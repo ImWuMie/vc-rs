@@ -20,7 +20,7 @@ strip = true
 [workspace.dependencies]
 anyhow = "1.0"
 tracing = "0.1"
-rubato = "2"
+rubato = "3"
 # Base ONNX Runtime: CPU core only. Provider features are opt-in in `vc-core`:
 # Windows ML loads the system Windows App SDK Runtime ORT dynamically, CUDA pulls
 # the large CUDA EP, and native TensorRT avoids ORT entirely.
