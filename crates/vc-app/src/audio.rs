@@ -332,11 +332,11 @@ fn build_cpal_input_stream<F>(
 where
     F: FnMut(&[f32]) + Send + 'static,
 {
-    let stream_config = config.clone().into();
+    let stream_config: cpal::StreamConfig = config.clone().into();
     let err_fn = |err| tracing::warn!("input stream error: {err}");
     match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
+            stream_config.clone(),
             move |data: &[f32], _| on_samples(data),
             err_fn,
             None,
@@ -344,7 +344,7 @@ where
         cpal::SampleFormat::I16 => {
             let mut scratch = vec![0.0; cpal_scratch_samples(config)];
             device.build_input_stream(
-                &stream_config,
+                stream_config.clone(),
                 move |data: &[i16], _| {
                     for input in data.chunks(scratch.len()) {
                         let converted = &mut scratch[..input.len()];
@@ -359,7 +359,7 @@ where
         cpal::SampleFormat::U16 => {
             let mut scratch = vec![0.0; cpal_scratch_samples(config)];
             device.build_input_stream(
-                &stream_config,
+                stream_config.clone(),
                 move |data: &[u16], _| {
                     for input in data.chunks(scratch.len()) {
                         let converted = &mut scratch[..input.len()];
@@ -388,11 +388,11 @@ fn build_cpal_output_stream<F>(
 where
     F: FnMut(&mut [f32]) + Send + 'static,
 {
-    let stream_config = config.clone().into();
+    let stream_config: cpal::StreamConfig = config.clone().into();
     let err_fn = |err| tracing::warn!("output stream error: {err}");
     match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_output_stream(
-            &stream_config,
+            stream_config.clone(),
             move |data: &mut [f32], _| fill(data),
             err_fn,
             None,
@@ -400,7 +400,7 @@ where
         cpal::SampleFormat::I16 => {
             let mut scratch = vec![0.0; cpal_scratch_samples(config)];
             device.build_output_stream(
-                &stream_config,
+                stream_config.clone(),
                 move |data: &mut [i16], _| {
                     for output in data.chunks_mut(scratch.len()) {
                         let tmp = &mut scratch[..output.len()];
@@ -415,7 +415,7 @@ where
         cpal::SampleFormat::U16 => {
             let mut scratch = vec![0.0; cpal_scratch_samples(config)];
             device.build_output_stream(
-                &stream_config,
+                stream_config.clone(),
                 move |data: &mut [u16], _| {
                     for output in data.chunks_mut(scratch.len()) {
                         let tmp = &mut scratch[..output.len()];

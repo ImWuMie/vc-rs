@@ -20,7 +20,7 @@ cpu = ["vc-core/ort"]
 vc-core = { path = "../vc-core" }
 anyhow.workspace = true
 tracing.workspace = true
-cpal = "0.17"
+cpal = "0.18"
 hound = "3.5"
 rtrb = "0.3"
 thread-priority = "3.0.0"
