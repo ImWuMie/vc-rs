@@ -27,9 +27,9 @@ nice-plug-egui = "0.1.5"
 egui = "0.34.1"
 vc-core = { path = "../vc-core" }
 rtrb = "0.3"
-rfd = "0.15"
+rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 anyhow.workspace = true
 ort = { workspace = true, optional = true }
 
