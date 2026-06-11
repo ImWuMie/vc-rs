@@ -24,8 +24,9 @@
     Build and run Steinberg's validator before installing.
 
 .PARAMETER PopulateRuntime
-    Forwarded to validate-vst3.ps1 when -ValidateFirst is used. Copies the
-    variant runtime DLLs into the bundle before validation/install.
+    Forwarded to validate-vst3.ps1 when -ValidateFirst is used, so the validator
+    runs against the runtime-populated bundle. The installed bundle is always
+    populated with the variant runtime DLLs regardless of this switch.
 
 .PARAMETER DestinationRoot
     Root VST3 directory. Defaults to %LocalAppData%\Programs\Common\VST3.
@@ -134,6 +135,22 @@ try {
 
     if (-not (Test-Path -LiteralPath $bundle)) {
         throw "VST3 bundle not found: $bundle. Run scripts/validate-vst3.ps1 or pass -BuildFirst."
+    }
+
+    # Always stage the variant's runtime DLLs into the bundle before installing.
+    # `cargo xtask bundle` does NOT emit them: Windows ML needs
+    # Microsoft.WindowsAppRuntime.Bootstrap.dll beside the plugin, and TensorRT
+    # needs nvinfer/cudart. Without this an installed plugin fails to load in the
+    # DAW ("failed to load Microsoft.WindowsAppRuntime.Bootstrap.dll"). Validation
+    # deliberately runs against the raw silent bundle, so populate here (after
+    # -ValidateFirst) rather than inside validate-vst3.ps1. Idempotent: re-copying
+    # over an already-populated bundle is a no-op-ish overwrite.
+    Invoke-Step "populate $Variant runtime DLLs" {
+        if ($Variant -eq 'tensorrt') {
+            & (Join-Path $repoRoot 'crates\vc-vst3\package-tensorrt.ps1') -RuntimeOnly
+        } else {
+            & (Join-Path $repoRoot 'crates\vc-vst3\package-windowsml.ps1')
+        }
     }
 
     Assert-SafeBundleDestination $DestinationRoot $destination $destinationName
