@@ -622,11 +622,20 @@ impl RealtimeSession {
             RuntimeModel::Rvc(pipeline)
         };
 
-        let (mut input_producer, mut input_consumer) =
-            RingBuffer::<f32>::new(input_chunk * INPUT_QUEUE_CHUNKS);
         let output_capacity = output_chunk * OUTPUT_QUEUE_CHUNKS;
-        let (mut output_producer, mut output_consumer) = RingBuffer::<f32>::new(output_capacity);
         let running = Arc::new(AtomicBool::new(true));
+        // Build the device streams before spawning the inference worker: a
+        // stream failure then returns without ever starting (and stopping) the
+        // worker and its model/CUDA context. The streams stay paused until
+        // play(), so the worker can attach afterwards.
+        let (input_stream, output_stream, mut input_consumer, mut output_producer) =
+            build_streams(
+                &audio,
+                input_chunk * INPUT_QUEUE_CHUNKS,
+                output_capacity,
+                &running,
+                &telemetry,
+            )?;
         let worker_running = Arc::clone(&running);
         let worker_telemetry = Arc::clone(&telemetry);
         let worker_debug_input = Arc::clone(&debug_input);
@@ -753,50 +762,6 @@ impl RealtimeSession {
                 })?,
         );
 
-        let input_running = Arc::clone(&running);
-        let input_telemetry = Arc::clone(&telemetry);
-        let input_stream = match audio.build_input_stream(move |samples| {
-            if !input_running.load(Ordering::Relaxed) {
-                return;
-            }
-            let (_, remainder) = input_producer.push_partial_slice(samples);
-            if !remainder.is_empty() {
-                input_telemetry
-                    .input_overruns
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }) {
-            Ok(stream) => stream,
-            Err(err) => {
-                stop_startup_worker(&running, &mut worker);
-                return Err(err);
-            }
-        };
-        let output_running = Arc::clone(&running);
-        let output_telemetry = Arc::clone(&telemetry);
-        let output_stream = match audio.build_output_stream(move |out| {
-            if !output_running.load(Ordering::Relaxed) {
-                out.fill(0.0);
-                return;
-            }
-            let (_, remainder) = output_consumer.pop_partial_slice(out);
-            if !remainder.is_empty() {
-                remainder.fill(0.0);
-                output_telemetry
-                    .output_underruns
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            output_telemetry
-                .output_buffer_samples
-                .store(output_consumer.cached_slots() as u64, Ordering::Relaxed);
-        }) {
-            Ok(stream) => stream,
-            Err(err) => {
-                drop(input_stream);
-                stop_startup_worker(&running, &mut worker);
-                return Err(err);
-            }
-        };
         if let Err(err) = output_stream.play().and_then(|_| input_stream.play()) {
             drop(input_stream);
             drop(output_stream);
@@ -863,8 +828,59 @@ fn should_queue_silent_output(buffered: usize, output_chunk: usize) -> bool {
     buffered <= output_chunk
 }
 
+/// Streams plus the worker-side ring-buffer ends created in the same attempt.
+type StreamEndpoints = (
+    AudioStream,
+    AudioStream,
+    rtrb::Consumer<f32>,
+    rtrb::Producer<f32>,
+);
+
+fn build_streams(
+    audio: &RealtimeAudio,
+    input_capacity: usize,
+    output_capacity: usize,
+    running: &Arc<AtomicBool>,
+    telemetry: &Arc<Telemetry>,
+) -> Result<StreamEndpoints> {
+    let (mut input_producer, input_consumer) = RingBuffer::<f32>::new(input_capacity);
+    let (output_producer, mut output_consumer) = RingBuffer::<f32>::new(output_capacity);
+    let input_running = Arc::clone(running);
+    let input_telemetry = Arc::clone(telemetry);
+    let input_stream = audio.build_input_stream(move |samples| {
+        if !input_running.load(Ordering::Relaxed) {
+            return;
+        }
+        let (_, remainder) = input_producer.push_partial_slice(samples);
+        if !remainder.is_empty() {
+            input_telemetry
+                .input_overruns
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    })?;
+    let output_running = Arc::clone(running);
+    let output_telemetry = Arc::clone(telemetry);
+    let output_stream = audio.build_output_stream(move |out| {
+        if !output_running.load(Ordering::Relaxed) {
+            out.fill(0.0);
+            return;
+        }
+        let (_, remainder) = output_consumer.pop_partial_slice(out);
+        if !remainder.is_empty() {
+            remainder.fill(0.0);
+            output_telemetry
+                .output_underruns
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        output_telemetry
+            .output_buffer_samples
+            .store(output_consumer.cached_slots() as u64, Ordering::Relaxed);
+    })?;
+    Ok((input_stream, output_stream, input_consumer, output_producer))
+}
+
 fn stop_startup_worker(running: &AtomicBool, worker: &mut Option<JoinHandle<()>>) {
-    // Stream construction can fail after the inference worker starts. Always
+    // Stream playback can still fail after the inference worker starts. Always
     // stop and join it before returning so failed Apply attempts cannot leave a
     // model/CUDA context alive behind the next session.
     running.store(false, Ordering::SeqCst);

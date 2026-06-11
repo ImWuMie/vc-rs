@@ -43,6 +43,35 @@ pub fn f32_to_u16_into(input: &[f32], output: &mut [u16]) {
     }
 }
 
+/// Averages interleaved `channels`-channel frames down to mono.
+///
+/// `output` receives one sample per frame; `input.len()` must be
+/// `output.len() * channels`. `channels == 1` degenerates to a copy.
+pub fn downmix_to_mono_into(input: &[f32], channels: usize, output: &mut [f32]) {
+    debug_assert!(channels >= 1);
+    debug_assert_eq!(input.len(), output.len() * channels);
+    if channels == 1 {
+        output.copy_from_slice(input);
+        return;
+    }
+    let scale = 1.0 / channels as f32;
+    for (dst, frame) in output.iter_mut().zip(input.chunks_exact(channels)) {
+        *dst = frame.iter().sum::<f32>() * scale;
+    }
+}
+
+/// Duplicates each mono sample across all `channels` slots of an interleaved
+/// frame (the same upmix WASAPI's AUTOCONVERTPCM applied for mono sources).
+///
+/// `output.len()` must be `mono.len() * channels`.
+pub fn upmix_mono_into<T: Copy>(mono: &[T], channels: usize, output: &mut [T]) {
+    debug_assert!(channels >= 1);
+    debug_assert_eq!(output.len(), mono.len() * channels);
+    for (frame, &sample) in output.chunks_exact_mut(channels).zip(mono) {
+        frame.fill(sample);
+    }
+}
+
 pub fn rms(input: &[f32]) -> f32 {
     if input.is_empty() {
         return 0.0;
@@ -524,6 +553,38 @@ mod tests {
         assert_abs_diff_eq!(output[0], -1.0, epsilon = 1e-6);
         assert_abs_diff_eq!(output[1], 0.0, epsilon = 1e-6);
         assert_abs_diff_eq!(output[2], 32767.0 / 32768.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn downmix_averages_interleaved_frames() {
+        let stereo = [1.0, 0.0, 0.5, -0.5, -1.0, 1.0];
+        let mut mono = [9.0; 3];
+
+        downmix_to_mono_into(&stereo, 2, &mut mono);
+
+        assert_abs_diff_eq!(mono[0], 0.5, epsilon = 1e-6);
+        assert_abs_diff_eq!(mono[1], 0.0, epsilon = 1e-6);
+        assert_abs_diff_eq!(mono[2], 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn downmix_mono_is_copy() {
+        let input = [0.25, -0.75];
+        let mut output = [0.0; 2];
+
+        downmix_to_mono_into(&input, 1, &mut output);
+
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn upmix_duplicates_mono_across_channels() {
+        let mono = [0.25, -0.5];
+        let mut stereo = [9.0; 4];
+
+        upmix_mono_into(&mono, 2, &mut stereo);
+
+        assert_eq!(stereo, [0.25, 0.25, -0.5, -0.5]);
     }
 
     #[test]

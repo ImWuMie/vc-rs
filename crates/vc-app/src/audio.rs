@@ -95,9 +95,9 @@ impl RealtimeAudio {
 
     fn open_cpal(input_name: Option<&str>, output_name: Option<&str>) -> Result<Self> {
         let input_device = input_device(input_name)?;
-        let input_config = mono_input_config(&input_device)?;
+        let input_config = default_input_config(&input_device)?;
         let output_device = output_device(output_name)?;
-        let output_config = mono_output_config(&output_device)?;
+        let output_config = default_output_config(&output_device)?;
         let input_sample_rate = input_config.sample_rate();
         let output_sample_rate = output_config.sample_rate();
         let input_name = device_name(&input_device);
@@ -287,41 +287,65 @@ pub fn device_name(device: &cpal::Device) -> String {
         .unwrap_or_else(|_| "<unknown>".to_string())
 }
 
-pub fn mono_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig> {
-    let mut config = device
+// The engine works in mono, but the stream must be opened with the device's
+// native channel count: WASAPI shared mode only accepts the mix-format channel
+// count, and since cpal 0.18 `build_*_stream` enforces that via
+// `IsFormatSupported` instead of relying on AUTOCONVERTPCM. Channel
+// up/downmixing therefore happens in our callbacks, not in the OS.
+pub fn default_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig> {
+    device
         .default_input_config()
-        .context("failed to get default input config")?;
-    if config.channels() != 1 {
-        let sample_format = config.sample_format();
-        let sample_rate = config.sample_rate();
-        let buffer_size = *config.buffer_size();
-        config = cpal::SupportedStreamConfig::new(1, sample_rate, buffer_size, sample_format);
-    }
-    Ok(config)
+        .context("failed to get default input config")
 }
 
-pub fn mono_output_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig> {
-    let default = device
+pub fn default_output_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig> {
+    device
         .default_output_config()
-        .context("failed to get default output config")?;
-    Ok(cpal::SupportedStreamConfig::new(
-        1,
-        default.sample_rate(),
-        *default.buffer_size(),
-        default.sample_format(),
-    ))
+        .context("failed to get default output config")
 }
 
-fn cpal_scratch_samples(config: &cpal::SupportedStreamConfig) -> usize {
-    let samples = match *config.buffer_size() {
-        cpal::SupportedBufferSize::Range { max, .. } => {
-            (max as usize).saturating_mul(config.channels().max(1) as usize)
-        }
+fn cpal_scratch_frames(config: &cpal::SupportedStreamConfig) -> usize {
+    let channels = config.channels().max(1) as usize;
+    let frames = match *config.buffer_size() {
+        cpal::SupportedBufferSize::Range { max, .. } => max as usize,
         cpal::SupportedBufferSize::Unknown => CPAL_SCRATCH_FALLBACK_SAMPLES,
     };
-    // This buffer is moved into CPAL callbacks so sample-format conversion can
-    // stay allocation-free on the real-time path.
-    samples.clamp(1, CPAL_MAX_SCRATCH_SAMPLES)
+    // These buffers are moved into CPAL callbacks so sample-format conversion
+    // and channel up/downmixing stay allocation-free on the real-time path.
+    // Interleaved scratch is frames * channels, so cap the total accordingly.
+    frames.clamp(1, (CPAL_MAX_SCRATCH_SAMPLES / channels).max(1))
+}
+
+// FormatMessageW cannot resolve AUDCLNT_E_* HRESULTs, so cpal stream errors
+// reach the GUI status line as a bare "OS Error -2004287478". Translate the
+// codes users actually hit into something actionable. The decimal codes are
+// matched against the error text because cpal does not expose the raw HRESULT;
+// if the formatting ever changes the hint silently disappears, nothing breaks.
+fn with_audclnt_hint<E>(err: E) -> anyhow::Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let text = err.to_string();
+    let hint = [
+        // 0x8889000A AUDCLNT_E_DEVICE_IN_USE
+        (
+            "-2004287478",
+            "audio device is in use in exclusive mode by another application",
+        ),
+        // 0x88890004 AUDCLNT_E_DEVICE_INVALIDATED
+        (
+            "-2004287484",
+            "audio device was removed or its configuration changed",
+        ),
+        // 0x88890008 AUDCLNT_E_UNSUPPORTED_FORMAT
+        ("-2004287480", "audio device rejected the stream format"),
+    ]
+    .iter()
+    .find_map(|(code, hint)| text.contains(code).then_some(*hint));
+    match hint {
+        Some(hint) => anyhow::Error::new(err).context(hint),
+        None => anyhow::Error::new(err),
+    }
 }
 
 fn build_cpal_input_stream<F>(
@@ -333,23 +357,45 @@ where
     F: FnMut(&[f32]) + Send + 'static,
 {
     let stream_config: cpal::StreamConfig = config.clone().into();
+    // CPAL guarantees `data.len()` is a multiple of the channel count, and the
+    // chunk size below is too, so every chunk holds whole frames.
+    let channels = config.channels().max(1) as usize;
+    let frames = cpal_scratch_frames(config);
     let err_fn = |err| tracing::warn!("input stream error: {err}");
     match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
+        cpal::SampleFormat::F32 if channels == 1 => device.build_input_stream(
             stream_config.clone(),
             move |data: &[f32], _| on_samples(data),
             err_fn,
             None,
         ),
+        cpal::SampleFormat::F32 => {
+            let mut mono = vec![0.0; frames];
+            device.build_input_stream(
+                stream_config.clone(),
+                move |data: &[f32], _| {
+                    for input in data.chunks(frames * channels) {
+                        let mono = &mut mono[..input.len() / channels];
+                        dsp::downmix_to_mono_into(input, channels, mono);
+                        on_samples(mono);
+                    }
+                },
+                err_fn,
+                None,
+            )
+        }
         cpal::SampleFormat::I16 => {
-            let mut scratch = vec![0.0; cpal_scratch_samples(config)];
+            let mut interleaved = vec![0.0; frames * channels];
+            let mut mono = vec![0.0; frames];
             device.build_input_stream(
                 stream_config.clone(),
                 move |data: &[i16], _| {
-                    for input in data.chunks(scratch.len()) {
-                        let converted = &mut scratch[..input.len()];
+                    for input in data.chunks(frames * channels) {
+                        let converted = &mut interleaved[..input.len()];
                         dsp::i16_to_f32_into(input, converted);
-                        on_samples(converted);
+                        let mono = &mut mono[..input.len() / channels];
+                        dsp::downmix_to_mono_into(converted, channels, mono);
+                        on_samples(mono);
                     }
                 },
                 err_fn,
@@ -357,14 +403,17 @@ where
             )
         }
         cpal::SampleFormat::U16 => {
-            let mut scratch = vec![0.0; cpal_scratch_samples(config)];
+            let mut interleaved = vec![0.0; frames * channels];
+            let mut mono = vec![0.0; frames];
             device.build_input_stream(
                 stream_config.clone(),
                 move |data: &[u16], _| {
-                    for input in data.chunks(scratch.len()) {
-                        let converted = &mut scratch[..input.len()];
+                    for input in data.chunks(frames * channels) {
+                        let converted = &mut interleaved[..input.len()];
                         dsp::u16_to_f32_into(input, converted);
-                        on_samples(converted);
+                        let mono = &mut mono[..input.len() / channels];
+                        dsp::downmix_to_mono_into(converted, channels, mono);
+                        on_samples(mono);
                     }
                 },
                 err_fn,
@@ -377,6 +426,7 @@ where
             ))
         }
     }
+    .map_err(with_audclnt_hint)
     .context("failed to build input stream")
 }
 
@@ -389,23 +439,45 @@ where
     F: FnMut(&mut [f32]) + Send + 'static,
 {
     let stream_config: cpal::StreamConfig = config.clone().into();
+    // Same framing guarantee as the input path: chunks hold whole frames.
+    let channels = config.channels().max(1) as usize;
+    let frames = cpal_scratch_frames(config);
     let err_fn = |err| tracing::warn!("output stream error: {err}");
     match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_output_stream(
+        cpal::SampleFormat::F32 if channels == 1 => device.build_output_stream(
             stream_config.clone(),
             move |data: &mut [f32], _| fill(data),
             err_fn,
             None,
         ),
+        cpal::SampleFormat::F32 => {
+            let mut mono = vec![0.0; frames];
+            device.build_output_stream(
+                stream_config.clone(),
+                move |data: &mut [f32], _| {
+                    for output in data.chunks_mut(frames * channels) {
+                        let mono = &mut mono[..output.len() / channels];
+                        fill(mono);
+                        dsp::upmix_mono_into(mono, channels, output);
+                    }
+                },
+                err_fn,
+                None,
+            )
+        }
         cpal::SampleFormat::I16 => {
-            let mut scratch = vec![0.0; cpal_scratch_samples(config)];
+            let mut mono = vec![0.0; frames];
+            let mut converted = vec![0_i16; frames];
             device.build_output_stream(
                 stream_config.clone(),
                 move |data: &mut [i16], _| {
-                    for output in data.chunks_mut(scratch.len()) {
-                        let tmp = &mut scratch[..output.len()];
-                        fill(tmp);
-                        dsp::f32_to_i16_into(tmp, output);
+                    for output in data.chunks_mut(frames * channels) {
+                        let frames_in_chunk = output.len() / channels;
+                        let mono = &mut mono[..frames_in_chunk];
+                        fill(mono);
+                        let converted = &mut converted[..frames_in_chunk];
+                        dsp::f32_to_i16_into(mono, converted);
+                        dsp::upmix_mono_into(converted, channels, output);
                     }
                 },
                 err_fn,
@@ -413,14 +485,18 @@ where
             )
         }
         cpal::SampleFormat::U16 => {
-            let mut scratch = vec![0.0; cpal_scratch_samples(config)];
+            let mut mono = vec![0.0; frames];
+            let mut converted = vec![0_u16; frames];
             device.build_output_stream(
                 stream_config.clone(),
                 move |data: &mut [u16], _| {
-                    for output in data.chunks_mut(scratch.len()) {
-                        let tmp = &mut scratch[..output.len()];
-                        fill(tmp);
-                        dsp::f32_to_u16_into(tmp, output);
+                    for output in data.chunks_mut(frames * channels) {
+                        let frames_in_chunk = output.len() / channels;
+                        let mono = &mut mono[..frames_in_chunk];
+                        fill(mono);
+                        let converted = &mut converted[..frames_in_chunk];
+                        dsp::f32_to_u16_into(mono, converted);
+                        dsp::upmix_mono_into(converted, channels, output);
                     }
                 },
                 err_fn,
@@ -433,5 +509,6 @@ where
             ))
         }
     }
+    .map_err(with_audclnt_hint)
     .context("failed to build output stream")
 }
