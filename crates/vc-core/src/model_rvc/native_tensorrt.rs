@@ -116,6 +116,11 @@ impl NativeContentVecEngine {
             .and_then(NonZeroUsize::new)
             .ok_or_else(|| anyhow!("ContentVec expected channel count must be positive"))?;
         let path = ensure_native_engine(model_path, profile, profile.profile_shapes.as_str())?;
+        // `handle` is a real engine handle under cfg(native_tensorrt) (consumed
+        // by the struct field below) but `()` in the no-TensorRT stub build,
+        // where load_engine returns unit. One binding serves both configs, so
+        // silence the unit-value lint in the stub only.
+        #[cfg_attr(not(native_tensorrt), allow(clippy::let_unit_value))]
         let handle = load_engine(
             &path,
             profile.profile_shapes.as_str(),
@@ -190,6 +195,9 @@ impl NativeRmvpeEngine {
         let waveform_len = shape_volume(waveform_shape, "RMVPE waveform")?;
         let load_profile = profile_with_scalars(profile, &[("threshold", &[1usize])]);
         let path = ensure_native_engine(model_path, profile, profile.profile_shapes.as_str())?;
+        // `handle` is unit in the no-TensorRT stub build; see the equivalent
+        // binding in NativeContentVecEngine::load for the cfg rationale.
+        #[cfg_attr(not(native_tensorrt), allow(clippy::let_unit_value))]
         let handle = load_engine(&path, load_profile.as_str(), "pitchf", profile.gpu_priority)?;
         let output_len = engine_output_len(handle)?;
         info!(
@@ -250,6 +258,9 @@ impl NativeRvcEngine {
         let load_profile =
             profile_with_scalars(profile, &[("p_len", &[1usize]), ("sid", &[1usize])]);
         let path = ensure_native_engine(model_path, profile, profile.profile_shapes.as_str())?;
+        // `handle` is unit in the no-TensorRT stub build; see the equivalent
+        // binding in NativeContentVecEngine::load for the cfg rationale.
+        #[cfg_attr(not(native_tensorrt), allow(clippy::let_unit_value))]
         let handle = load_engine(&path, load_profile.as_str(), "audio", profile.gpu_priority)?;
         let output_len = engine_output_len(handle)?;
         info!(

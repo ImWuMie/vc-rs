@@ -411,6 +411,10 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// One-pole smoothing coefficient for an exponential follower with the given
 /// time constant. `time_ms <= 0` yields `1.0` (instantaneous), so callers can
 /// request a zero-length attack/release without special-casing.
+// Negated `>` (not `<= 0.0`) is deliberate: it also routes NaN into the safe
+// 1.0 branch, since every comparison with NaN is false. clippy's partial_cmp
+// suggestion would drop that guarantee.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn one_pole_coef(time_ms: f32, sample_rate: f32) -> f32 {
     if !(time_ms > 0.0) || !(sample_rate > 0.0) {
         return 1.0;

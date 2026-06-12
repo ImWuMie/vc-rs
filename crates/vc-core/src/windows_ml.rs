@@ -277,8 +277,8 @@ pub fn catalog_provider_ready_state(
     provider: CatalogExecutionProvider,
 ) -> Result<CatalogReadyState> {
     ensure_initialized()?;
-    with_catalog(|api, catalog| {
-        match find_catalog_candidate(api, catalog, provider)? {
+    with_catalog(
+        |api, catalog| match find_catalog_candidate(api, catalog, provider)? {
             Some(found) => {
                 let mut state = 0;
                 check_hr(
@@ -288,8 +288,8 @@ pub fn catalog_provider_ready_state(
                 Ok(CatalogReadyState::from_raw(state))
             }
             None => Ok(CatalogReadyState::NotPresent),
-        }
-    })
+        },
+    )
 }
 
 /// Best-effort: true if loading `provider` will trigger a Windows ML catalog EP

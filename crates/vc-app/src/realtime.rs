@@ -628,14 +628,13 @@ impl RealtimeSession {
         // stream failure then returns without ever starting (and stopping) the
         // worker and its model/CUDA context. The streams stay paused until
         // play(), so the worker can attach afterwards.
-        let (input_stream, output_stream, mut input_consumer, mut output_producer) =
-            build_streams(
-                &audio,
-                input_chunk * INPUT_QUEUE_CHUNKS,
-                output_capacity,
-                &running,
-                &telemetry,
-            )?;
+        let (input_stream, output_stream, mut input_consumer, mut output_producer) = build_streams(
+            &audio,
+            input_chunk * INPUT_QUEUE_CHUNKS,
+            output_capacity,
+            &running,
+            &telemetry,
+        )?;
         let worker_running = Arc::clone(&running);
         let worker_telemetry = Arc::clone(&telemetry);
         let worker_debug_input = Arc::clone(&debug_input);

@@ -207,8 +207,8 @@ impl F0Postprocessor {
                     i += 1;
                 }
                 let end = i; // exclusive; first voiced frame after the gap (or n)
-                // Bounded on both sides => start > 0 (voiced at start-1) and
-                // end < n (voiced at end). Both bounds are guaranteed voiced.
+                             // Bounded on both sides => start > 0 (voiced at start-1) and
+                             // end < n (voiced at end). Both bounds are guaranteed voiced.
                 if start > 0 && end < n && end - start <= max_len {
                     let log_left = pitchf[start - 1].ln();
                     let log_right = pitchf[end].ln();
