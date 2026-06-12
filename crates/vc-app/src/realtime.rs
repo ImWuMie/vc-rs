@@ -131,10 +131,10 @@ impl Default for RealtimeConfig {
 
 impl RealtimeConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.wasapi_input_exclusive || self.wasapi_output_exclusive {
-            if self.audio_backend != AudioBackend::Wasapi {
-                bail!("WASAPI exclusive options require the WASAPI backend");
-            }
+        if (self.wasapi_input_exclusive || self.wasapi_output_exclusive)
+            && self.audio_backend != AudioBackend::Wasapi
+        {
+            bail!("WASAPI exclusive options require the WASAPI backend");
         }
         if self.chunk_ms == 0 {
             bail!("chunk size must be greater than zero");
@@ -151,10 +151,10 @@ impl RealtimeConfig {
         if !(0.0..=1.0).contains(&self.noise_gate_floor) {
             bail!("noise gate floor must be in 0.0..=1.0");
         }
-        if !self.passthrough {
-            if self.model.is_none() || self.embedder.is_none() || self.f0_model.is_none() {
-                bail!("model, embedder, and F0 model are required");
-            }
+        if !self.passthrough
+            && (self.model.is_none() || self.embedder.is_none() || self.f0_model.is_none())
+        {
+            bail!("model, embedder, and F0 model are required");
         }
         Ok(())
     }
@@ -297,6 +297,11 @@ impl Telemetry {
     }
 }
 
+// Boxing the large `Apply` payload is intentionally declined: these commands
+// flow at control-message cadence (model/config changes), not per audio block,
+// so the size disparity costs nothing worth an extra heap allocation + indirection
+// on every push. Kept inline so the worker's command path stays allocation-free.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     Apply(RealtimeConfig),
     Stop,
@@ -496,6 +501,10 @@ fn wasapi_device_names() -> Result<(Vec<String>, Vec<String>)> {
     bail!("WASAPI is only available on Windows")
 }
 
+// Only ever one live value, held by the worker and dereferenced on every audio
+// block. Boxing the `Rvc` variant to even out the size would just add a pointer
+// chase to the inference hot path for no real memory benefit, so keep it inline.
+#[allow(clippy::large_enum_variant)]
 enum RuntimeModel {
     Passthrough(PassthroughModel),
     Rvc(RvcPipeline),

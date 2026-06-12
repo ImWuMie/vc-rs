@@ -1410,6 +1410,14 @@ pub(super) fn load_session(
     tensor_rt_run_mode: TensorRtRunMode,
     tensor_rt_session_purpose: TensorRtSessionPurpose,
 ) -> Result<Session> {
+    // `tensor_rt_profile` is consumed only by the Windows ML catalog-EP branches
+    // below (the TensorRT-RTX fixed-shape profile). Reference it here so a build
+    // without those branches — e.g. the `cpu`-only CI lane — matches the
+    // windowsml signature without an unused-argument warning. Mirrors the
+    // `let _ = tensor_rt_run_mode;` discard in the no-cuda arm.
+    #[cfg(not(all(windows, feature = "windowsml")))]
+    let _ = tensor_rt_profile;
+
     #[cfg(not(all(windows, feature = "windowsml")))]
     if provider.is_windows_ml() {
         bail!(

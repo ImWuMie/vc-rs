@@ -356,7 +356,7 @@ fn build_cpal_input_stream<F>(
 where
     F: FnMut(&[f32]) + Send + 'static,
 {
-    let stream_config: cpal::StreamConfig = config.clone().into();
+    let stream_config: cpal::StreamConfig = (*config).into();
     // CPAL guarantees `data.len()` is a multiple of the channel count, and the
     // chunk size below is too, so every chunk holds whole frames.
     let channels = config.channels().max(1) as usize;
@@ -364,7 +364,7 @@ where
     let err_fn = |err| tracing::warn!("input stream error: {err}");
     match config.sample_format() {
         cpal::SampleFormat::F32 if channels == 1 => device.build_input_stream(
-            stream_config.clone(),
+            stream_config,
             move |data: &[f32], _| on_samples(data),
             err_fn,
             None,
@@ -372,7 +372,7 @@ where
         cpal::SampleFormat::F32 => {
             let mut mono = vec![0.0; frames];
             device.build_input_stream(
-                stream_config.clone(),
+                stream_config,
                 move |data: &[f32], _| {
                     for input in data.chunks(frames * channels) {
                         let mono = &mut mono[..input.len() / channels];
@@ -388,7 +388,7 @@ where
             let mut interleaved = vec![0.0; frames * channels];
             let mut mono = vec![0.0; frames];
             device.build_input_stream(
-                stream_config.clone(),
+                stream_config,
                 move |data: &[i16], _| {
                     for input in data.chunks(frames * channels) {
                         let converted = &mut interleaved[..input.len()];
@@ -406,7 +406,7 @@ where
             let mut interleaved = vec![0.0; frames * channels];
             let mut mono = vec![0.0; frames];
             device.build_input_stream(
-                stream_config.clone(),
+                stream_config,
                 move |data: &[u16], _| {
                     for input in data.chunks(frames * channels) {
                         let converted = &mut interleaved[..input.len()];
@@ -438,14 +438,14 @@ fn build_cpal_output_stream<F>(
 where
     F: FnMut(&mut [f32]) + Send + 'static,
 {
-    let stream_config: cpal::StreamConfig = config.clone().into();
+    let stream_config: cpal::StreamConfig = (*config).into();
     // Same framing guarantee as the input path: chunks hold whole frames.
     let channels = config.channels().max(1) as usize;
     let frames = cpal_scratch_frames(config);
     let err_fn = |err| tracing::warn!("output stream error: {err}");
     match config.sample_format() {
         cpal::SampleFormat::F32 if channels == 1 => device.build_output_stream(
-            stream_config.clone(),
+            stream_config,
             move |data: &mut [f32], _| fill(data),
             err_fn,
             None,
@@ -453,7 +453,7 @@ where
         cpal::SampleFormat::F32 => {
             let mut mono = vec![0.0; frames];
             device.build_output_stream(
-                stream_config.clone(),
+                stream_config,
                 move |data: &mut [f32], _| {
                     for output in data.chunks_mut(frames * channels) {
                         let mono = &mut mono[..output.len() / channels];
@@ -469,7 +469,7 @@ where
             let mut mono = vec![0.0; frames];
             let mut converted = vec![0_i16; frames];
             device.build_output_stream(
-                stream_config.clone(),
+                stream_config,
                 move |data: &mut [i16], _| {
                     for output in data.chunks_mut(frames * channels) {
                         let frames_in_chunk = output.len() / channels;
@@ -488,7 +488,7 @@ where
             let mut mono = vec![0.0; frames];
             let mut converted = vec![0_u16; frames];
             device.build_output_stream(
-                stream_config.clone(),
+                stream_config,
                 move |data: &mut [u16], _| {
                     for output in data.chunks_mut(frames * channels) {
                         let frames_in_chunk = output.len() / channels;
