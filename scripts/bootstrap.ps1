@@ -123,6 +123,17 @@ if ($rustup) {
     Write-Warning "rustup not found on PATH yet. Open a new terminal and run: rustup default stable-x86_64-pc-windows-msvc"
 }
 
+# --- 4. Git hooks (shared, repo-local) --------------------------------------
+# Point git at the tracked .githooks dir so every clone gets the pre-commit
+# rustfmt check. Relative path resolves against the working-tree root. Idempotent.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+if (Test-Path (Join-Path $repoRoot ".githooks")) {
+    Write-Host "[git] setting core.hooksPath = .githooks" -ForegroundColor Yellow
+    & git -C $repoRoot config core.hooksPath .githooks
+} else {
+    Write-Warning "Skipping git hooks setup: .githooks not found under $repoRoot"
+}
+
 # --- Summary ----------------------------------------------------------------
 Write-Host ""
 Write-Host "== winget-scope prerequisites done ==" -ForegroundColor Cyan

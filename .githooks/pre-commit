@@ -1,0 +1,22 @@
+#!/bin/sh
+# pre-commit: reject commits whose Rust code isn't rustfmt-clean.
+#
+# Check-only by design — it never rewrites files. Auto-formatting from a hook
+# would touch unstaged/unrelated files (cargo fmt is workspace-wide) and make
+# the committed diff differ from what was reviewed. Fix violations explicitly
+# with `just fmt` (or `cargo fmt --all`), then re-stage.
+#
+# Shared via core.hooksPath=.githooks (configured by scripts/bootstrap.ps1, or
+# manually: `git config core.hooksPath .githooks`).
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not on PATH; skipping rustfmt check." >&2
+    exit 0
+fi
+
+if ! cargo fmt --all --check; then
+    echo >&2
+    echo "pre-commit: rustfmt found unformatted code (diff above)." >&2
+    echo "Fix it:  just fmt   (or: cargo fmt --all)   then re-stage and commit." >&2
+    exit 1
+fi
