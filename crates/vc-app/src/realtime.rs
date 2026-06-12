@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -567,8 +567,8 @@ impl RealtimeSession {
         )?;
         let input_rate = audio.input_sample_rate();
         let output_rate = audio.output_sample_rate();
-        let input_chunk = chunk_samples_for_rate(input_rate, config.chunk_ms);
-        let output_chunk = chunk_samples_for_rate(output_rate, config.chunk_ms);
+        let input_chunk = dsp::chunk_samples_for_rate(input_rate, config.chunk_ms);
+        let output_chunk = dsp::chunk_samples_for_rate(output_rate, config.chunk_ms);
         let output_extra_ms = if config.passthrough {
             0
         } else {
@@ -814,19 +814,15 @@ impl Drop for RealtimeSession {
         }
         if let Some(path) = &self.debug_input_wav {
             if let Ok(samples) = self.debug_input.lock() {
-                let _ = write_wav(path, &samples, self.input_rate);
+                let _ = write_wav_mono(path, &samples, self.input_rate);
             }
         }
         if let Some(path) = &self.debug_output_wav {
             if let Ok(samples) = self.debug_output.lock() {
-                let _ = write_wav(path, &samples, self.output_rate);
+                let _ = write_wav_mono(path, &samples, self.output_rate);
             }
         }
     }
-}
-
-fn chunk_samples_for_rate(sample_rate: u32, chunk_ms: u32) -> usize {
-    ((sample_rate as u64 * chunk_ms as u64) / 1000).max(128) as usize
 }
 
 fn should_queue_silent_output(buffered: usize, output_chunk: usize) -> bool {
@@ -897,7 +893,10 @@ fn stop_startup_worker(running: &AtomicBool, worker: &mut Option<JoinHandle<()>>
     }
 }
 
-fn write_wav(path: &PathBuf, samples: &[f32], sample_rate: u32) -> Result<()> {
+/// Write mono `f32` samples to a 16-bit PCM WAV file. Shared by the realtime
+/// debug capture here and the CLI's WAV-conversion output so both produce an
+/// identical file format.
+pub fn write_wav_mono(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
     let mut writer = hound::WavWriter::create(
         path,
         hound::WavSpec {

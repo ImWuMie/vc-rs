@@ -7,6 +7,17 @@ use rubato::{Fft, FixedSync, Resampler};
 const STREAM_RESAMPLE_CHUNK: usize = 480;
 const STREAM_RESAMPLE_COMPACT_THRESHOLD: usize = STREAM_RESAMPLE_CHUNK * 8;
 
+/// Samples in a `chunk_ms` window at `sample_rate`, with a hard 128-sample
+/// floor.
+///
+/// The floor keeps every front-end's chunk above the minimum the feature/F0
+/// extractors need at low sample rates or tiny chunk sizes; it is a shared
+/// invariant, so the three realtime drivers (CLI/GUI worker, VST3 worker) call
+/// this rather than each re-deriving the formula.
+pub fn chunk_samples_for_rate(sample_rate: u32, chunk_ms: u32) -> usize {
+    ((sample_rate as u64 * chunk_ms as u64) / 1000).max(128) as usize
+}
+
 pub fn i16_to_f32(input: &[i16]) -> Vec<f32> {
     let mut output = vec![0.0; input.len()];
     i16_to_f32_into(input, &mut output);
@@ -528,6 +539,12 @@ fn linear_resample_envelope_at(points: &[f32], index: usize, output_len: usize) 
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
+
+    #[test]
+    fn chunk_samples_apply_the_floor() {
+        assert_eq!(chunk_samples_for_rate(48_000, 10), 480);
+        assert_eq!(chunk_samples_for_rate(48_000, 1), 128);
+    }
 
     #[test]
     fn converts_i16_roundtrip() {

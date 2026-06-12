@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{debug, info};
-use vc_app::{DenoiserMode, EngineController, EngineState, LiveParams, RealtimeConfig};
+use vc_app::{
+    write_wav_mono, DenoiserMode, EngineController, EngineState, LiveParams, RealtimeConfig,
+};
 use vc_core::dsp;
 use vc_core::model_rvc::{F0PostprocessConfig, RvcPipeline, RvcPipelineConfig, VoiceModel};
 use vc_core::sola::{self, ChunkSmootherConfig, SmoothingKind};
@@ -107,10 +109,6 @@ fn smoothing_kind(smoother: Smoother) -> SmoothingKind {
     }
 }
 
-fn chunk_samples_for_rate(sample_rate: u32, chunk_ms: u32) -> usize {
-    ((sample_rate as u64 * chunk_ms as u64) / 1000).max(128) as usize
-}
-
 pub fn run_wav(args: WavArgs) -> Result<()> {
     let (mut samples, spec) = read_wav_mono(&args.input)?;
     let denoiser_mode = args.denoiser_mode();
@@ -123,7 +121,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
     } else {
         args.input_gain
     };
-    let chunk_samples = chunk_samples_for_rate(spec.sample_rate, args.chunk_ms);
+    let chunk_samples = dsp::chunk_samples_for_rate(spec.sample_rate, args.chunk_ms);
     let output_extra_ms = DEFAULT_CROSSFADE_MS
         .saturating_add(DEFAULT_SOLA_SEARCH_MS)
         .saturating_add(args.rvc_output_tail_discard_ms);
@@ -199,8 +197,9 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         let missing = samples.len() - output.len();
         output.extend_from_slice(&final_tail[..missing.min(final_tail.len())]);
     }
+    // Pad a short tail with silence / trim any overshoot so the output length
+    // matches the input exactly.
     output.resize(samples.len(), 0.0);
-    output.truncate(samples.len());
     write_wav_mono(&args.output, &output, spec.sample_rate)?;
     info!(
         "wrote {} samples at {} Hz to {} (chunks={})",
@@ -259,32 +258,9 @@ fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, hound::WavSpec)> {
     Ok((samples, spec))
 }
 
-fn write_wav_mono(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
-    let mut writer = hound::WavWriter::create(
-        path,
-        hound::WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        },
-    )?;
-    for sample in dsp::f32_to_i16(samples) {
-        writer.write_sample(sample)?;
-    }
-    writer.finalize()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{chunk_samples_for_rate, wav_model_input_chunk};
-
-    #[test]
-    fn computes_chunk_samples_per_sample_rate() {
-        assert_eq!(chunk_samples_for_rate(48_000, 10), 480);
-        assert_eq!(chunk_samples_for_rate(48_000, 1), 128);
-    }
+    use super::wav_model_input_chunk;
 
     #[test]
     fn pads_short_wav_chunk() {

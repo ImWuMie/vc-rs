@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use nice_plug::prelude::util;
 use rtrb::{Consumer, Producer, RingBuffer};
+use vc_core::dsp::chunk_samples_for_rate;
 use vc_core::model_rvc::{F0PostprocessConfig, RvcPipeline, RvcPipelineConfig, VoiceModel};
 use vc_core::sola::{self, ChunkSmoother, ChunkSmootherConfig, SmoothingKind};
 
@@ -27,10 +28,6 @@ const OUTPUT_QUEUE_CHUNKS: usize = 4;
 /// without reallocating them.
 pub const MIN_CHUNK_MS: u32 = 50;
 pub const MAX_CHUNK_MS: u32 = 1000;
-
-fn chunk_samples_for_rate(sample_rate: u32, chunk_ms: u32) -> usize {
-    ((sample_rate as u64 * chunk_ms as u64) / 1000).max(128) as usize
-}
 
 /// Settle time before acting on a reload request. A burst of changes (e.g.
 /// toggling CPU/CUDA quickly) collapses into a single reload, because rebuilding
