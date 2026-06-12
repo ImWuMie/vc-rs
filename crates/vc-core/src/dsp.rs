@@ -375,11 +375,14 @@ pub fn sola_offset(candidate: &[f32], reference: &[f32], search: usize) -> usize
     let max_offset = search.min(candidate.len().saturating_sub(frame));
     let mut best_offset = 0;
     let mut best_score = f32::MIN;
+    // Reference energy is independent of `offset`; hoist it out of the search
+    // loop so the normalized cross-correlation denominator only recomputes the
+    // window-dependent term per iteration. Result (best_offset) is unchanged.
+    let reference_energy = dot(&reference[..frame], &reference[..frame]);
     for offset in 0..=max_offset {
         let window = &candidate[offset..offset + frame];
         let nom = dot(window, &reference[..frame]);
-        let den =
-            (dot(window, window) * dot(&reference[..frame], &reference[..frame]) + 1e-9).sqrt();
+        let den = (dot(window, window) * reference_energy + 1e-9).sqrt();
         let score = nom / den;
         if score > best_score {
             best_score = score;

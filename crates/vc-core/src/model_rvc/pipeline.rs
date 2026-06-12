@@ -824,7 +824,13 @@ impl VoiceModel for RvcPipeline {
             }
         }
         if self.rms_mix_rate < 1.0 {
-            let output_rms_before_mix = dsp::rms(&converted);
+            // Captured before apply_rms_mix mutates `converted`, but only used
+            // in the debug! below; skip the extra RMS pass when debug is off.
+            let output_rms_before_mix = if tracing::enabled!(tracing::Level::DEBUG) {
+                dsp::rms(&converted)
+            } else {
+                0.0
+            };
             // `converted` has already been trimmed to the same tail that SOLA
             // will search over. Use the input buffer tail with the same
             // duration; taking the head would compare against past context
