@@ -9,8 +9,8 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use vc_app::{
-    AudioBackend, DenoiserMode, EngineController, EngineState, LiveParams, RealtimeConfig,
-    Smoother, TelemetrySnapshot,
+    AudioBackend, DenoiserMode, EngineController, EngineState, LiveParams, OutputDynamicsConfig,
+    RealtimeConfig, Smoother, TelemetrySnapshot,
 };
 use vc_core::Provider;
 
@@ -263,11 +263,13 @@ impl GuiSettings {
             noise_gate_attack_ms: self.noise_gate_attack_ms,
             noise_gate_release_ms: self.noise_gate_release_ms,
             noise_gate_floor: self.noise_gate_floor,
-            volume_envelope: self.volume_envelope,
-            rms_mix_rate: self.rms_mix_rate,
-            auto_output_gain: self.auto_output_gain,
-            target_output_rms: self.target_output_rms,
-            max_output_gain: self.max_output_gain,
+            output_dynamics: OutputDynamicsConfig {
+                volume_envelope: self.volume_envelope,
+                rms_mix_rate: self.rms_mix_rate,
+                auto_output_gain: self.auto_output_gain,
+                target_output_rms: self.target_output_rms,
+                max_output_gain: self.max_output_gain,
+            },
             passthrough: self.passthrough,
             debug_input_wav: None,
             debug_output_wav: None,

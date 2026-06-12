@@ -10,7 +10,9 @@ use vc_app::{
     write_wav_mono, DenoiserMode, EngineController, EngineState, LiveParams, RealtimeConfig,
 };
 use vc_core::dsp;
-use vc_core::model_rvc::{F0PostprocessConfig, RvcPipeline, RvcPipelineConfig, VoiceModel};
+use vc_core::model_rvc::{
+    F0PostprocessConfig, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig, VoiceModel,
+};
 use vc_core::sola::{self, ChunkSmootherConfig, SmoothingKind};
 
 use crate::cli::{
@@ -55,11 +57,13 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         noise_gate_attack_ms: args.noise_gate_attack_ms,
         noise_gate_release_ms: args.noise_gate_release_ms,
         noise_gate_floor: args.noise_gate_floor,
-        volume_envelope: args.volume_envelope,
-        rms_mix_rate: args.rms_mix_rate,
-        auto_output_gain: args.auto_output_gain,
-        target_output_rms: args.target_output_rms,
-        max_output_gain: args.max_output_gain,
+        output_dynamics: OutputDynamicsConfig {
+            volume_envelope: args.volume_envelope,
+            rms_mix_rate: args.rms_mix_rate,
+            auto_output_gain: args.auto_output_gain,
+            target_output_rms: args.target_output_rms,
+            max_output_gain: args.max_output_gain,
+        },
         passthrough: args.passthrough,
         debug_input_wav: args.debug_input_wav,
         debug_output_wav: args.debug_output_wav,
@@ -148,11 +152,13 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         volume_excluded_ms: DEFAULT_CROSSFADE_MS,
         extra_convert_ms: args.extra_convert_ms,
         output_gain: args.output_gain,
-        volume_envelope: args.volume_envelope,
-        rms_mix_rate: args.rms_mix_rate,
-        auto_output_gain: args.auto_output_gain,
-        target_output_rms: args.target_output_rms,
-        max_output_gain: args.max_output_gain,
+        output_dynamics: OutputDynamicsConfig {
+            volume_envelope: args.volume_envelope,
+            rms_mix_rate: args.rms_mix_rate,
+            auto_output_gain: args.auto_output_gain,
+            target_output_rms: args.target_output_rms,
+            max_output_gain: args.max_output_gain,
+        },
         // F0 post-processing is disabled by default; CLI/preset wiring is a
         // separate task.
         f0_postprocess: F0PostprocessConfig::default(),

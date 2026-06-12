@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use nice_plug::prelude::util;
 use rtrb::{Consumer, Producer, RingBuffer};
 use vc_core::dsp::chunk_samples_for_rate;
-use vc_core::model_rvc::{F0PostprocessConfig, RvcPipeline, RvcPipelineConfig, VoiceModel};
+use vc_core::model_rvc::{
+    F0PostprocessConfig, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig, VoiceModel,
+};
 use vc_core::sola::{self, ChunkSmoother, ChunkSmootherConfig, SmoothingKind};
 
 use crate::config::PluginConfig;
@@ -497,11 +499,13 @@ impl WorkerCtx {
             volume_excluded_ms: self.crossfade_ms,
             extra_convert_ms: settings.extra_convert_ms,
             output_gain: 1.0,
-            volume_envelope: settings.volume_envelope,
-            rms_mix_rate: settings.rms_mix_rate,
-            auto_output_gain: settings.auto_output_gain,
-            target_output_rms: settings.target_output_rms,
-            max_output_gain: settings.max_output_gain,
+            output_dynamics: OutputDynamicsConfig {
+                volume_envelope: settings.volume_envelope,
+                rms_mix_rate: settings.rms_mix_rate,
+                auto_output_gain: settings.auto_output_gain,
+                target_output_rms: settings.target_output_rms,
+                max_output_gain: settings.max_output_gain,
+            },
             // F0 post-processing is disabled by default; UI wiring is a separate task.
             f0_postprocess: F0PostprocessConfig::default(),
         })

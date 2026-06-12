@@ -11,3 +11,4 @@ pub use realtime::{
     write_wav_mono, AudioBackend, DenoiserMode, DeviceList, EngineController, EngineState,
     EngineStatusSnapshot, LiveParams, RealtimeConfig, Smoother, TelemetrySnapshot,
 };
+pub use vc_core::model_rvc::OutputDynamicsConfig;

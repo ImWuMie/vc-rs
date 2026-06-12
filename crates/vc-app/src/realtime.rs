@@ -10,7 +10,8 @@ use rtrb::RingBuffer;
 use thread_priority::{set_current_thread_priority, ThreadPriority};
 use vc_core::dsp;
 use vc_core::model_rvc::{
-    F0PostprocessConfig, GpuPriority, PassthroughModel, RvcPipeline, RvcPipelineConfig, VoiceModel,
+    F0PostprocessConfig, GpuPriority, OutputDynamicsConfig, PassthroughModel, RvcPipeline,
+    RvcPipelineConfig, VoiceModel,
 };
 use vc_core::sola::{self, ChunkSmootherConfig, SmoothingKind};
 use vc_core::Provider;
@@ -80,11 +81,7 @@ pub struct RealtimeConfig {
     pub noise_gate_attack_ms: f32,
     pub noise_gate_release_ms: f32,
     pub noise_gate_floor: f32,
-    pub volume_envelope: bool,
-    pub rms_mix_rate: f32,
-    pub auto_output_gain: bool,
-    pub target_output_rms: f32,
-    pub max_output_gain: f32,
+    pub output_dynamics: OutputDynamicsConfig,
     pub passthrough: bool,
     pub debug_input_wav: Option<PathBuf>,
     pub debug_output_wav: Option<PathBuf>,
@@ -117,11 +114,7 @@ impl Default for RealtimeConfig {
             noise_gate_attack_ms: 5.0,
             noise_gate_release_ms: 50.0,
             noise_gate_floor: 0.0,
-            volume_envelope: false,
-            rms_mix_rate: 0.0,
-            auto_output_gain: false,
-            target_output_rms: 0.03,
-            max_output_gain: 512.0,
+            output_dynamics: OutputDynamicsConfig::default(),
             passthrough: false,
             debug_input_wav: None,
             debug_output_wav: None,
@@ -139,7 +132,8 @@ impl RealtimeConfig {
         if self.chunk_ms == 0 {
             bail!("chunk size must be greater than zero");
         }
-        if !(0.0..=1.0).contains(&self.rms_mix_rate) || !self.rms_mix_rate.is_finite() {
+        let rms_mix_rate = self.output_dynamics.rms_mix_rate;
+        if !(0.0..=1.0).contains(&rms_mix_rate) || !rms_mix_rate.is_finite() {
             bail!("RMS mix rate must be a finite value in 0.0..=1.0");
         }
         if !self.noise_gate_attack_ms.is_finite() || self.noise_gate_attack_ms < 0.0 {
@@ -606,11 +600,7 @@ impl RealtimeSession {
                 volume_excluded_ms: config.crossfade_ms,
                 extra_convert_ms: config.extra_convert_ms,
                 output_gain: current_live.output_gain,
-                volume_envelope: config.volume_envelope,
-                rms_mix_rate: config.rms_mix_rate,
-                auto_output_gain: config.auto_output_gain,
-                target_output_rms: config.target_output_rms,
-                max_output_gain: config.max_output_gain,
+                output_dynamics: config.output_dynamics,
                 // F0 post-processing is disabled by default; GUI/CLI wiring is a
                 // separate task.
                 f0_postprocess: F0PostprocessConfig::default(),

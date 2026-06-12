@@ -107,6 +107,38 @@ pub struct RvcPipeline {
     pitchf_postprocessed_scratch: Vec<f32>,
 }
 
+/// Post-conversion output level shaping, applied after inference.
+///
+/// Grouped because every front-end carries the same five knobs verbatim and
+/// passes them straight through `RealtimeConfig` into `RvcPipelineConfig`;
+/// keeping them as one unit means adding an output-level knob touches the
+/// struct, not each front-end's field-by-field config mapping. `output_gain`
+/// is deliberately *not* here: it is a live (per-block) parameter, not static
+/// load-time config.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputDynamicsConfig {
+    /// Match the converted output's short-term envelope to the input's.
+    pub volume_envelope: bool,
+    /// Blend ratio (0..=1) for mixing input RMS back into the output level.
+    pub rms_mix_rate: f32,
+    /// Automatically scale output toward `target_output_rms`.
+    pub auto_output_gain: bool,
+    pub target_output_rms: f32,
+    pub max_output_gain: f32,
+}
+
+impl Default for OutputDynamicsConfig {
+    fn default() -> Self {
+        Self {
+            volume_envelope: false,
+            rms_mix_rate: 0.0,
+            auto_output_gain: false,
+            target_output_rms: 0.03,
+            max_output_gain: 512.0,
+        }
+    }
+}
+
 pub struct RvcPipelineConfig<'a> {
     pub model: &'a Path,
     pub embedder: &'a Path,
@@ -130,11 +162,7 @@ pub struct RvcPipelineConfig<'a> {
     pub volume_excluded_ms: u32,
     pub extra_convert_ms: u32,
     pub output_gain: f32,
-    pub volume_envelope: bool,
-    pub rms_mix_rate: f32,
-    pub auto_output_gain: bool,
-    pub target_output_rms: f32,
-    pub max_output_gain: f32,
+    pub output_dynamics: OutputDynamicsConfig,
     pub f0_postprocess: F0PostprocessConfig,
 }
 
@@ -203,11 +231,11 @@ impl RvcPipeline {
             volume_excluded_ms: config.volume_excluded_ms,
             extra_convert_samples,
             output_gain: config.output_gain,
-            volume_envelope: config.volume_envelope,
-            rms_mix_rate: config.rms_mix_rate,
-            auto_output_gain: config.auto_output_gain,
-            target_output_rms: config.target_output_rms,
-            max_output_gain: config.max_output_gain,
+            volume_envelope: config.output_dynamics.volume_envelope,
+            rms_mix_rate: config.output_dynamics.rms_mix_rate,
+            auto_output_gain: config.output_dynamics.auto_output_gain,
+            target_output_rms: config.output_dynamics.target_output_rms,
+            max_output_gain: config.output_dynamics.max_output_gain,
             stream_state: RvcStreamState::new(),
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
@@ -569,11 +597,11 @@ impl RvcPipeline {
             volume_excluded_ms: config.volume_excluded_ms,
             extra_convert_samples,
             output_gain: config.output_gain,
-            volume_envelope: config.volume_envelope,
-            rms_mix_rate: config.rms_mix_rate,
-            auto_output_gain: config.auto_output_gain,
-            target_output_rms: config.target_output_rms,
-            max_output_gain: config.max_output_gain,
+            volume_envelope: config.output_dynamics.volume_envelope,
+            rms_mix_rate: config.output_dynamics.rms_mix_rate,
+            auto_output_gain: config.output_dynamics.auto_output_gain,
+            target_output_rms: config.output_dynamics.target_output_rms,
+            max_output_gain: config.output_dynamics.max_output_gain,
             stream_state: RvcStreamState::new(),
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
