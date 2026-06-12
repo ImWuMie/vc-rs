@@ -9,6 +9,9 @@ description = "Reusable RVC voice conversion pipeline (model_rvc, dsp, sola)"
 # DEP_VC_RS_NATIVE_TENSORRT_* env vars (used to emit /DELAYLOAD link args).
 links = "vc_rs_native_tensorrt"
 
+[lints]
+workspace = true
+
 [features]
 # Enables `clap::ValueEnum` derivation on shared config enums (e.g. `Provider`)
 # so the CLI can use them directly as `value_enum` args. Plugins leave it off.

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Shared realtime application runtime for vc-rs frontends"
 
+[lints]
+workspace = true
+
 [features]
 default = ["windowsml", "tensorrt", "rnnoise"]
 windowsml = ["vc-core/windowsml"]

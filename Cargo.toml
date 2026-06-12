@@ -8,6 +8,15 @@ version = "0.2.1"
 edition = "2021"
 license = "MIT"
 
+# Central lint policy for every workspace crate. Each member opts in with
+# `[lints] workspace = true`, so tuning a lint here is the single knob — no more
+# per-file pragmas scattered to keep clippy quiet. CI runs clippy with
+# `-D warnings`, which turns this baseline into a hard gate; intentional
+# exceptions stay as narrowly-scoped `#[allow(...)]` at the offending item with a
+# reason, not as a blanket relaxation here.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
 # Drop symbols/debug info from shipped binaries. Absolute build-machine paths
 # (which include the developer's user name, via panic-location / dep + std source
 # strings in .rdata) are scrubbed separately with rustc --remap-path-prefix,

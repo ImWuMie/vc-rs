@@ -1,0 +1,61 @@
+# cargo-deny policy — supply-chain gate for the dependency graph.
+#
+# Run locally with `cargo deny check` (install: `cargo install cargo-deny`); CI
+# runs it on every push/PR. Scope is the only shipped target (Windows x64), so
+# unix-only transitive deps don't generate noise.
+#
+# The license allow-list mirrors scripts/licenses/about.toml — the set already
+# vetted for the third-party notices shipped with the binaries. Keep the two in
+# sync: a new permissive license belongs in BOTH. Copyleft licenses are
+# deliberately excluded; if a dep needs one, that's a review decision, not a
+# config tweak.
+
+[graph]
+targets = [{ triple = "x86_64-pc-windows-msvc" }]
+# Provider backends are mutually exclusive feature sets (ort vs native tensorrt),
+# so resolve the default graph rather than unioning all features.
+all-features = false
+
+[advisories]
+version = 2
+# RUSTSEC ignores go here with a one-line rationale, e.g.
+#   "RUSTSEC-0000-0000", # unmaintained transitive dep, no fix available yet
+ignore = []
+
+[licenses]
+version = 2
+# Skip license checks on our own `publish = false` workspace crates (e.g. xtask
+# carries no license field). Mirrors `private = { ignore = true }` in
+# scripts/licenses/about.toml; third-party deps are still fully checked.
+private = { ignore = true }
+# Accept a dual/OR license if any branch is allowed; raise the confidence floor
+# so a fuzzy license-text match never silently passes.
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+# Per-crate license exceptions (crate + the SPDX it's allowed to use) go here.
+exceptions = []
+
+[bans]
+# Duplicate versions are a warning, not a failure: a single transitive dep often
+# pins an older minor and blocking the build over it has poor cost/benefit. The
+# warning still surfaces drift worth occasionally deduping.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

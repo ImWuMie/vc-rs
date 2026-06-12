@@ -1,0 +1,76 @@
+# Continuous integration: format, lint, test, and supply-chain checks.
+#
+# Hard design constraint — CI must run on a stock GitHub runner with NO NVIDIA
+# stack and NO Windows App SDK Runtime installed. Two things make that possible:
+#
+#   * VC_RS_ENABLE_NATIVE_TENSORRT=0 makes vc-core/build.rs skip the cc shim and
+#     the nvinfer link, so the default feature set (windowsml + tensorrt) builds
+#     and lints without CUDA/TensorRT. The native-TensorRT FFI behind
+#     #[cfg(native_tensorrt)] still needs the GPU SDKs and is only linted locally
+#     via `just lint`; CI cannot cover it.
+#   * `windowsml` loads ORT/DirectML dynamically (ort load-dynamic), so it
+#     type-checks without the runtime DLL present — fine for clippy, which never
+#     opens a session. Tests, which would, run on the self-contained `cpu`
+#     feature (static ORT CPU) instead.
+#
+# So: clippy on the default (shipped) feature set is the lint gate; tests run on
+# the deterministic `cpu` feature. Keep this green — `-D warnings` is enforced.
+
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+# A newer push to the same ref cancels its still-running CI.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the GPU stack out of every job (see header).
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+
+jobs:
+  # ---- Format + lint: the shipped feature set (windowsml + tensorrt stub) ----
+  lint:
+    name: fmt + clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt (check only)
+        run: cargo fmt --all --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ---- Tests on the self-contained CPU provider (real, deterministic) ----
+  test:
+    name: test (cpu)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test (cpu feature)
+        run: >
+          cargo test
+          -p vc-core -p vc-app -p vc-cli
+          --no-default-features --features cpu
+
+  # ---- Supply chain: licenses, advisories, duplicate/banned deps ----
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

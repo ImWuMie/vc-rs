@@ -118,6 +118,25 @@ pwsh -File scripts/verify.ps1   # cargo test + bundle smoke test
 First-time SDK setup, packaging, and env details: [`scripts/README.md`](scripts/README.md)
 and [`docs/development_ja.md`](docs/development_ja.md).
 
+### CI quality gates
+
+`.github/workflows/ci.yml` runs on every push to `main`/`dev` and on PRs, on a
+stock GPU-less runner (`VC_RS_ENABLE_NATIVE_TENSORRT=0`):
+
+- **fmt + clippy** — `cargo fmt --all --check` and `cargo clippy --workspace
+  --all-targets -- -D warnings` on the default (shipped) feature set. Warnings
+  are denied, so keep the tree clean: lint policy is centralized in
+  `[workspace.lints]` (root `Cargo.toml`); intentional exceptions are
+  narrowly-scoped `#[allow(...)]` with a reason at the item, not a relaxation
+  there. The native-TensorRT FFI (`#[cfg(native_tensorrt)]`) only lints locally
+  via `just lint` — CI can't reach it.
+- **test (cpu)** — `cargo test -p vc-core -p vc-app -p vc-cli
+  --no-default-features --features cpu`: the self-contained static-ORT-CPU path,
+  so tests run deterministically without the Windows App SDK Runtime or GPU SDKs.
+- **cargo-deny** — `deny.toml` gates licenses (allow-list mirrors
+  `scripts/licenses/about.toml`), advisories, and banned/duplicate deps. Run it
+  locally with `cargo deny check`.
+
 ## VST3 plugin notes
 
 Model/backend/chunk edits are **staged** in the egui editor and apply only on
