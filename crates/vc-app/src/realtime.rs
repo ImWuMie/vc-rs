@@ -10,10 +10,11 @@ use rtrb::RingBuffer;
 use thread_priority::{set_current_thread_priority, ThreadPriority};
 use vc_core::dsp;
 use vc_core::model_rvc::{
-    set_process_gpu_priority, F0Config, GpuPriority, LiveParams, NoiseGateShaping,
-    OutputDynamicsConfig, PassthroughModel, RvcPipeline, RvcPipelineConfig, VoiceModel,
+    set_process_gpu_priority, ChunkConverter, ChunkOutputConfig, ChunkStats, F0Config, GpuPriority,
+    LiveParams, NoiseGateShaping, OutputDynamicsConfig, PassthroughModel, RvcPipeline,
+    RvcPipelineConfig, VoiceModel,
 };
-use vc_core::sola::{self, ChunkSmootherConfig, SmoothingKind};
+use vc_core::sola::SmoothingKind;
 use vc_core::Provider;
 
 use crate::audio::{self, AudioStream, RealtimeAudio};
@@ -532,27 +533,40 @@ fn wasapi_device_names() -> Result<(Vec<String>, Vec<String>)> {
 // chase to the inference hot path for no real memory benefit, so keep it inline.
 #[allow(clippy::large_enum_variant)]
 enum RuntimeModel {
-    Passthrough(PassthroughModel),
-    Rvc(RvcPipeline),
+    Passthrough {
+        model: PassthroughModel,
+        resampler: dsp::StreamingResampleMono,
+    },
+    Rvc(ChunkConverter<RvcPipeline>),
 }
 
 impl RuntimeModel {
-    fn apply_live(&mut self, live: &LiveParams) {
-        if let Self::Rvc(model) = self {
-            model.apply_live(live);
-        }
-    }
-}
-
-impl VoiceModel for RuntimeModel {
-    fn process(
+    fn process_chunk(
         &mut self,
         audio: &[f32],
         sample_rate: u32,
-    ) -> Result<vc_core::model_rvc::ModelOutput> {
+        live: &LiveParams,
+        prepared: &mut Vec<f32>,
+    ) -> Result<ChunkStats> {
         match self {
-            Self::Passthrough(model) => model.process(audio, sample_rate),
-            Self::Rvc(model) => model.process(audio, sample_rate),
+            Self::Passthrough { model, resampler } => {
+                let out = model.process(audio, sample_rate)?;
+                prepared.clear();
+                resampler.process_into(&out.audio, prepared)?;
+                Ok(ChunkStats {
+                    silent: out.silent,
+                    inference_time: out.inference_time,
+                    input_rms: out.input_rms,
+                    output_rms: out.output_rms,
+                    model_output_samples: out.audio.len(),
+                })
+            }
+            Self::Rvc(converter) => {
+                converter.model_mut().apply_live(live);
+                let converted = converter.process_chunk(audio, sample_rate, None)?;
+                *prepared = converted.audio;
+                Ok(converted.stats)
+            }
         }
     }
 }
@@ -597,7 +611,13 @@ impl RealtimeSession {
         let debug_input = Arc::new(Mutex::new(Vec::new()));
         let debug_output = Arc::new(Mutex::new(Vec::new()));
         let model = if config.passthrough {
-            RuntimeModel::Passthrough(PassthroughModel)
+            RuntimeModel::Passthrough {
+                model: PassthroughModel,
+                resampler: dsp::StreamingResampleMono::new(
+                    input_rate as usize,
+                    output_rate as usize,
+                )?,
+            }
         } else {
             let pipeline_config = config.pipeline_config(input_rate, input_chunk, &current_live);
             let pipeline = match config.denoiser_mode {
@@ -613,7 +633,17 @@ impl RealtimeSession {
                     }
                 }
             };
-            RuntimeModel::Rvc(pipeline)
+            RuntimeModel::Rvc(ChunkConverter::new(
+                pipeline,
+                ChunkOutputConfig {
+                    kind: config.smoother.kind(),
+                    output_sample_rate: output_rate,
+                    output_chunk_samples: output_chunk,
+                    crossfade_ms: config.crossfade_ms,
+                    sola_search_ms: config.sola_search_ms,
+                    tail_discard_ms: config.rvc_output_tail_discard_ms,
+                },
+            ))
         };
 
         let output_capacity = output_chunk * OUTPUT_QUEUE_CHUNKS;
@@ -635,7 +665,6 @@ impl RealtimeSession {
         let worker_debug_output = Arc::clone(&debug_output);
         let capture_input = config.debug_input_wav.is_some();
         let capture_output = config.debug_output_wav.is_some();
-        let smoothing_enabled = !config.passthrough;
         let mut worker = Some(
             thread::Builder::new()
                 .name("vc-app-inference".to_string())
@@ -646,17 +675,6 @@ impl RealtimeSession {
                     let mut model = model;
                     let mut input_acc = Vec::<f32>::with_capacity(input_chunk * 2);
                     let mut prepared = Vec::<f32>::with_capacity(output_chunk * 2);
-                    let mut resampler = match dsp::StreamingResampleMono::new(
-                        input_rate as usize,
-                        output_rate as usize,
-                    ) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            worker_running.store(false, Ordering::SeqCst);
-                            return;
-                        }
-                    };
-                    let mut smoother = None::<(u32, sola::ChunkSmoother)>;
                     while worker_running.load(Ordering::SeqCst) {
                         let available = input_consumer
                             .slots()
@@ -680,57 +698,28 @@ impl RealtimeSession {
                                 samples.extend_from_slice(&input_acc[..input_chunk]);
                             }
                         }
-                        model.apply_live(&live.load());
-                        let out = model.process(&input_acc[..input_chunk], input_rate);
+                        let stats = model.process_chunk(
+                            &input_acc[..input_chunk],
+                            input_rate,
+                            &live.load(),
+                            &mut prepared,
+                        );
                         input_acc.clear();
-                        let Ok(out) = out else {
+                        let Ok(stats) = stats else {
                             worker_running.store(false, Ordering::SeqCst);
                             break;
                         };
                         worker_telemetry.chunks.fetch_add(1, Ordering::Relaxed);
                         worker_telemetry
                             .inference_us
-                            .store(out.inference_time.as_micros() as u64, Ordering::Relaxed);
+                            .store(stats.inference_time.as_micros() as u64, Ordering::Relaxed);
                         worker_telemetry
                             .input_rms_bits
-                            .store(out.input_rms.to_bits(), Ordering::Relaxed);
+                            .store(stats.input_rms.to_bits(), Ordering::Relaxed);
                         worker_telemetry
                             .output_rms_bits
-                            .store(out.output_rms.to_bits(), Ordering::Relaxed);
-                        let output_silent = out.silent;
-                        prepared.clear();
-                        if smoothing_enabled {
-                            if smoother.as_ref().map(|(rate, _)| *rate) != Some(out.sample_rate) {
-                                smoother = Some((
-                                    out.sample_rate,
-                                    sola::model_domain_chunk_smoother(ChunkSmootherConfig {
-                                        kind: config.smoother.kind(),
-                                        output_chunk_samples: output_chunk,
-                                        output_sample_rate: output_rate,
-                                        model_sample_rate: out.sample_rate,
-                                        crossfade_ms: config.crossfade_ms,
-                                        sola_search_ms: config.sola_search_ms,
-                                        tail_discard_ms: config.rvc_output_tail_discard_ms,
-                                    }),
-                                ));
-                            }
-                            match sola::prepare_model_output(
-                                out,
-                                output_rate,
-                                output_chunk,
-                                &mut smoother.as_mut().unwrap().1,
-                                None,
-                            ) {
-                                Ok(value) => prepared = value.audio,
-                                Err(_) => {
-                                    worker_running.store(false, Ordering::SeqCst);
-                                    break;
-                                }
-                            }
-                        } else if resampler.process_into(&out.audio, &mut prepared).is_err() {
-                            worker_running.store(false, Ordering::SeqCst);
-                            break;
-                        }
+                            .store(stats.output_rms.to_bits(), Ordering::Relaxed);
+                        let output_silent = stats.silent;
                         if capture_output {
                             if let Ok(mut samples) = worker_debug_output.lock() {
                                 samples.extend_from_slice(&prepared);

@@ -11,10 +11,10 @@ use vc_app::{
 };
 use vc_core::dsp;
 use vc_core::model_rvc::{
-    set_process_gpu_priority, F0Config, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline,
-    RvcPipelineConfig, VoiceModel,
+    set_process_gpu_priority, ChunkConverter, ChunkOutputConfig, F0Config, NoiseGateShaping,
+    OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
-use vc_core::sola::{self, ChunkSmootherConfig, SmoothingKind};
+use vc_core::sola::SmoothingKind;
 
 use crate::cli::{
     Denoiser, RunArgs, Smoother, WavArgs, DEFAULT_CROSSFADE_MS, DEFAULT_SOLA_SEARCH_MS,
@@ -141,7 +141,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
     // WAV mode builds the pipeline directly (realtime goes via vc-app, which
     // applies this on session start); set the process GPU priority here too.
     set_process_gpu_priority(args.gpu_priority.into());
-    let mut model = RvcPipeline::load(RvcPipelineConfig {
+    let model = RvcPipeline::load(RvcPipelineConfig {
         model: &args.model,
         embedder: &args.embedder,
         embedder_output: args.embedder_output.as_deref(),
@@ -178,41 +178,36 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             max_output_gain: args.max_output_gain,
         },
     })?;
+    let mut converter = ChunkConverter::new(
+        model,
+        ChunkOutputConfig {
+            kind: smoothing_kind(args.smoother),
+            output_sample_rate: spec.sample_rate,
+            output_chunk_samples: chunk_samples,
+            crossfade_ms: DEFAULT_CROSSFADE_MS,
+            sola_search_ms: DEFAULT_SOLA_SEARCH_MS,
+            tail_discard_ms: args.rvc_output_tail_discard_ms,
+        },
+    );
     let mut output = Vec::with_capacity(samples.len());
     let mut chunks = 0usize;
     let mut final_tail = Vec::new();
     let preroll = vec![0.0; chunk_samples];
-    let preroll_out = model.process(&preroll, spec.sample_rate)?;
-    let mut joiner = sola::model_domain_chunk_smoother(ChunkSmootherConfig {
-        kind: smoothing_kind(args.smoother),
-        output_chunk_samples: chunk_samples,
-        output_sample_rate: spec.sample_rate,
-        model_sample_rate: preroll_out.sample_rate,
-        crossfade_ms: DEFAULT_CROSSFADE_MS,
-        sola_search_ms: DEFAULT_SOLA_SEARCH_MS,
-        tail_discard_ms: args.rvc_output_tail_discard_ms,
-    });
-    joiner.prime_model_output(&preroll_out.audio, &preroll_out.pitchf);
+    converter.prime(&preroll, spec.sample_rate)?;
 
     let mut fixed_chunk_pad = Vec::new();
     for chunk in samples.chunks(chunk_samples) {
         let model_input = wav_model_input_chunk(chunk, chunk_samples, &mut fixed_chunk_pad);
-        let out = model.process(model_input, spec.sample_rate)?;
+        let converted =
+            converter.process_chunk(model_input, spec.sample_rate, Some(&mut final_tail))?;
         debug!(
             "wav chunk={} input_samples={} output_samples={}",
             chunks,
             chunk.len(),
-            out.audio.len()
+            converted.stats.model_output_samples
         );
         chunks += 1;
-        let prepared = sola::prepare_model_output(
-            out,
-            spec.sample_rate,
-            chunk_samples,
-            &mut joiner,
-            Some(&mut final_tail),
-        )?;
-        output.extend_from_slice(&prepared.audio);
+        output.extend_from_slice(&converted.audio);
     }
     if output.len() < samples.len() {
         let missing = samples.len() - output.len();

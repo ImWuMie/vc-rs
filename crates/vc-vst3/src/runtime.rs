@@ -15,10 +15,10 @@ use nice_plug::prelude::util;
 use rtrb::{Consumer, Producer, RingBuffer};
 use vc_core::dsp::chunk_samples_for_rate;
 use vc_core::model_rvc::{
-    F0Config, LiveParams, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
-    VoiceModel,
+    ChunkConverter, ChunkOutputConfig, F0Config, LiveParams, NoiseGateShaping,
+    OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
-use vc_core::sola::{self, ChunkSmoother, ChunkSmootherConfig, SmoothingKind};
+use vc_core::sola::SmoothingKind;
 
 use crate::config::PluginConfig;
 use crate::params::VcRvcParams;
@@ -227,20 +227,15 @@ impl WorkerCtx {
     }
 
     fn run(mut self) {
-        let output_sample_rate = self.sample_rate;
         let mut chunk_samples = self.current_chunk_samples();
-        let mut output_chunk_samples = chunk_samples;
-        let mut smoother: Option<(u32, ChunkSmoother)> = None;
         let mut input_acc = Vec::<f32>::with_capacity(chunk_samples * 2);
-        let mut prepared = Vec::<f32>::with_capacity(output_chunk_samples * 2);
 
         // Do not load models during host startup, plugin scan, or project
         // restore. Some DAWs instantiate and tear down plugins on UI/control
         // threads, and CUDA/ORT loading can crash or stall the entire host if it
         // happens implicitly. The editor's Load / Reload button is the explicit
         // boundary for model (re)initialization.
-        let mut pipeline = None;
-        let mut smoothing_kind = self.current_smoothing_kind();
+        let mut converter = None;
         self.set_idle_status();
         let mut reload_at: Option<Instant> = None;
 
@@ -258,16 +253,14 @@ impl WorkerCtx {
                 self.dirty.store(false, Ordering::SeqCst);
                 // chunk_ms may have changed; recompute and re-report latency.
                 chunk_samples = self.current_chunk_samples();
-                output_chunk_samples = chunk_samples;
                 self.latency
                     .store(self.latency_samples(chunk_samples), Ordering::Relaxed);
                 // Drop the old pipeline (releasing its CUDA context) before
                 // building the new one, so the two never coexist.
-                drop(pipeline.take());
-                smoother = None;
+                drop(converter.take());
                 let (new_pipeline, new_kind) = self.load_current(chunk_samples);
-                pipeline = new_pipeline;
-                smoothing_kind = new_kind;
+                converter = new_pipeline
+                    .map(|pipeline| self.chunk_converter(pipeline, new_kind, chunk_samples));
                 input_acc.clear();
                 self.drain_input();
             }
@@ -296,7 +289,7 @@ impl WorkerCtx {
             }
 
             let chunk = &input_acc[..chunk_samples];
-            let Some(pipeline) = pipeline.as_mut() else {
+            let Some(converter) = converter.as_mut() else {
                 // No pipeline: discard input and stay silent.
                 input_acc.clear();
                 continue;
@@ -305,7 +298,7 @@ impl WorkerCtx {
             // Apply automatable parameters before converting this chunk. Builds
             // the same `LiveParams` the standalone worker does, so both drive the
             // single `apply_live` entry point rather than diverging set_* calls.
-            pipeline.apply_live(&LiveParams {
+            converter.model_mut().apply_live(&LiveParams {
                 pitch_shift: self.params.pitch_shift.value(),
                 speaker_id: self.params.speaker_id.value() as i64,
                 input_gain: util::db_to_gain(self.params.input_gain_db.value()),
@@ -314,50 +307,18 @@ impl WorkerCtx {
                 noise_gate_threshold: util::db_to_gain(self.params.noise_gate_threshold_db.value()),
             });
 
-            let out = match pipeline.process(chunk, self.sample_rate) {
-                Ok(out) => out,
+            let converted = match converter.process_chunk(chunk, self.sample_rate, None) {
+                Ok(converted) => converted,
                 Err(err) => {
-                    nice_plug::nice_error!("vc-vst3: model processing failed: {err:#}");
+                    nice_plug::nice_error!("vc-vst3: chunk conversion failed: {err:#}");
                     self.running.store(false, Ordering::SeqCst);
                     break;
                 }
             };
             input_acc.clear();
 
-            // (Re)build the chunk smoother when the model output rate changes.
-            let model_sample_rate = out.sample_rate;
-            if smoother.as_ref().map(|(rate, _)| *rate) != Some(model_sample_rate) {
-                let joiner = sola::model_domain_chunk_smoother(ChunkSmootherConfig {
-                    kind: smoothing_kind,
-                    output_chunk_samples,
-                    output_sample_rate,
-                    model_sample_rate,
-                    crossfade_ms: self.crossfade_ms,
-                    sola_search_ms: self.sola_search_ms,
-                    tail_discard_ms: self.tail_discard_ms,
-                });
-                smoother = Some((model_sample_rate, joiner));
-            }
-            let joiner = &mut smoother.as_mut().expect("smoother set above").1;
-
-            prepared.clear();
-            match sola::prepare_model_output(
-                out,
-                output_sample_rate,
-                output_chunk_samples,
-                joiner,
-                None,
-            ) {
-                Ok(result) => prepared = result.audio,
-                Err(err) => {
-                    nice_plug::nice_error!("vc-vst3: output smoothing failed: {err:#}");
-                    self.running.store(false, Ordering::SeqCst);
-                    break;
-                }
-            }
-
             // Push to the output ring; drop the tail if the consumer is behind.
-            let _ = self.output_producer.push_partial_slice(&prepared);
+            let _ = self.output_producer.push_partial_slice(&converted.audio);
         }
     }
 
@@ -386,10 +347,6 @@ impl WorkerCtx {
         }
     }
 
-    fn current_smoothing_kind(&self) -> SmoothingKind {
-        self.params.settings.read().unwrap().smoothing_kind()
-    }
-
     /// Current chunk size in samples, from the persisted (clamped) `chunk_ms`.
     fn current_chunk_samples(&self) -> usize {
         let chunk_ms = self
@@ -411,6 +368,25 @@ impl WorkerCtx {
     fn latency_samples(&self, chunk_samples: usize) -> u32 {
         let extra = chunk_samples_for_rate(self.sample_rate, self.output_extra_ms());
         (chunk_samples + extra) as u32
+    }
+
+    fn chunk_converter(
+        &self,
+        pipeline: RvcPipeline,
+        kind: SmoothingKind,
+        chunk_samples: usize,
+    ) -> ChunkConverter<RvcPipeline> {
+        ChunkConverter::new(
+            pipeline,
+            ChunkOutputConfig {
+                kind,
+                output_sample_rate: self.sample_rate,
+                output_chunk_samples: chunk_samples,
+                crossfade_ms: self.crossfade_ms,
+                sola_search_ms: self.sola_search_ms,
+                tail_discard_ms: self.tail_discard_ms,
+            },
+        )
     }
 
     /// Build a pipeline from the current persisted settings, reporting status.
