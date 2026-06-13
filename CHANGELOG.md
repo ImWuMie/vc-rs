@@ -17,7 +17,9 @@ versioning and publishing procedure.
 - GPU Priority now applies to every backend, not just native TensorRT: it sets a
   process-wide Windows GPU scheduling priority class (in addition to the
   TensorRT CUDA stream priority on that path), so the control is shown in the GUI
-  for Windows ML / CPU builds as well.
+  for Windows ML / CPU builds as well. High additionally opts the process out of
+  CPU power throttling (EcoQoS) so inference keeps full clock when the window is
+  in the background, removing the large foreground/background timing difference.
 
 ## [0.2.1] - 2026-06-10
 

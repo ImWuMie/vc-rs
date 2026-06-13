@@ -10,9 +10,9 @@ use rtrb::RingBuffer;
 use thread_priority::{set_current_thread_priority, ThreadPriority};
 use vc_core::dsp;
 use vc_core::model_rvc::{
-    set_process_gpu_priority, ChunkConverter, ChunkOutputConfig, ChunkStats, F0Config, GpuPriority,
-    LiveParams, NoiseGateShaping, OutputDynamicsConfig, PassthroughModel, RvcPipeline,
-    RvcPipelineConfig, VoiceModel,
+    set_process_gpu_priority, set_process_power_throttling, ChunkConverter, ChunkOutputConfig,
+    ChunkStats, F0Config, GpuPriority, LiveParams, NoiseGateShaping, OutputDynamicsConfig,
+    PassthroughModel, RvcPipeline, RvcPipelineConfig, VoiceModel,
 };
 use vc_core::sola::SmoothingKind;
 use vc_core::Provider;
@@ -598,6 +598,12 @@ impl RealtimeSession {
         // the controller thread, off the audio callback, and re-applied on every
         // reconfigure so a changed setting takes effect on the next session.
         set_process_gpu_priority(config.gpu_priority);
+        // Disable CPU power throttling (EcoQoS) under High so inference stays on
+        // performance cores at full clock even when the window loses focus,
+        // removing the large foreground/background timing gap. Covers every
+        // thread (ORT intra-op pool, TensorRT CUDA orchestration, worker), which
+        // a per-thread override on the worker alone would not.
+        set_process_power_throttling(config.gpu_priority == GpuPriority::High);
         let audio = RealtimeAudio::open(
             config.audio_backend,
             config.wasapi_input_exclusive,

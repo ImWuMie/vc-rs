@@ -11,8 +11,8 @@ use vc_app::{
 };
 use vc_core::dsp;
 use vc_core::model_rvc::{
-    set_process_gpu_priority, ChunkConverter, ChunkOutputConfig, F0Config, NoiseGateShaping,
-    OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
+    set_process_gpu_priority, set_process_power_throttling, ChunkConverter, ChunkOutputConfig,
+    F0Config, GpuPriority, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
 
@@ -140,15 +140,19 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         .saturating_add(DEFAULT_SOLA_SEARCH_MS)
         .saturating_add(args.rvc_output_tail_discard_ms);
     // WAV mode builds the pipeline directly (realtime goes via vc-app, which
-    // applies this on session start); set the process GPU priority here too.
-    set_process_gpu_priority(args.gpu_priority.into());
+    // applies these on session start); set the process GPU priority and power
+    // throttling here too. High also opts out of EcoQoS so a background run
+    // keeps full clock.
+    let gpu_priority: GpuPriority = args.gpu_priority.into();
+    set_process_gpu_priority(gpu_priority);
+    set_process_power_throttling(gpu_priority == GpuPriority::High);
     let model = RvcPipeline::load(RvcPipelineConfig {
         model: &args.model,
         embedder: &args.embedder,
         embedder_output: args.embedder_output.as_deref(),
         f0_model: &args.f0_model,
         provider: args.provider,
-        gpu_priority: args.gpu_priority.into(),
+        gpu_priority,
         gpu_device_id: args.gpu_device_id,
         sample_rate: spec.sample_rate,
         chunk_samples,

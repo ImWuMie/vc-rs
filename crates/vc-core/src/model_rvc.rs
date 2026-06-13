@@ -41,7 +41,7 @@ pub use inspect::inspect_model;
 pub use pipeline::{
     F0Config, LiveParams, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
-pub use process_priority::set_process_gpu_priority;
+pub use process_priority::{set_process_gpu_priority, set_process_power_throttling};
 
 #[cfg(test)]
 mod tests;
