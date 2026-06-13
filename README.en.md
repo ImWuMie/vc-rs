@@ -21,6 +21,25 @@ source** — just download, extract, supply your models, and run.
 > [`docs/development_ja.md`](docs/development_ja.md). The internal design is in
 > [`docs/architecture.md`](docs/architecture.md).
 
+## Highlights
+
+- **Native Rust implementation** — no Python / PyTorch runtime. With no GC pauses
+  or interpreter overhead, worst-case processing time stays stable even in
+  real time, and distribution is lightweight (the windowsml build is a few MB).
+- **Glitch-resistant real-time design** — audio callbacks only move samples
+  through lock-free ring buffers; heavy work like inference is isolated on a
+  separate thread. Under load the callback never blocks — it drops input or emits
+  silence instead.
+- **Broad GPU support and a fastest mode** — Windows ML (DirectML) runs on
+  non-NVIDIA GPUs too, while native TensorRT offers the fastest path on NVIDIA GPUs.
+- **WAV mode shares the real-time path** — so audio-quality tuning can be verified
+  deterministically.
+
+> The conversion quality itself is essentially the same as other tools as long as
+> the same RVC model is used. vc-rs's strengths are **stability for real-time use**
+> (resistance to dropouts, room to tighten latency) and **being lightweight and
+> easy to use**.
+
 ## Download
 
 Get the latest version from
