@@ -53,3 +53,14 @@ cc = "1"
 
 [dev-dependencies]
 approx = "0.5"
+# Microbenchmark harness for the CPU hot paths (dsp/sola). Dev-only, so it never
+# ships in a distribution build. Pure-CPU benches don't enable the `tensorrt`
+# feature, so build.rs never compiles the native shim — `cargo bench -p vc-core`
+# needs no GPU stack.
+divan = "0.1"
+
+# Microbenchmarks for the vc-core CPU hot paths (resample, RMS, SOLA/PSOLA join,
+# noise gate). `harness = false` hands the binary to divan's own runner.
+[[bench]]
+name = "pipeline"
+harness = false

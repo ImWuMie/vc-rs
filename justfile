@@ -38,6 +38,12 @@ test-cpu:
 test:
     . ./scripts/activate.ps1; . ./scripts/rustflags.ps1; cargo test --workspace
 
+# Microbenchmarks for the vc-core CPU hot paths (dsp/sola). No GPU stack needed:
+# the bench target doesn't enable `tensorrt`, so the native shim is never built.
+# Filter to one bench with `just bench dsp_bench::rms`.
+bench *args:
+    cargo bench -p vc-core -- {{args}}
+
 # Dev CLI build — both backends in one vc-rs.exe (activates the GPU stack).
 build:
     . ./scripts/activate.ps1; . ./scripts/rustflags.ps1; cargo build --release
