@@ -13,11 +13,8 @@
 //! samples (the RVC output domain), and resampling benches use the 48k<->16k
 //! conversions the embedder/F0 front-end performs every chunk.
 
-use std::time::Duration;
-
 use divan::{black_box, Bencher};
 use vc_core::dsp::{self, NoiseGate, RmsMixScratch, StreamingResampleMono};
-use vc_core::model_rvc::ModelOutput;
 use vc_core::sola::SmoothingKind;
 use vc_core::sola::{model_domain_chunk_smoother, prepare_model_output, ChunkSmootherConfig};
 
@@ -194,32 +191,6 @@ mod dsp_bench {
 mod sola_bench {
     use super::*;
 
-    // Build a minimal `ModelOutput` carrying just the fields the chunk smoother
-    // reads (audio + pitchf + sample_rate); timing/metadata fields are inert here.
-    fn model_output(audio: Vec<f32>, pitchf: Vec<f32>, sample_rate: u32) -> ModelOutput {
-        ModelOutput {
-            raw_output_samples: audio.len(),
-            output_rms: dsp::rms(&audio),
-            convert_size: audio.len(),
-            out_size: audio.len(),
-            model_input_samples: audio.len(),
-            audio,
-            pitchf,
-            sample_rate,
-            inference_time: Duration::ZERO,
-            embedder_time: Duration::ZERO,
-            pitch_time: Duration::ZERO,
-            rvc_time: Duration::ZERO,
-            input_rms: 0.0,
-            voiced_ratio: 0.0,
-            applied_output_gain: 1.0,
-            feature_frames: 0,
-            pitch_frames: 0,
-            silent: false,
-            volume: 0.0,
-        }
-    }
-
     fn smoother_config(kind: SmoothingKind, output_chunk_samples: usize) -> ChunkSmootherConfig {
         // Mirrors the CLI's ChunkOutputConfig defaults (crates/vc-cli/src/engine.rs):
         // SOLA/PSOLA run in the 48 kHz model domain with output also at 48 kHz, so
@@ -238,8 +209,8 @@ mod sola_bench {
     // Full chunk-join path: `prepare_model_output` runs the SOLA/PSOLA offset
     // search + cross-fade and fits the result to the output chunk. This is the
     // closest model-free stand-in for a realtime chunk's post-inference cost.
-    // The smoother is primed once so we measure steady-state joins, and a fresh
-    // `ModelOutput` is moved in each iteration (the function consumes it).
+    // The smoother is primed once so we measure steady-state joins; the model
+    // audio/pitchf and the output buffer are reused like the realtime worker.
     #[divan::bench(args = [SmoothingKind::Sola, SmoothingKind::Psola])]
     fn prepare_model_output_chunk(bencher: Bencher, kind: SmoothingKind) {
         let chunk = CHUNK_48K_100MS;
@@ -252,11 +223,20 @@ mod sola_bench {
         joiner.prime_model_output(&audio, &pitchf);
 
         bencher
-            .with_inputs(|| model_output(audio.clone(), pitchf.clone(), 48_000))
-            .bench_local_values(|out| {
-                let prepared =
-                    prepare_model_output(out, 48_000, chunk, black_box(&mut joiner), None).unwrap();
-                black_box(prepared);
+            .with_inputs(Vec::<f32>::new)
+            .bench_local_values(|mut out| {
+                let sola_offset = prepare_model_output(
+                    &audio,
+                    &pitchf,
+                    48_000,
+                    48_000,
+                    chunk,
+                    black_box(&mut joiner),
+                    None,
+                    &mut out,
+                )
+                .unwrap();
+                black_box((sola_offset, out));
             });
     }
 }

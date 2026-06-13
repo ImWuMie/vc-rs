@@ -202,18 +202,23 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
     converter.prime(&preroll, spec.sample_rate)?;
 
     let mut fixed_chunk_pad = Vec::new();
+    let mut chunk_out = Vec::new();
     for chunk in samples.chunks(chunk_samples) {
         let model_input = wav_model_input_chunk(chunk, chunk_samples, &mut fixed_chunk_pad);
-        let converted =
-            converter.process_chunk(model_input, spec.sample_rate, Some(&mut final_tail))?;
+        let stats = converter.process_chunk(
+            model_input,
+            spec.sample_rate,
+            Some(&mut final_tail),
+            &mut chunk_out,
+        )?;
         debug!(
             "wav chunk={} input_samples={} output_samples={}",
             chunks,
             chunk.len(),
-            converted.stats.model_output_samples
+            stats.model_output_samples
         );
         chunks += 1;
-        output.extend_from_slice(&converted.audio);
+        output.extend_from_slice(&chunk_out);
     }
     if output.len() < samples.len() {
         let missing = samples.len() - output.len();

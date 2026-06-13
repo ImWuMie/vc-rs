@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -13,7 +12,7 @@ use super::f0_postprocess::{F0PostprocessConfig, F0Postprocessor};
 use super::inspect::{inspect_contentvec_input_name, inspect_rvc_model};
 use super::pitch::{
     align_pitchf_to_features_into, center_crop_pitchf_to_features_into, coarse_pitch_into,
-    pitchf_tail_for_output, voiced_ratio,
+    pitchf_tail_for_output_into, voiced_ratio,
 };
 use super::sessions::{HubertEmbedderSession, RmvpePitchSession, RvcModelSession};
 use super::shape::{
@@ -115,6 +114,11 @@ pub struct RvcPipeline {
     target_output_rms: f32,
     max_output_gain: f32,
     stream_state: RvcStreamState,
+    // Reused per-chunk buffer for the gain-scaled / denoised input, so `process`
+    // does not allocate a fresh Vec every chunk when input_gain != 1.0 or a
+    // denoiser is active. Empty when the zero-copy (gain==1.0, denoiser-off) path
+    // is taken.
+    input_scratch: Vec<f32>,
     input_reference_scratch: Vec<f32>,
     rms_mix_scratch: dsp::RmsMixScratch,
     pitchf_untrimmed_scratch: Vec<f32>,
@@ -341,6 +345,7 @@ impl RvcPipeline {
             target_output_rms: config.output_dynamics.target_output_rms,
             max_output_gain: config.output_dynamics.max_output_gain,
             stream_state: RvcStreamState::new(),
+            input_scratch: Vec::new(),
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -723,6 +728,7 @@ impl RvcPipeline {
             target_output_rms: config.output_dynamics.target_output_rms,
             max_output_gain: config.output_dynamics.max_output_gain,
             stream_state: RvcStreamState::new(),
+            input_scratch: Vec::new(),
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -814,6 +820,7 @@ impl RvcPipeline {
             },
         )?;
         self.stream_state = RvcStreamState::new();
+        self.input_scratch.clear();
         self.input_reference_scratch.clear();
         self.rms_mix_scratch = dsp::RmsMixScratch::default();
         self.pitchf_untrimmed_scratch.clear();
@@ -825,27 +832,46 @@ impl RvcPipeline {
 }
 
 impl VoiceModel for RvcPipeline {
-    fn process(&mut self, audio: &[f32], sample_rate: u32) -> Result<ModelOutput> {
+    fn process(
+        &mut self,
+        audio: &[f32],
+        sample_rate: u32,
+        out_audio: &mut Vec<f32>,
+        out_pitchf: &mut Vec<f32>,
+    ) -> Result<ModelOutput> {
         let total_start = Instant::now();
         let input_gain = self.input_gain.max(0.0);
-        let mut input_audio: Cow<'_, [f32]> = if (input_gain - 1.0).abs() > f32::EPSILON {
-            Cow::Owned(
-                audio
-                    .iter()
-                    .map(|sample| (*sample * input_gain).clamp(-1.0, 1.0))
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            Cow::Borrowed(audio)
-        };
-        // Noise reduction runs before RMS/silence detection and feature/F0
-        // extraction so the model sees the cleaned signal. Only an active
-        // denoiser forces an owned buffer (`to_mut` clones a borrowed slice);
-        // the gain==1.0 + denoiser-off path stays zero-copy.
-        if !matches!(self.input_denoiser, InputDenoiser::Off) {
-            self.input_denoiser.process_in_place(input_audio.to_mut())?;
+        let apply_gain = (input_gain - 1.0).abs() > f32::EPSILON;
+        let denoiser_active = !matches!(self.input_denoiser, InputDenoiser::Off);
+        // Only gain≠1.0 or an active denoiser need an owned buffer; the no-op
+        // path keeps `audio` as a zero-copy borrow. When an owned buffer is
+        // needed, reuse `input_scratch` instead of allocating a fresh Vec every
+        // chunk. Take it into a local so the borrow does not collide with the
+        // later `&mut self.stream_state` call; it is written back at the end of
+        // the function to retain the allocation.
+        let mut input_scratch = std::mem::take(&mut self.input_scratch);
+        if apply_gain || denoiser_active {
+            input_scratch.clear();
+            if apply_gain {
+                input_scratch.extend(
+                    audio
+                        .iter()
+                        .map(|sample| (*sample * input_gain).clamp(-1.0, 1.0)),
+                );
+            } else {
+                input_scratch.extend_from_slice(audio);
+            }
+            // Noise reduction runs before RMS/silence detection and feature/F0
+            // extraction so the model sees the cleaned signal.
+            if denoiser_active {
+                self.input_denoiser.process_in_place(&mut input_scratch)?;
+            }
         }
-        let input_audio = input_audio.as_ref();
+        let input_audio: &[f32] = if apply_gain || denoiser_active {
+            &input_scratch
+        } else {
+            audio
+        };
         let input_rms = dsp::rms(input_audio);
         let output_extra_len = ms_to_samples(RVC_SAMPLE_RATE, self.output_extra_ms);
         let volume_excluded_len = ms_to_samples(RVC_SAMPLE_RATE, self.volume_excluded_ms);
@@ -856,6 +882,9 @@ impl VoiceModel for RvcPipeline {
             volume_excluded_len,
             self.extra_convert_samples,
         )?;
+        // `input_audio` is no longer borrowed past this point; return the buffer
+        // so its capacity is reused on the next chunk.
+        self.input_scratch = input_scratch;
 
         let is_silent = self.silence_threshold > 0.0 && input_rms < self.silence_threshold;
         let output_silent = is_silent && self.stream_state.prev_silence;
@@ -968,9 +997,10 @@ impl VoiceModel for RvcPipeline {
 
         if SKIP_SILENT_CHUNKS && output_silent {
             // If previous chunk was also silent, keep returning silence without running the model to reduce CPU usage and avoid latency spikes from the embedder when silence ends.
+            out_audio.clear();
+            out_audio.resize(stream_input.out_size, 0.0);
+            out_pitchf.clear();
             return Ok(ModelOutput {
-                audio: vec![0.0; stream_input.out_size],
-                pitchf: Vec::new(),
                 sample_rate: RVC_SAMPLE_RATE,
                 inference_time: total_start.elapsed(),
                 embedder_time: Duration::ZERO,
@@ -991,48 +1021,51 @@ impl VoiceModel for RvcPipeline {
             });
         }
 
-        // RVC
+        // RVC. The converted samples are written straight into the caller-owned
+        // `out_audio` buffer (reused across chunks) and all post-processing runs
+        // in place on it; the output pitchf goes into `out_pitchf`.
         let rvc_start = Instant::now();
-        let mut converted = self.rvc.infer(
+        self.rvc.infer(
             &features.data,
             &features.shape,
             feature_len,
             pitch,
             pitchf,
             self.speaker_id,
+            out_audio,
         )?;
         let rvc_time = rvc_start.elapsed();
-        let raw_output_samples = converted.len();
-        keep_tail_in_place(&mut converted, stream_input.out_size);
-        let output_pitchf = pitchf_tail_for_output(pitchf, converted.len(), RVC_SAMPLE_RATE);
-        converted.iter_mut().for_each(|x| *x = x.clamp(-1.0, 1.0));
+        let raw_output_samples = out_audio.len();
+        keep_tail_in_place(out_audio, stream_input.out_size);
+        pitchf_tail_for_output_into(pitchf, out_audio.len(), RVC_SAMPLE_RATE, out_pitchf);
+        out_audio.iter_mut().for_each(|x| *x = x.clamp(-1.0, 1.0));
         if self.volume_envelope {
             let envelope = stream_input.volume.sqrt().clamp(0.0, 1.0);
-            for sample in &mut converted {
+            for sample in out_audio.iter_mut() {
                 *sample *= envelope;
             }
         }
         if self.rms_mix_rate < 1.0 {
-            // Captured before apply_rms_mix mutates `converted`, but only used
+            // Captured before apply_rms_mix mutates `out_audio`, but only used
             // in the debug! below; skip the extra RMS pass when debug is off.
             let output_rms_before_mix = if tracing::enabled!(tracing::Level::DEBUG) {
-                dsp::rms(&converted)
+                dsp::rms(out_audio)
             } else {
                 0.0
             };
-            // `converted` has already been trimmed to the same tail that SOLA
+            // `out_audio` has already been trimmed to the same tail that SOLA
             // will search over. Use the input buffer tail with the same
             // duration; taking the head would compare against past context
             // added only to stabilize the model.
             let input_reference = self.stream_state.output_reference_audio(
                 sample_rate,
                 RVC_SAMPLE_RATE,
-                converted.len(),
+                out_audio.len(),
                 &mut self.input_reference_scratch,
             )?;
             dsp::apply_rms_mix_with_scratch(
                 input_reference,
-                &mut converted,
+                out_audio,
                 RVC_SAMPLE_RATE as usize,
                 self.rms_mix_rate,
                 &mut self.rms_mix_scratch,
@@ -1042,21 +1075,19 @@ impl VoiceModel for RvcPipeline {
                 self.rms_mix_rate,
                 dsp::rms(input_reference),
                 output_rms_before_mix,
-                dsp::rms(&converted)
+                dsp::rms(out_audio)
             );
         }
-        let output_rms_before_gain = dsp::rms(&converted);
+        let output_rms_before_gain = dsp::rms(out_audio);
         let applied_output_gain = self.applied_output_gain(output_rms_before_gain);
         if (applied_output_gain - 1.0).abs() > f32::EPSILON {
-            for sample in &mut converted {
+            for sample in out_audio.iter_mut() {
                 *sample = (*sample * applied_output_gain).clamp(-1.0, 1.0);
             }
         }
-        let output_rms = dsp::rms(&converted);
+        let output_rms = dsp::rms(out_audio);
 
         Ok(ModelOutput {
-            audio: converted,
-            pitchf: output_pitchf,
             sample_rate: RVC_SAMPLE_RATE,
             inference_time: total_start.elapsed(),
             embedder_time,

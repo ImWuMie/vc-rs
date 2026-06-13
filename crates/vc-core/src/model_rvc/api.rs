@@ -4,9 +4,11 @@ use anyhow::Result;
 
 use crate::dsp;
 
+/// Per-chunk metadata returned by [`VoiceModel::process`]. The converted audio
+/// and output `pitchf` are written into caller-owned buffers passed as
+/// out-parameters (so the worker reuses them across chunks instead of
+/// allocating); this struct carries only the scalar stats describing the chunk.
 pub struct ModelOutput {
-    pub audio: Vec<f32>,
-    pub pitchf: Vec<f32>,
     pub sample_rate: u32,
     pub inference_time: Duration,
     pub embedder_time: Duration,
@@ -27,16 +29,32 @@ pub struct ModelOutput {
 }
 
 pub trait VoiceModel: Send {
-    fn process(&mut self, audio: &[f32], sample_rate: u32) -> Result<ModelOutput>;
+    /// Convert one chunk. The converted samples are written into `out_audio` and
+    /// the output `pitchf` into `out_pitchf` (both cleared first), so callers
+    /// can reuse the buffers across chunks. Returns scalar chunk metadata.
+    fn process(
+        &mut self,
+        audio: &[f32],
+        sample_rate: u32,
+        out_audio: &mut Vec<f32>,
+        out_pitchf: &mut Vec<f32>,
+    ) -> Result<ModelOutput>;
 }
 
 pub struct PassthroughModel;
 
 impl VoiceModel for PassthroughModel {
-    fn process(&mut self, audio: &[f32], sample_rate: u32) -> Result<ModelOutput> {
+    fn process(
+        &mut self,
+        audio: &[f32],
+        sample_rate: u32,
+        out_audio: &mut Vec<f32>,
+        out_pitchf: &mut Vec<f32>,
+    ) -> Result<ModelOutput> {
+        out_audio.clear();
+        out_audio.extend_from_slice(audio);
+        out_pitchf.clear();
         Ok(ModelOutput {
-            audio: audio.to_vec(),
-            pitchf: Vec::new(),
             sample_rate,
             inference_time: Duration::ZERO,
             embedder_time: Duration::ZERO,

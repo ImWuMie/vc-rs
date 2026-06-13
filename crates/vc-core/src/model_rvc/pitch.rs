@@ -43,18 +43,31 @@ pub(super) fn center_crop_pitchf_to_features_into(
     }
 }
 
+#[cfg(test)]
 pub(super) fn pitchf_tail_for_output(
     pitchf: &[f32],
     output_samples: usize,
     sample_rate: u32,
 ) -> Vec<f32> {
+    let mut out = Vec::new();
+    pitchf_tail_for_output_into(pitchf, output_samples, sample_rate, &mut out);
+    out
+}
+
+pub(super) fn pitchf_tail_for_output_into(
+    pitchf: &[f32],
+    output_samples: usize,
+    sample_rate: u32,
+    output: &mut Vec<f32>,
+) {
+    output.clear();
     if pitchf.is_empty() || output_samples == 0 || sample_rate == 0 {
-        return Vec::new();
+        return;
     }
     let frames = feature_len_for_samples(output_samples, sample_rate)
         .max(1)
         .min(pitchf.len());
-    pitchf[pitchf.len() - frames..].to_vec()
+    output.extend_from_slice(&pitchf[pitchf.len() - frames..]);
 }
 
 pub(super) fn voiced_ratio(pitchf: &[f32]) -> f32 {

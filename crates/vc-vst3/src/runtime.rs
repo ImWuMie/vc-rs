@@ -229,6 +229,8 @@ impl WorkerCtx {
     fn run(mut self) {
         let mut chunk_samples = self.current_chunk_samples();
         let mut input_acc = Vec::<f32>::with_capacity(chunk_samples * 2);
+        // Reused output buffer for the converted chunk, filled by `process_chunk`.
+        let mut chunk_out = Vec::<f32>::with_capacity(chunk_samples * 2);
 
         // Do not load models during host startup, plugin scan, or project
         // restore. Some DAWs instantiate and tear down plugins on UI/control
@@ -307,18 +309,16 @@ impl WorkerCtx {
                 noise_gate_threshold: util::db_to_gain(self.params.noise_gate_threshold_db.value()),
             });
 
-            let converted = match converter.process_chunk(chunk, self.sample_rate, None) {
-                Ok(converted) => converted,
-                Err(err) => {
-                    nice_plug::nice_error!("vc-vst3: chunk conversion failed: {err:#}");
-                    self.running.store(false, Ordering::SeqCst);
-                    break;
-                }
-            };
+            if let Err(err) = converter.process_chunk(chunk, self.sample_rate, None, &mut chunk_out)
+            {
+                nice_plug::nice_error!("vc-vst3: chunk conversion failed: {err:#}");
+                self.running.store(false, Ordering::SeqCst);
+                break;
+            }
             input_acc.clear();
 
             // Push to the output ring; drop the tail if the consumer is behind.
-            let _ = self.output_producer.push_partial_slice(&converted.audio);
+            let _ = self.output_producer.push_partial_slice(&chunk_out);
         }
     }
 

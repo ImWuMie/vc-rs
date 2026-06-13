@@ -25,22 +25,21 @@ pub struct ChunkStats {
     pub model_output_samples: usize,
 }
 
-pub struct ConvertedChunk {
-    pub audio: Vec<f32>,
-    pub stats: ChunkStats,
-}
-
 /// Owns the stateful model-to-fixed-output conversion shared by WAV and the
 /// worker-side realtime paths.
 ///
-/// Keep this off audio callbacks: model processing, smoothing, resampling, and
-/// the returned `Vec` may all allocate. Output settings are intentionally fixed
-/// for the converter lifetime; rebuild the converter together with the model
-/// when a stream's chunk size or output format changes.
+/// Keep this off audio callbacks: model processing, smoothing, and resampling
+/// may allocate. Output settings are intentionally fixed for the converter
+/// lifetime; rebuild the converter together with the model when a stream's chunk
+/// size or output format changes.
 pub struct ChunkConverter<M> {
     model: M,
     output: ChunkOutputConfig,
     smoother: Option<(u32, ChunkSmoother)>,
+    // Reused per-chunk buffers for the model's converted audio and output
+    // pitchf, so `process_chunk` does not allocate them every chunk.
+    model_audio: Vec<f32>,
+    model_pitchf: Vec<f32>,
 }
 
 impl<M: VoiceModel> ChunkConverter<M> {
@@ -49,6 +48,8 @@ impl<M: VoiceModel> ChunkConverter<M> {
             model,
             output,
             smoother: None,
+            model_audio: Vec::new(),
+            model_pitchf: Vec::new(),
         }
     }
 
@@ -70,38 +71,56 @@ impl<M: VoiceModel> ChunkConverter<M> {
         input: &[f32],
         input_sample_rate: u32,
         final_tail: Option<&mut Vec<f32>>,
-    ) -> Result<ConvertedChunk> {
-        let out = self.model.process(input, input_sample_rate)?;
-        let stats = chunk_stats(&out);
-        let model_sample_rate = out.sample_rate;
+        out: &mut Vec<f32>,
+    ) -> Result<ChunkStats> {
+        let meta = self.model.process(
+            input,
+            input_sample_rate,
+            &mut self.model_audio,
+            &mut self.model_pitchf,
+        )?;
+        let stats = chunk_stats(&meta, self.model_audio.len());
+        let model_sample_rate = meta.sample_rate;
         let output_sample_rate = self.output.output_sample_rate;
         let output_chunk_samples = self.output.output_chunk_samples;
-        let smoother = self.smoother_for(model_sample_rate);
-        let prepared = sola::prepare_model_output(
-            out,
+        self.ensure_smoother(model_sample_rate);
+        // Disjoint field borrows: the smoother and the model output buffers are
+        // separate fields, so this does not conflict.
+        let smoother = &mut self.smoother.as_mut().expect("smoother set above").1;
+        sola::prepare_model_output(
+            &self.model_audio,
+            &self.model_pitchf,
+            model_sample_rate,
             output_sample_rate,
             output_chunk_samples,
             smoother,
             final_tail,
+            out,
         )?;
-        Ok(ConvertedChunk {
-            audio: prepared.audio,
-            stats,
-        })
+        Ok(stats)
     }
 
     /// Runs the same model/smoother initialization path as a normal chunk but
     /// emits no audio. WAV conversion uses this for its historical silent
     /// preroll; realtime paths deliberately start from their first real chunk.
     pub fn prime(&mut self, input: &[f32], input_sample_rate: u32) -> Result<ChunkStats> {
-        let out = self.model.process(input, input_sample_rate)?;
-        let stats = chunk_stats(&out);
-        self.smoother_for(out.sample_rate)
-            .prime_model_output(&out.audio, &out.pitchf);
+        let meta = self.model.process(
+            input,
+            input_sample_rate,
+            &mut self.model_audio,
+            &mut self.model_pitchf,
+        )?;
+        let stats = chunk_stats(&meta, self.model_audio.len());
+        self.ensure_smoother(meta.sample_rate);
+        let smoother = &mut self.smoother.as_mut().expect("smoother set above").1;
+        smoother.prime_model_output(&self.model_audio, &self.model_pitchf);
         Ok(stats)
     }
 
-    fn smoother_for(&mut self, model_sample_rate: u32) -> &mut ChunkSmoother {
+    /// Ensures `self.smoother` matches `model_sample_rate`, rebuilding it on a
+    /// rate change. Split out of the per-chunk path so callers can then take a
+    /// disjoint borrow of the smoother alongside the model output buffers.
+    fn ensure_smoother(&mut self, model_sample_rate: u32) {
         if self.smoother.as_ref().map(|(rate, _)| *rate) != Some(model_sample_rate) {
             self.smoother = Some((
                 model_sample_rate,
@@ -116,19 +135,18 @@ impl<M: VoiceModel> ChunkConverter<M> {
                 }),
             ));
         }
-        &mut self.smoother.as_mut().expect("smoother set above").1
     }
 }
 
-fn chunk_stats(out: &ModelOutput) -> ChunkStats {
+fn chunk_stats(meta: &ModelOutput, model_output_samples: usize) -> ChunkStats {
     ChunkStats {
-        silent: out.silent,
-        inference_time: out.inference_time,
-        input_rms: out.input_rms,
-        output_rms: out.output_rms,
+        silent: meta.silent,
+        inference_time: meta.inference_time,
+        input_rms: meta.input_rms,
+        output_rms: meta.output_rms,
         // This is the length immediately before smoothing, not the pipeline's
         // separately reported `raw_output_samples` diagnostic.
-        model_output_samples: out.audio.len(),
+        model_output_samples,
     }
 }
 
@@ -141,12 +159,14 @@ mod tests {
     use super::*;
 
     struct FakeModel {
-        outputs: VecDeque<Result<ModelOutput>>,
+        // Each entry pairs the model-domain audio the fake emits with its
+        // metadata; `process` writes the audio into the caller's out buffer.
+        outputs: VecDeque<Result<(Vec<f32>, ModelOutput)>>,
         calls: usize,
     }
 
     impl FakeModel {
-        fn new(outputs: impl IntoIterator<Item = Result<ModelOutput>>) -> Self {
+        fn new(outputs: impl IntoIterator<Item = Result<(Vec<f32>, ModelOutput)>>) -> Self {
             Self {
                 outputs: outputs.into_iter().collect(),
                 calls: 0,
@@ -155,9 +175,19 @@ mod tests {
     }
 
     impl VoiceModel for FakeModel {
-        fn process(&mut self, _audio: &[f32], _sample_rate: u32) -> Result<ModelOutput> {
+        fn process(
+            &mut self,
+            _audio: &[f32],
+            _sample_rate: u32,
+            out_audio: &mut Vec<f32>,
+            out_pitchf: &mut Vec<f32>,
+        ) -> Result<ModelOutput> {
             self.calls += 1;
-            self.outputs.pop_front().expect("fake output")
+            let (audio, meta) = self.outputs.pop_front().expect("fake output")?;
+            out_audio.clear();
+            out_audio.extend_from_slice(&audio);
+            out_pitchf.clear();
+            Ok(meta)
         }
     }
 
@@ -172,15 +202,13 @@ mod tests {
         }
     }
 
-    fn output(audio: Vec<f32>, sample_rate: u32) -> ModelOutput {
-        ModelOutput {
+    fn output(audio: Vec<f32>, sample_rate: u32) -> (Vec<f32>, ModelOutput) {
+        let meta = ModelOutput {
             raw_output_samples: 999,
             output_rms: 0.75,
             convert_size: audio.len(),
             out_size: audio.len(),
             model_input_samples: audio.len(),
-            audio,
-            pitchf: Vec::new(),
             sample_rate,
             inference_time: Duration::from_micros(123),
             embedder_time: Duration::ZERO,
@@ -193,7 +221,8 @@ mod tests {
             pitch_frames: 0,
             silent: true,
             volume: 0.0,
-        }
+        };
+        (audio, meta)
     }
 
     #[test]
@@ -201,15 +230,18 @@ mod tests {
         let mut converter =
             ChunkConverter::new(FakeModel::new([Ok(output(vec![1.0; 8], 1_000))]), config());
 
-        let converted = converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
+        let mut out = Vec::new();
+        let stats = converter
+            .process_chunk(&[0.0; 4], 1_000, None, &mut out)
+            .unwrap();
 
         assert_eq!(converter.model_mut().calls, 1);
-        assert_eq!(converted.audio.len(), 4);
-        assert!(converted.stats.silent);
-        assert_eq!(converted.stats.inference_time, Duration::from_micros(123));
-        assert_eq!(converted.stats.input_rms, 0.25);
-        assert_eq!(converted.stats.output_rms, 0.75);
-        assert_eq!(converted.stats.model_output_samples, 8);
+        assert_eq!(out.len(), 4);
+        assert!(stats.silent);
+        assert_eq!(stats.inference_time, Duration::from_micros(123));
+        assert_eq!(stats.input_rms, 0.25);
+        assert_eq!(stats.output_rms, 0.75);
+        assert_eq!(stats.model_output_samples, 8);
     }
 
     #[test]
@@ -221,13 +253,22 @@ mod tests {
         ];
         let mut converter = ChunkConverter::new(FakeModel::new(outputs), config());
 
-        let first = converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
-        let second = converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
-        let changed_rate = converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
+        let mut first = Vec::new();
+        converter
+            .process_chunk(&[0.0; 4], 1_000, None, &mut first)
+            .unwrap();
+        let mut second = Vec::new();
+        converter
+            .process_chunk(&[0.0; 4], 1_000, None, &mut second)
+            .unwrap();
+        let mut changed_rate = Vec::new();
+        converter
+            .process_chunk(&[0.0; 4], 1_000, None, &mut changed_rate)
+            .unwrap();
 
-        assert_eq!(first.audio, vec![0.0; 4]);
-        assert_ne!(second.audio, vec![0.0; 4]);
-        assert_eq!(changed_rate.audio, vec![0.0; 4]);
+        assert_eq!(first, vec![0.0; 4]);
+        assert_ne!(second, vec![0.0; 4]);
+        assert_eq!(changed_rate, vec![0.0; 4]);
     }
 
     #[test]
@@ -239,13 +280,22 @@ mod tests {
         ];
         let mut converter = ChunkConverter::new(FakeModel::new(outputs), config());
 
-        converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
-        let joined = converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
-        assert_ne!(joined.audio, vec![0.0; 4]);
+        let mut scratch = Vec::new();
+        converter
+            .process_chunk(&[0.0; 4], 1_000, None, &mut scratch)
+            .unwrap();
+        let mut joined = Vec::new();
+        converter
+            .process_chunk(&[0.0; 4], 1_000, None, &mut joined)
+            .unwrap();
+        assert_ne!(joined, vec![0.0; 4]);
 
         converter.reset_streaming_state();
-        let reset = converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
-        assert_eq!(reset.audio, vec![0.0; 4]);
+        let mut reset = Vec::new();
+        converter
+            .process_chunk(&[0.0; 4], 1_000, None, &mut reset)
+            .unwrap();
+        assert_eq!(reset, vec![0.0; 4]);
     }
 
     #[test]
@@ -263,11 +313,17 @@ mod tests {
             ChunkConverter::new(FakeModel::new([Ok(output(real_audio, 1_000))]), config());
 
         let stats = converter.prime(&[0.0; 4], 1_000).unwrap();
-        let primed = converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
-        let unprimed = without_prime.process_chunk(&[0.0; 4], 1_000, None).unwrap();
+        let mut primed = Vec::new();
+        converter
+            .process_chunk(&[0.0; 4], 1_000, None, &mut primed)
+            .unwrap();
+        let mut unprimed = Vec::new();
+        without_prime
+            .process_chunk(&[0.0; 4], 1_000, None, &mut unprimed)
+            .unwrap();
 
         assert_eq!(stats.model_output_samples, 8);
-        assert_ne!(primed.audio, unprimed.audio);
+        assert_ne!(primed, unprimed);
     }
 
     #[test]
@@ -278,23 +334,31 @@ mod tests {
         ];
         let mut converter = ChunkConverter::new(FakeModel::new(outputs), config());
         let mut tail = vec![9.0];
+        let mut out = Vec::new();
 
-        converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
+        converter
+            .process_chunk(&[0.0; 4], 1_000, None, &mut out)
+            .unwrap();
         assert_eq!(tail, vec![9.0]);
         converter
-            .process_chunk(&[0.0; 4], 1_000, Some(&mut tail))
+            .process_chunk(&[0.0; 4], 1_000, Some(&mut tail), &mut out)
             .unwrap();
         assert_ne!(tail, vec![9.0]);
     }
 
     #[test]
     fn model_and_output_errors_are_returned() {
+        let mut out = Vec::new();
         let mut model_error =
             ChunkConverter::new(FakeModel::new([Err(anyhow!("model failed"))]), config());
-        assert!(model_error.process_chunk(&[0.0; 4], 1_000, None).is_err());
+        assert!(model_error
+            .process_chunk(&[0.0; 4], 1_000, None, &mut out)
+            .is_err());
 
         let mut output_error =
             ChunkConverter::new(FakeModel::new([Ok(output(vec![1.0; 8], 0))]), config());
-        assert!(output_error.process_chunk(&[0.0; 4], 1_000, None).is_err());
+        assert!(output_error
+            .process_chunk(&[0.0; 4], 1_000, None, &mut out)
+            .is_err());
     }
 }

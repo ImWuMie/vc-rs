@@ -713,9 +713,10 @@ impl RuntimeModel {
                     *passthrough_active = false;
                 }
                 rvc.model_mut().apply_live(live);
-                let converted = rvc.process_chunk(audio, sample_rate, None)?;
-                *prepared = converted.audio;
-                Ok(converted.stats)
+                // Write the converted chunk straight into the worker-owned
+                // `prepared` buffer (reused across chunks) instead of moving a
+                // freshly allocated Vec out of the converter.
+                rvc.process_chunk(audio, sample_rate, None, prepared)
             }
         }
     }

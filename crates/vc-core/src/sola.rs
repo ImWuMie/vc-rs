@@ -1,7 +1,6 @@
 use anyhow::Result;
 
 use crate::dsp;
-use crate::model_rvc::ModelOutput;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SmoothingKind {
@@ -19,16 +18,6 @@ pub struct ChunkSmootherConfig {
     pub tail_discard_ms: u32,
 }
 
-pub struct PreparedModelAudio {
-    pub audio: Vec<f32>,
-    pub sola_offset: usize,
-}
-
-struct SmoothedAudio {
-    audio: Vec<f32>,
-    sola_offset: usize,
-}
-
 const PSOLA_MIN_F0_HZ: f32 = 50.0;
 const PSOLA_MAX_F0_HZ: f32 = 1_100.0;
 const PSOLA_MAX_RELATIVE_F0_STDDEV: f32 = 0.20;
@@ -42,6 +31,9 @@ pub struct SolaChunkJoiner {
     tail_discard_samples: usize,
     sola_buffer: Vec<f32>,
     weighted_reference: Vec<f32>,
+    // Reused storage for the joined chunk so `process` does not allocate a fresh
+    // Vec every chunk. Holds the latest smoothed output; read via `output()`.
+    output_buffer: Vec<f32>,
 }
 
 impl SolaChunkJoiner {
@@ -58,6 +50,7 @@ impl SolaChunkJoiner {
             tail_discard_samples,
             sola_buffer: Vec::new(),
             weighted_reference: Vec::new(),
+            output_buffer: Vec::new(),
         }
     }
 
@@ -72,17 +65,20 @@ impl SolaChunkJoiner {
             .extend_from_slice(tail_slice(audio, self.crossfade_samples));
     }
 
-    fn process(&mut self, audio: &[f32]) -> SmoothedAudio {
+    /// Joins `audio` against the retained crossfade history, writing the result
+    /// into `self.output_buffer` (reused across chunks) and returning the chosen
+    /// SOLA offset. Read the joined samples via [`Self::output`].
+    fn process(&mut self, audio: &[f32]) -> usize {
         self.process_with_offset_selector(audio, |candidate, weighted_reference, max_offset| {
             dsp::sola_offset_with_threshold(candidate, weighted_reference, max_offset, 1e-4)
         })
     }
 
-    fn process_with_offset_selector<F>(
-        &mut self,
-        audio: &[f32],
-        mut select_offset: F,
-    ) -> SmoothedAudio
+    fn output(&self) -> &[f32] {
+        &self.output_buffer
+    }
+
+    fn process_with_offset_selector<F>(&mut self, audio: &[f32], mut select_offset: F) -> usize
     where
         F: FnMut(&[f32], &[f32], usize) -> usize,
     {
@@ -90,20 +86,16 @@ impl SolaChunkJoiner {
         let audio = self.candidate_audio(audio);
 
         if self.crossfade_samples == 0 || audio.is_empty() {
-            let output = last_or_pad(audio, target_len);
+            last_or_pad_into(audio, target_len, &mut self.output_buffer);
             self.sola_buffer.clear();
-            return SmoothedAudio {
-                audio: output,
-                sola_offset: 0,
-            };
+            return 0;
         }
 
         if self.sola_buffer.is_empty() {
             self.prime(audio);
-            return SmoothedAudio {
-                audio: vec![0.0; target_len],
-                sola_offset: 0,
-            };
+            self.output_buffer.clear();
+            self.output_buffer.resize(target_len, 0.0);
+            return 0;
         }
 
         let crossfade_len = self
@@ -113,12 +105,9 @@ impl SolaChunkJoiner {
             .min(audio.len())
             .min(target_len);
         if crossfade_len == 0 {
-            let output = last_or_pad(audio, target_len);
+            last_or_pad_into(audio, target_len, &mut self.output_buffer);
             self.update_sola_buffer(audio, 0);
-            return SmoothedAudio {
-                audio: output,
-                sola_offset: 0,
-            };
+            return 0;
         }
 
         let max_offset = self
@@ -135,16 +124,18 @@ impl SolaChunkJoiner {
         };
 
         let output_end = sola_offset.saturating_add(target_len).min(audio.len());
-        let mut output = audio[sola_offset..output_end].to_vec();
-        pad_to_len_in_place(&mut output, target_len);
+        // `reference` borrows `self.sola_buffer`; `output_buffer` is a disjoint
+        // field, so writing the joined chunk here while reading `reference` is a
+        // valid split borrow (same pattern as `weighted_reference` above).
+        let output = &mut self.output_buffer;
+        output.clear();
+        output.extend_from_slice(&audio[sola_offset..output_end]);
+        pad_to_len_in_place(output, target_len);
         output.truncate(target_len);
         vcclient_crossfade(reference, &mut output[..crossfade_len]);
         self.update_sola_buffer(audio, sola_offset);
 
-        SmoothedAudio {
-            audio: output,
-            sola_offset,
-        }
+        sola_offset
     }
 
     fn candidate_audio<'a>(&self, audio: &'a [f32]) -> &'a [f32] {
@@ -222,7 +213,7 @@ impl PsolaChunkJoiner {
         self.inner.prime(audio);
     }
 
-    fn process(&mut self, audio: &[f32], pitchf: &[f32]) -> SmoothedAudio {
+    fn process(&mut self, audio: &[f32], pitchf: &[f32]) -> usize {
         let Some(period_samples) = stable_pitch_period_samples(pitchf, self.sample_rate) else {
             return self.inner.process(audio);
         };
@@ -284,10 +275,18 @@ impl ChunkSmoother {
         }
     }
 
-    fn process(&mut self, audio: &[f32], pitchf: &[f32]) -> SmoothedAudio {
+    fn process(&mut self, audio: &[f32], pitchf: &[f32]) -> usize {
         match self {
             Self::Sola(joiner) => joiner.process(audio),
             Self::Psola(joiner) => joiner.process(audio, pitchf),
+        }
+    }
+
+    /// The most recent joined chunk (model domain), valid after [`Self::process`].
+    fn output(&self) -> &[f32] {
+        match self {
+            Self::Sola(joiner) => joiner.output(),
+            Self::Psola(joiner) => joiner.inner.output(),
         }
     }
 
@@ -622,18 +621,6 @@ fn resample_to_output_domain(
     dsp::resample_mono(audio, from_sample_rate as usize, to_sample_rate as usize)
 }
 
-fn resample_owned_to_output_domain(
-    audio: Vec<f32>,
-    from_sample_rate: u32,
-    to_sample_rate: u32,
-) -> Result<Vec<f32>> {
-    if from_sample_rate == to_sample_rate {
-        Ok(audio)
-    } else {
-        resample_to_output_domain(&audio, from_sample_rate, to_sample_rate)
-    }
-}
-
 fn fit_to_len_in_place(input: &mut Vec<f32>, len: usize) {
     pad_to_len_in_place(input, len);
     input.truncate(len);
@@ -653,30 +640,39 @@ fn pad_to_len_in_place(input: &mut Vec<f32>, len: usize) {
     }
 }
 
-fn last_or_pad(input: &[f32], len: usize) -> Vec<f32> {
+fn last_or_pad_into(input: &[f32], len: usize, output: &mut Vec<f32>) {
+    output.clear();
     if input.len() >= len {
-        input[input.len() - len..].to_vec()
+        output.extend_from_slice(&input[input.len() - len..]);
     } else {
-        let mut output = vec![0.0; len - input.len()];
+        output.resize(len - input.len(), 0.0);
         output.extend_from_slice(input);
-        output
     }
 }
 
+/// Runs the chunk smoother on a model-domain chunk and writes the fixed-length
+/// output-domain audio into `out` (cleared first), returning the chosen SOLA
+/// offset. `model_audio` / `model_pitchf` are the model's per-chunk output and
+/// output pitchf; both they and `out` are caller-owned and reused across chunks
+/// so the steady-state path allocates only when the model and output sample
+/// rates differ (the resample below).
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_model_output(
-    out: ModelOutput,
+    model_audio: &[f32],
+    model_pitchf: &[f32],
+    model_sample_rate: u32,
     output_sample_rate: u32,
     output_chunk_samples: usize,
     joiner: &mut ChunkSmoother,
     final_tail: Option<&mut Vec<f32>>,
-) -> Result<PreparedModelAudio> {
-    let model_sample_rate = out.sample_rate;
-    let candidate = joiner.candidate_audio(&out.audio);
-    let smoothed = joiner.process(&out.audio, &out.pitchf);
+    out: &mut Vec<f32>,
+) -> Result<usize> {
+    let candidate = joiner.candidate_audio(model_audio);
+    let chunk_samples = joiner.chunk_samples();
+    let sola_offset = joiner.process(model_audio, model_pitchf);
     if let Some(final_tail) = final_tail {
-        let tail_start = smoothed
-            .sola_offset
-            .saturating_add(joiner.chunk_samples())
+        let tail_start = sola_offset
+            .saturating_add(chunk_samples)
             .min(candidate.len());
         final_tail.clear();
         let tail = &candidate[tail_start..];
@@ -691,36 +687,38 @@ pub fn prepare_model_output(
         }
     }
 
-    let mut audio =
-        resample_owned_to_output_domain(smoothed.audio, model_sample_rate, output_sample_rate)?;
-    fit_to_len_in_place(&mut audio, output_chunk_samples);
-    Ok(PreparedModelAudio {
-        audio,
-        sola_offset: smoothed.sola_offset,
-    })
+    out.clear();
+    if model_sample_rate == output_sample_rate {
+        out.extend_from_slice(joiner.output());
+    } else {
+        out.extend(resample_to_output_domain(
+            joiner.output(),
+            model_sample_rate,
+            output_sample_rate,
+        )?);
+    }
+    fit_to_len_in_place(out, output_chunk_samples);
+    Ok(sola_offset)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::{
         prepare_model_output, psola_offset_with_period, stable_pitch_period_samples,
         vcclient_crossfade_gains, ChunkSmoother, PsolaChunkJoiner, SolaChunkJoiner,
     };
-    use crate::model_rvc::ModelOutput;
 
     #[test]
     fn sola_chunk_joiner_uses_detected_offset() {
         let mut joiner = SolaChunkJoiner::new(4, 2, 2, 0);
 
-        let first = joiner.process(&[0.0, 0.0, 1.0, 0.5, 2.0, 3.0, 4.0, 5.0]);
-        assert_eq!(first.audio, vec![0.0, 0.0, 0.0, 0.0]);
+        let _ = joiner.process(&[0.0, 0.0, 1.0, 0.5, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(joiner.output(), vec![0.0, 0.0, 0.0, 0.0].as_slice());
 
         let second = joiner.process(&[0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0]);
 
-        assert_eq!(second.sola_offset, 2);
-        assert_eq!(second.audio.len(), 4);
+        assert_eq!(second, 2);
+        assert_eq!(joiner.output().len(), 4);
     }
 
     #[test]
@@ -728,10 +726,10 @@ mod tests {
         let mut joiner = SolaChunkJoiner::new(4, 2, 2, 0);
 
         joiner.prime(&[0.0, 0.0, 1.0, 0.5, 2.0, 3.0, 4.0, 5.0]);
-        let output = joiner.process(&[0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0]);
+        let sola_offset = joiner.process(&[0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0]);
 
-        assert_eq!(output.sola_offset, 2);
-        assert_eq!(output.audio, vec![4.0, 0.5, 6.0, 7.0]);
+        assert_eq!(sola_offset, 2);
+        assert_eq!(joiner.output(), vec![4.0, 0.5, 6.0, 7.0].as_slice());
     }
 
     #[test]
@@ -744,18 +742,18 @@ mod tests {
     fn sola_chunk_joiner_right_aligns_short_outputs_without_crossfade() {
         let mut joiner = SolaChunkJoiner::new(5, 0, 1, 0);
 
-        let output = joiner.process(&[1.0, 2.0]);
+        let _ = joiner.process(&[1.0, 2.0]);
 
-        assert_eq!(output.audio, vec![0.0, 0.0, 0.0, 1.0, 2.0]);
+        assert_eq!(joiner.output(), vec![0.0, 0.0, 0.0, 1.0, 2.0].as_slice());
     }
 
     #[test]
     fn sola_chunk_joiner_discards_unstable_tail_before_output_selection() {
         let mut joiner = SolaChunkJoiner::new(4, 0, 0, 2);
 
-        let output = joiner.process(&[1.0, 2.0, 3.0, 4.0, 100.0, 101.0]);
+        let _ = joiner.process(&[1.0, 2.0, 3.0, 4.0, 100.0, 101.0]);
 
-        assert_eq!(output.audio, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(joiner.output(), vec![1.0, 2.0, 3.0, 4.0].as_slice());
     }
 
     #[test]
@@ -791,28 +789,32 @@ mod tests {
         let mut joiner = PsolaChunkJoiner::new(4, 2, 2, 0, 48_000);
 
         joiner.prime(&[0.0, 0.0, 1.0, 0.5, 2.0, 3.0, 4.0, 5.0]);
-        let output = joiner.process(&[0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0], &[]);
+        let sola_offset = joiner.process(&[0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0], &[]);
 
-        assert_eq!(output.sola_offset, 2);
-        assert_eq!(output.audio, vec![4.0, 0.5, 6.0, 7.0]);
+        assert_eq!(sola_offset, 2);
+        assert_eq!(joiner.inner.output(), vec![4.0, 0.5, 6.0, 7.0].as_slice());
     }
 
     #[test]
     fn smoothed_model_output_reports_sola_offset_before_resampling() {
         let mut joiner = ChunkSmoother::Sola(SolaChunkJoiner::new(4, 2, 2, 0));
         joiner.prime(&[0.0, 0.0, 1.0, 0.5, 2.0, 3.0, 4.0, 5.0]);
+        let mut out = Vec::new();
 
-        let prepared = prepare_model_output(
-            synthetic_model_output(vec![0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0], 48_000),
+        let sola_offset = prepare_model_output(
+            &[0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0],
+            &[],
+            48_000,
             24_000,
             2,
             &mut joiner,
             None,
+            &mut out,
         )
         .unwrap();
 
-        assert_eq!(prepared.sola_offset, 2);
-        assert_eq!(prepared.audio.len(), 2);
+        assert_eq!(sola_offset, 2);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
@@ -820,13 +822,17 @@ mod tests {
         let mut joiner = ChunkSmoother::Sola(SolaChunkJoiner::new(4, 2, 2, 0));
         joiner.prime(&[0.0, 0.0, 1.0, 0.5, 2.0, 3.0, 4.0, 5.0]);
         let mut final_tail = Vec::new();
+        let mut out = Vec::new();
 
         let _ = prepare_model_output(
-            synthetic_model_output(vec![0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0], 48_000),
+            &[0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0],
+            &[],
+            48_000,
             24_000,
             2,
             &mut joiner,
             Some(&mut final_tail),
+            &mut out,
         )
         .unwrap();
         let expected_tail = crate::dsp::resample_mono(&[8.0, 9.0], 48_000, 24_000).unwrap();
@@ -839,20 +845,21 @@ mod tests {
         let mut joiner = ChunkSmoother::Sola(SolaChunkJoiner::new(4, 2, 2, 2));
         joiner.prime(&[0.0, 0.0, 1.0, 0.5, 2.0, 3.0, 4.0, 5.0, 100.0, 101.0]);
         let mut final_tail = Vec::new();
+        let mut out = Vec::new();
 
-        let prepared = prepare_model_output(
-            synthetic_model_output(
-                vec![0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0, 100.0, 101.0],
-                48_000,
-            ),
+        prepare_model_output(
+            &[0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0, 100.0, 101.0],
+            &[],
+            48_000,
             48_000,
             4,
             &mut joiner,
             Some(&mut final_tail),
+            &mut out,
         )
         .unwrap();
 
-        assert_eq!(prepared.audio, vec![4.0, 0.5, 6.0, 7.0]);
+        assert_eq!(out, vec![4.0, 0.5, 6.0, 7.0]);
         assert_eq!(final_tail, vec![8.0, 9.0]);
     }
 
@@ -861,53 +868,21 @@ mod tests {
         let mut joiner = ChunkSmoother::Psola(PsolaChunkJoiner::new(4, 2, 2, 0, 48_000));
         joiner.prime(&[0.0, 0.0, 1.0, 0.5, 2.0, 3.0, 4.0, 5.0]);
         let mut final_tail = Vec::new();
+        let mut out = Vec::new();
 
-        let prepared = prepare_model_output(
-            synthetic_model_output_with_pitchf(
-                vec![0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0],
-                48_000,
-                vec![100.0; 8],
-            ),
+        prepare_model_output(
+            &[0.1, 0.2, 1.0, 0.5, 6.0, 7.0, 8.0, 9.0],
+            &[100.0; 8],
+            48_000,
             48_000,
             4,
             &mut joiner,
             Some(&mut final_tail),
+            &mut out,
         )
         .unwrap();
 
-        assert_eq!(prepared.audio.len(), 4);
+        assert_eq!(out.len(), 4);
         assert_eq!(final_tail.len(), 2);
-    }
-
-    fn synthetic_model_output(audio: Vec<f32>, sample_rate: u32) -> ModelOutput {
-        synthetic_model_output_with_pitchf(audio, sample_rate, Vec::new())
-    }
-
-    fn synthetic_model_output_with_pitchf(
-        audio: Vec<f32>,
-        sample_rate: u32,
-        pitchf: Vec<f32>,
-    ) -> ModelOutput {
-        ModelOutput {
-            raw_output_samples: audio.len(),
-            output_rms: crate::dsp::rms(&audio),
-            convert_size: audio.len(),
-            out_size: audio.len(),
-            model_input_samples: audio.len(),
-            audio,
-            pitchf,
-            sample_rate,
-            inference_time: Duration::ZERO,
-            embedder_time: Duration::ZERO,
-            pitch_time: Duration::ZERO,
-            rvc_time: Duration::ZERO,
-            input_rms: 0.0,
-            voiced_ratio: 0.0,
-            applied_output_gain: 1.0,
-            feature_frames: 0,
-            pitch_frames: 0,
-            silent: false,
-            volume: 0.0,
-        }
     }
 }

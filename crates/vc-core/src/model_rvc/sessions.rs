@@ -992,6 +992,9 @@ impl RvcModelSession {
         Ok(())
     }
 
+    // Inputs mirror the ONNX RVC contract (feats/p_len/pitch/pitchf/sid) plus the
+    // reused output buffer; an ad-hoc struct would only obscure that contract.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn infer(
         &mut self,
         feats: &[f32],
@@ -1000,7 +1003,8 @@ impl RvcModelSession {
         pitch: &[i64],
         pitchf: &[f32],
         speaker_id: i64,
-    ) -> Result<Vec<f32>> {
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
         let feats_shape_usize = i64_shape_to_usize(feats_shape, "feats")?;
         validate_tensorrt_input_shape(
             self.provider,
@@ -1022,12 +1026,18 @@ impl RvcModelSession {
             &pitch_shape,
         )?;
         if let Some(native) = self.native_rvc.as_mut() {
-            return native.infer(feats, pitch, pitchf, speaker_id);
+            // The native TensorRT FFI still returns an owned Vec; copy it into the
+            // caller buffer so the reuse contract holds for the ORT paths below.
+            // Refactoring the native shim to write in place is out of scope here.
+            let converted = native.infer(feats, pitch, pitchf, speaker_id)?;
+            out.clear();
+            out.extend_from_slice(&converted);
+            return Ok(());
         }
         #[cfg(feature = "ort")]
         {
             if self.tensor_rt_binding.is_some() {
-                return self.infer_with_binding(feats, frame_len, pitch, pitchf, speaker_id);
+                return self.infer_with_binding(feats, frame_len, pitch, pitchf, speaker_id, out);
             }
             if self.provider == Provider::Cpu
                 && self
@@ -1044,6 +1054,7 @@ impl RvcModelSession {
                     pitchf,
                     speaker_id,
                     &pitch_shape,
+                    out,
                 );
             }
             self.infer_with_session_run(
@@ -1055,10 +1066,14 @@ impl RvcModelSession {
                 pitchf,
                 speaker_id,
                 &pitch_shape,
+                out,
             )
         }
         #[cfg(not(feature = "ort"))]
-        bail!("RVC session inference requires the `ort` feature; this build supports native TensorRT only")
+        {
+            let _ = out;
+            bail!("RVC session inference requires the `ort` feature; this build supports native TensorRT only")
+        }
     }
 
     // Keep the RVC tensor inputs explicit here: collapsing them into an ad-hoc
@@ -1075,7 +1090,8 @@ impl RvcModelSession {
         pitchf: &[f32],
         speaker_id: i64,
         pitch_shape: &[usize; 2],
-    ) -> Result<Vec<f32>> {
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
         let p_len_value = [frame_len as i64];
         let sid_value = [speaker_id];
         let feats = TensorRef::from_array_view((feats_shape, feats))?;
@@ -1087,7 +1103,7 @@ impl RvcModelSession {
             .session
             .as_mut()
             .ok_or_else(|| anyhow!("RVC ORT session is not initialized"))?;
-        let (output_shape, output_data) = {
+        let output_shape = {
             let run_start = Instant::now();
             let outputs = session.run(ort::inputs![
                 "feats" => feats,
@@ -1108,10 +1124,12 @@ impl RvcModelSession {
                 .ok_or_else(|| anyhow!("RVC output 'audio' not found"))?;
             let (shape, data) = value.try_extract_tensor::<f32>()?;
             let output_shape = i64_shape_to_usize(shape, "rvc output")?;
-            (output_shape, data.to_vec())
+            out.clear();
+            out.extend_from_slice(data);
+            output_shape
         };
         self.enable_cpu_output_binding(feats_shape_usize, pitch_shape, &output_shape)?;
-        Ok(output_data)
+        Ok(())
     }
 
     // Keep the RVC tensor inputs explicit here: collapsing them into an ad-hoc
@@ -1128,7 +1146,8 @@ impl RvcModelSession {
         pitchf: &[f32],
         speaker_id: i64,
         pitch_shape: &[usize; 2],
-    ) -> Result<Vec<f32>> {
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
         let p_len_value = [frame_len as i64];
         let sid_value = [speaker_id];
         let feats = TensorRef::from_array_view((feats_shape, feats))?;
@@ -1196,7 +1215,9 @@ impl RvcModelSession {
                 format_usize_shape(&actual_shape)
             );
         }
-        Ok(data.to_vec())
+        out.clear();
+        out.extend_from_slice(data);
+        Ok(())
     }
 
     #[cfg(feature = "ort")]
@@ -1207,7 +1228,8 @@ impl RvcModelSession {
         pitch: &[i64],
         pitchf: &[f32],
         speaker_id: i64,
-    ) -> Result<Vec<f32>> {
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
         let binding = self
             .tensor_rt_binding
             .as_mut()
@@ -1257,7 +1279,9 @@ impl RvcModelSession {
                         format_usize_shape(&actual_shape)
                     );
                 }
-                Ok(data.to_vec())
+                out.clear();
+                out.extend_from_slice(data);
+                Ok(())
             }
             RvcTensorRtBinding::CudaGraph(binding) => {
                 let h2d_start = Instant::now();
@@ -1300,7 +1324,9 @@ impl RvcModelSession {
                         format_usize_shape(&actual_shape)
                     );
                 }
-                Ok(data.to_vec())
+                out.clear();
+                out.extend_from_slice(data);
+                Ok(())
             }
         }
     }
