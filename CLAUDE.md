@@ -155,9 +155,9 @@ Optional headless TOML seed for fresh instances (see `crates/vc-vst3/README.md`)
   cleanup.** Content features, continuous F0 (`pitchf`), coarse pitch, and model
   output must refer to the same time window; misalignment sounds like drift or
   unstable consonants.
-- **WAV mode reuses the realtime pipeline** so quality changes can be tested
-  deterministically. A WAV-vs-realtime difference should trace to buffering /
-  scheduling / final-tail handling, not a separate model path.
+- **Keep conversion paths shared.** CLI, GUI, VST3, and WAV-specific code should
+  adapt their I/O and scheduling constraints to shared conversion components.
+  Follow `AGENTS.md` and the canonical boundaries in `docs/architecture.md`.
 - RVC models must be **`.onnx`** (`.pth` is not supported). Models are never
   bundled; `download-models.ps1` fetches the reference ContentVec/RMVPE models.
 - For the **TensorRT VST3 package**, leftover ORT provider DLLs (e.g.

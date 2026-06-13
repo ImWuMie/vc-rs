@@ -7,25 +7,49 @@ through the realtime engine, how the RVC pipeline is staged, and why chunk
 smoothing is separated from the audio callback. Concrete commands, local model
 paths, and smoke-test recipes belong in `README.md` or local scripts instead.
 
-The current design is a CLI-first Rust implementation of realtime RVC voice
-conversion. The same engine and model pipeline should remain reusable by a
-future GUI; the GUI should configure the engine, not own audio or inference
-logic.
+CLI, GUI, VST3, and WAV conversion share the same audio-I/O-agnostic conversion
+components wherever their hosting constraints permit. Front-ends adapt device,
+host, or file I/O to those components; they should not own separate inference,
+chunk-conversion, smoothing, or output-assembly implementations.
 
 ## Module Boundaries
 
-- `cli`: user-facing arguments and validation.
-- `audio`: device enumeration and CPAL/WASAPI stream setup.
-- `engine`: realtime stream orchestration, bounded queues, worker thread,
-  metrics, and WAV-mode reuse of the same model path.
-- `model_rvc`: ONNX Runtime sessions, streaming RVC state, feature extraction,
-  F0 extraction, pitch preparation, and output level shaping.
-- `sola`: chunk joining and model-output preparation using SOLA or PSOLA.
-- `dsp`: resampling, sample conversion, RMS/envelope operations, correlation,
-  and crossfade primitives.
+- `vc-core`: shared audio-I/O-agnostic conversion components, including
+  `RvcPipeline`, `ChunkConverter`, DSP, and SOLA/PSOLA smoothing.
+- `vc-app`: shared standalone realtime runtime for CLI and GUI, including
+  CPAL/WASAPI device I/O, bounded queues, worker orchestration, and metrics.
+- `vc-cli`: CLI arguments, validation, realtime runtime control, and WAV file
+  adaptation to the shared conversion components.
+- `vc-gui`: GUI state and controls that configure the `vc-app` runtime.
+- `vc-vst3`: DAW host adaptation, audio-callback ring-buffer I/O, worker
+  scheduling, plugin state, and host latency reporting.
 
 Changes to chunk sizing, model context, smoothing, or output latency usually
-cross `engine`, `model_rvc`, `sola`, and `dsp`; review them together.
+cross the front-end worker runtimes, `model_rvc`, `sola`, and `dsp`; review them
+together.
+
+## Shared Conversion Paths
+
+All conversion modes should use the shared `vc-core` model and chunk-conversion
+components. Inference, model streaming state, output shaping, and SOLA/PSOLA
+joining must not be reimplemented in a front-end merely because its audio source
+or scheduler differs.
+
+CLI and GUI additionally share `vc-app` because both own standalone audio
+devices. VST3 cannot use that device runtime because the DAW owns its audio
+callback and requires plugin-specific state and latency reporting. VST3 should
+still adapt host audio to the shared conversion components and keep its distinct
+worker and buffering behavior narrowly scoped to host integration.
+
+WAV conversion is an offline adapter around the same `RvcPipeline` and
+`ChunkConverter` path used for realtime conversion. Offline processing may use
+different scheduling, prime the smoother, pad a partial input chunk, and collect
+the final tail explicitly. Those differences must not become a separate model,
+chunk-conversion, smoothing, or output-shaping path.
+
+When a hosting constraint requires a front-end-specific behavior, document the
+constraint near the implementation and preserve the shared path for all
+unaffected stages.
 
 ## Realtime Topology
 
@@ -170,9 +194,10 @@ debug output.
 
 ## WAV Mode
 
-WAV conversion uses the same RVC pipeline and smoother as realtime conversion
-so audio-quality changes can be tested deterministically without device
-scheduling noise. It can prime the smoother and handle the final tail explicitly
-because it is not constrained by callback deadlines. A difference between WAV
-and realtime output should usually be explained by buffering, scheduling, or
-final-tail handling rather than by a separate model path.
+WAV conversion uses the shared `RvcPipeline`, `ChunkConverter`, and smoother so
+audio-quality changes can be tested deterministically without device scheduling
+noise. It can prime the smoother, pad the final partial input chunk, and handle
+the final output tail explicitly because it is not constrained by callback
+deadlines. A difference between WAV and realtime output should be explained by
+buffering, scheduling, padding, or final-tail handling rather than by a separate
+conversion path.

@@ -13,6 +13,18 @@ Windows, CUDA 13 / TensorRT 11. Day-to-day:
 - Prefer preallocated buffers and message passing to background workers.
 - Any change to chunking, buffering, or latency-sensitive code should be reviewed for real-time safety.
 
+## Shared conversion pipeline
+- CLI, GUI, VST3, and WAV conversion must reuse the shared conversion pipeline
+  wherever their device, host, and offline-processing constraints permit.
+- Keep inference, chunk conversion, smoothing, and output assembly in shared
+  components rather than duplicating them in front-ends.
+- Do not add a front-end-specific conversion path without documenting why the
+  shared components cannot satisfy its constraints.
+- Keep unavoidable differences narrowly scoped to device or host I/O,
+  scheduling, buffering, latency reporting, and offline final-tail handling.
+- Follow [`docs/architecture.md`](docs/architecture.md) as the canonical
+  description of conversion data flow and ownership boundaries.
+
 ## Distribution safety
 - Do not embed or ship machine-specific paths, developer-machine user names,
   secrets, local models, caches, logs, debug artifacts, or other local state.
