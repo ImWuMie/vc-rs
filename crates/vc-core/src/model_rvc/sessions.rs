@@ -140,6 +140,7 @@ impl HubertEmbedderSession {
                     input_shape,
                     self.output_name.as_str(),
                     &output_shape,
+                    profile.gpu_device_id,
                 )?)
             }
             TensorRtRunMode::DeviceIo | TensorRtRunMode::CudaGraph => {
@@ -150,6 +151,7 @@ impl HubertEmbedderSession {
                     self.output_name.as_str(),
                     &output_shape,
                     shared_waveform,
+                    profile.gpu_device_id,
                 )?;
                 binding.warmup_capture(
                     &mut self.session,
@@ -465,6 +467,7 @@ impl RmvpePitchSession {
                     waveform_shape,
                     &output_shape,
                     threshold,
+                    profile.gpu_device_id,
                 )?)
             }
             TensorRtRunMode::DeviceIo | TensorRtRunMode::CudaGraph => {
@@ -474,6 +477,7 @@ impl RmvpePitchSession {
                     &output_shape,
                     threshold,
                     shared_waveform,
+                    profile.gpu_device_id,
                 )?;
                 binding.warmup_capture(
                     &mut self.session,
@@ -918,6 +922,7 @@ impl RvcModelSession {
                     &output_shape,
                     frame_len as i64,
                     speaker_id,
+                    profile.gpu_device_id,
                 )?)
             }
             TensorRtRunMode::DeviceIo | TensorRtRunMode::CudaGraph => {
@@ -932,6 +937,7 @@ impl RvcModelSession {
                     &output_shape,
                     frame_len as i64,
                     speaker_id,
+                    profile.gpu_device_id,
                 )?;
                 binding.warmup_capture(
                     session,
@@ -1410,13 +1416,14 @@ pub(super) fn load_session(
     tensor_rt_run_mode: TensorRtRunMode,
     tensor_rt_session_purpose: TensorRtSessionPurpose,
 ) -> Result<Session> {
-    // `tensor_rt_profile` is consumed only by the Windows ML catalog-EP branches
-    // below (the TensorRT-RTX fixed-shape profile). Reference it here so a build
-    // without those branches — e.g. the `cpu`-only CI lane — matches the
-    // windowsml signature without an unused-argument warning. Mirrors the
-    // `let _ = tensor_rt_run_mode;` discard in the no-cuda arm.
-    #[cfg(not(all(windows, feature = "windowsml")))]
-    let _ = tensor_rt_profile;
+    // CUDA consumes the selected device ID from the fixed-shape profile.
+    // Windows ML consumes the same profile only for TensorRT-RTX shape options;
+    // its adapter selection remains owned by Windows ML.
+    #[cfg(feature = "cuda")]
+    let gpu_device_id = tensor_rt_profile.map_or(0, |profile| profile.gpu_device_id);
+    #[cfg(feature = "cuda")]
+    let gpu_device_id_i32 = i32::try_from(gpu_device_id)
+        .map_err(|_| anyhow!("GPU device ID {gpu_device_id} exceeds the supported i32 range"))?;
 
     #[cfg(not(all(windows, feature = "windowsml")))]
     if provider.is_windows_ml() {
@@ -1459,7 +1466,7 @@ pub(super) fn load_session(
             {
                 info!(
                     "requesting ONNX Runtime CUDA execution provider device_id={} cuda_graph={} device_io={} run_mode={}",
-                    TENSORRT_DEVICE_ID,
+                    gpu_device_id,
                     tensor_rt_run_mode.cuda_graph(),
                     tensor_rt_run_mode.device_io(),
                     tensor_rt_run_mode.label()
@@ -1471,7 +1478,7 @@ pub(super) fn load_session(
                 }
                 builder = builder
                     .with_execution_providers([ep::CUDA::default()
-                        .with_device_id(TENSORRT_DEVICE_ID)
+                        .with_device_id(gpu_device_id_i32)
                         .with_cuda_graph(tensor_rt_run_mode.cuda_graph())
                         .build()
                         .error_on_failure()])

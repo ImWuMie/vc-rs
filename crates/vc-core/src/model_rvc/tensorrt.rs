@@ -29,7 +29,6 @@ use super::shape::onnx_silence_front_feature_frames;
 // Fixed-shape GPU bindings are intentionally model-worker state, not audio callback state.
 // Keep CUDA Graph tensor addresses stable for each session; do not allocate or re-bind them on chunk runs.
 
-pub(super) const TENSORRT_DEVICE_ID: i32 = 0;
 pub(super) const TENSORRT_CACHE_DIR_ENV: &str = "VC_RS_TENSORRT_CACHE_DIR";
 pub(super) const TENSORRT_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 pub(super) const CUDA_GRAPH_ENV: &str = "VC_RS_CUDA_GRAPH";
@@ -63,6 +62,7 @@ pub(super) struct TensorRtSessionProfile {
     pub(super) profile_shapes: String,
     pub(super) fixed_inputs: Vec<TensorRtInputShape>,
     pub(super) gpu_priority: super::GpuPriority,
+    pub(super) gpu_device_id: u32,
 }
 
 impl TensorRtSessionProfile {
@@ -74,11 +74,17 @@ impl TensorRtSessionProfile {
             profile_shapes,
             fixed_inputs,
             gpu_priority: super::GpuPriority::default(),
+            gpu_device_id: 0,
         }
     }
 
     pub(super) fn with_gpu_priority(mut self, gpu_priority: super::GpuPriority) -> Self {
         self.gpu_priority = gpu_priority;
+        self
+    }
+
+    pub(super) fn with_gpu_device_id(mut self, gpu_device_id: u32) -> Self {
+        self.gpu_device_id = gpu_device_id;
         self
     }
 
@@ -130,6 +136,7 @@ impl TensorRtSessionProfile {
     pub(super) fn cache_dir_from_root(&self, cache_root: &Path) -> Result<PathBuf> {
         let model_cache_key = self.model_cache_key()?;
         Ok(cache_root
+            .join(format!("device-{}", self.gpu_device_id))
             .join(self.role.label())
             .join(model_cache_key)
             .join(tensor_rt_cache_key(&self.profile_shapes)))
@@ -280,9 +287,10 @@ pub(super) struct TensorRtSharedWaveform {
 
 #[cfg(feature = "ort")]
 impl TensorRtSharedWaveform {
-    pub(super) fn new(session: &Session, shape: &[usize]) -> Result<Self> {
-        let host_input_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUInput)?;
-        let device_allocator = tensor_rt_device_allocator(session)?;
+    pub(super) fn new(session: &Session, shape: &[usize], gpu_device_id: u32) -> Result<Self> {
+        let host_input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let device_allocator = tensor_rt_device_allocator(session, gpu_device_id)?;
         let mut host_waveform = Tensor::<f32>::new(&host_input_allocator, shape.to_vec())
             .context("failed to allocate shared CUDA-pinned waveform input")?;
         zero_f32_tensor(&mut host_waveform, "shared_waveform")?;
@@ -349,9 +357,12 @@ impl HubertTensorRtPinnedBinding {
         input_shape: &[usize],
         output_name: &str,
         output_shape: &[usize],
+        gpu_device_id: u32,
     ) -> Result<Self> {
-        let input_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUInput)?;
-        let output_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUOutput)?;
+        let input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
         let audio =
             Tensor::<f32>::new(&input_allocator, input_shape.to_vec()).with_context(|| {
                 format!("failed to allocate TensorRT ContentVec input '{input_name}'")
@@ -398,9 +409,12 @@ impl RmvpeTensorRtPinnedBinding {
         waveform_shape: &[usize],
         output_shape: &[usize],
         threshold_value: f32,
+        gpu_device_id: u32,
     ) -> Result<Self> {
-        let input_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUInput)?;
-        let output_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUOutput)?;
+        let input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
         let waveform = Tensor::<f32>::new(&input_allocator, waveform_shape.to_vec())
             .context("failed to allocate TensorRT RMVPE input 'waveform'")?;
         let mut threshold = Tensor::<f32>::new(&input_allocator, vec![1usize])
@@ -469,9 +483,12 @@ impl RvcTensorRtPinnedBinding {
         output_shape: &[usize],
         frame_len: i64,
         speaker_id: i64,
+        gpu_device_id: u32,
     ) -> Result<Self> {
-        let input_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUInput)?;
-        let output_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUOutput)?;
+        let input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
         let feats = Tensor::<f32>::new(&input_allocator, feats_shape.to_vec())
             .context("failed to allocate TensorRT RVC input 'feats'")?;
         let pitch = Tensor::<i64>::new(&input_allocator, pitch_shape.to_vec())
@@ -562,9 +579,11 @@ impl HubertTensorRtGraphBinding {
         output_name: &str,
         output_shape: &[usize],
         shared_waveform: Option<&TensorRtSharedWaveform>,
+        gpu_device_id: u32,
     ) -> Result<Self> {
-        let host_output_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUOutput)?;
-        let device_allocator = tensor_rt_device_allocator(session)?;
+        let host_output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
+        let device_allocator = tensor_rt_device_allocator(session, gpu_device_id)?;
         let mut device_output = Tensor::<f32>::new(&device_allocator, output_shape.to_vec())
             .with_context(|| {
                 format!("failed to allocate TensorRT ContentVec CUDA output '{output_name}'")
@@ -587,7 +606,7 @@ impl HubertTensorRtGraphBinding {
                 (None, None, None, true)
             } else {
                 let host_input_allocator =
-                    tensor_rt_pinned_allocator(session, MemoryType::CPUInput)?;
+                    tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
                 let mut host_audio = Tensor::<f32>::new(
                     &host_input_allocator,
                     input_shape.to_vec(),
@@ -709,10 +728,13 @@ impl RmvpeTensorRtGraphBinding {
         output_shape: &[usize],
         threshold_value: f32,
         shared_waveform: Option<&TensorRtSharedWaveform>,
+        gpu_device_id: u32,
     ) -> Result<Self> {
-        let host_input_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUInput)?;
-        let host_output_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUOutput)?;
-        let device_allocator = tensor_rt_device_allocator(session)?;
+        let host_input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let host_output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
+        let device_allocator = tensor_rt_device_allocator(session, gpu_device_id)?;
         let mut host_threshold = Tensor::<f32>::new(&host_input_allocator, vec![1usize])
             .context("failed to allocate TensorRT RMVPE host input 'threshold'")?;
         write_scalar_f32_tensor(&mut host_threshold, threshold_value, "threshold")?;
@@ -867,10 +889,13 @@ impl RvcTensorRtGraphBinding {
         output_shape: &[usize],
         frame_len: i64,
         speaker_id: i64,
+        gpu_device_id: u32,
     ) -> Result<Self> {
-        let host_input_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUInput)?;
-        let host_output_allocator = tensor_rt_pinned_allocator(session, MemoryType::CPUOutput)?;
-        let device_allocator = tensor_rt_device_allocator(session)?;
+        let host_input_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
+        let host_output_allocator =
+            tensor_rt_pinned_allocator(session, MemoryType::CPUOutput, gpu_device_id)?;
+        let device_allocator = tensor_rt_device_allocator(session, gpu_device_id)?;
         let mut host_feats = Tensor::<f32>::new(&host_input_allocator, feats_shape.to_vec())
             .context("failed to allocate TensorRT RVC host input 'feats'")?;
         zero_f32_tensor(&mut host_feats, "feats")?;
@@ -1228,10 +1253,13 @@ pub(super) fn provider_uses_fixed_shape(provider: Provider) -> bool {
 pub(super) fn tensor_rt_pinned_allocator(
     session: &Session,
     memory_type: MemoryType,
+    gpu_device_id: u32,
 ) -> Result<Allocator> {
+    let gpu_device_id = i32::try_from(gpu_device_id)
+        .map_err(|_| anyhow!("GPU device ID {gpu_device_id} exceeds the supported i32 range"))?;
     let memory_info = MemoryInfo::new(
         AllocationDevice::CUDA_PINNED,
-        TENSORRT_DEVICE_ID,
+        gpu_device_id,
         AllocatorType::Device,
         memory_type,
     )
@@ -1241,10 +1269,15 @@ pub(super) fn tensor_rt_pinned_allocator(
 }
 
 #[cfg(feature = "ort")]
-pub(super) fn tensor_rt_device_allocator(session: &Session) -> Result<Allocator> {
+pub(super) fn tensor_rt_device_allocator(
+    session: &Session,
+    gpu_device_id: u32,
+) -> Result<Allocator> {
+    let gpu_device_id = i32::try_from(gpu_device_id)
+        .map_err(|_| anyhow!("GPU device ID {gpu_device_id} exceeds the supported i32 range"))?;
     let memory_info = MemoryInfo::new(
         AllocationDevice::CUDA,
-        TENSORRT_DEVICE_ID,
+        gpu_device_id,
         AllocatorType::Device,
         MemoryType::Default,
     )

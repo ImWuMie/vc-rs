@@ -112,7 +112,8 @@ RVC 音声変換モデル（`.onnx`）は別途自分で用意してください
    の各 `.onnx` を指定します。
 2. **Provider** — バックエンドを選びます（windowsml 版: `windowsml` /
    `windowsml-directml` / `windowsml-nvtrtx` / `windowsml-cpu` / `cpu`、
-   tensorrt 版: `tensorrt`）。**GPU Priority** も選べます。
+   tensorrt 版: `tensorrt`）。**GPU Priority** と CUDA / TensorRT 用の
+   **GPU Device ID** も選べます。
 3. **Audio** — 入力・出力デバイスを選びます（**Refresh devices** で再取得）。
    空欄なら「System default」を使います。
 4. **Engine configuration** — **Chunk ms** / **Extra convert ms** を設定します

@@ -99,6 +99,7 @@ fn tensorrt_profiles_match_validated_shapes() {
             .cache_dir_from_root(Path::new("cache-root"))
             .unwrap(),
         Path::new("cache-root")
+            .join("device-0")
             .join("contentvec")
             .join("content_vec_500_0123456789abcdef")
             .join("audio_1x24000")
@@ -144,6 +145,7 @@ fn contentvec_fixed_profile_allows_non_default_input_name() {
             .cache_dir_from_root(Path::new("cache-root"))
             .unwrap(),
         Path::new("cache-root")
+            .join("device-0")
             .join("contentvec")
             .join("content_vec_500_0123456789abcdef")
             .join("input_values_1x18240")
@@ -432,4 +434,21 @@ fn derives_vcclient_onnx_silence_front_feature_offset() {
 #[test]
 fn gpu_priority_defaults_to_high() {
     assert_eq!(super::GpuPriority::default(), super::GpuPriority::High);
+}
+
+#[test]
+fn tensor_rt_cache_is_separated_by_gpu_device_id() {
+    let profile = TensorRtSessionProfile::single_input(ModelRole::ContentVec, "audio", 24_000)
+        .with_model_cache_key("model")
+        .with_gpu_device_id(2);
+    assert_eq!(
+        profile
+            .cache_dir_from_root(Path::new("cache-root"))
+            .unwrap(),
+        Path::new("cache-root")
+            .join("device-2")
+            .join("contentvec")
+            .join("model")
+            .join("audio_1x24000")
+    );
 }

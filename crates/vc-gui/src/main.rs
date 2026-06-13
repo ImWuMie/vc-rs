@@ -121,6 +121,7 @@ struct GuiSettings {
     f0_model: String,
     provider: String,
     gpu_priority: String,
+    gpu_device_id: u32,
     audio_backend: String,
     input_device: String,
     output_device: String,
@@ -162,6 +163,7 @@ impl Default for GuiSettings {
             f0_model: String::new(),
             provider: default_provider_name().to_string(),
             gpu_priority: "high".to_string(),
+            gpu_device_id: 0,
             audio_backend: "cpal".to_string(),
             input_device: String::new(),
             output_device: String::new(),
@@ -245,6 +247,7 @@ impl GuiSettings {
             f0_model: path_option(&self.f0_model),
             provider: parse_provider(&self.provider)?,
             gpu_priority: parse_gpu_priority(&self.gpu_priority)?,
+            gpu_device_id: self.gpu_device_id,
             audio_backend: AudioBackend::Cpal,
             input_device: string_option(&self.input_device),
             output_device: string_option(&self.output_device),
@@ -466,6 +469,14 @@ impl eframe::App for VcGui {
                             .changed();
                     }
                 });
+            changed |= ui
+                .add_enabled(
+                    matches!(self.settings.provider.as_str(), "cuda" | "tensorrt"),
+                    egui::DragValue::new(&mut self.settings.gpu_device_id)
+                        .prefix("GPU Device ID: ")
+                        .range(0..=i32::MAX as u32),
+                )
+                .changed();
 
             ui.separator();
             ui.heading("Audio");

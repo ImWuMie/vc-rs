@@ -118,7 +118,8 @@ still supply your own RVC voice model (`.onnx`).
    (RMVPE) `.onnx` files.
 2. **Provider** — choose the backend (windowsml package: `windowsml` /
    `windowsml-directml` / `windowsml-nvtrtx` / `windowsml-cpu` / `cpu`; tensorrt
-   package: `tensorrt`). **GPU Priority** is selectable too.
+   package: `tensorrt`). **GPU Priority** and the CUDA/TensorRT
+   **GPU Device ID** are selectable too.
 3. **Audio** — pick the input/output devices (**Refresh devices** to re-scan).
    Leave blank to use "System default".
 4. **Engine configuration** — set **Chunk ms** / **Extra convert ms** (see

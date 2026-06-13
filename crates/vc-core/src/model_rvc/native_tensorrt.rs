@@ -26,6 +26,7 @@ mod ffi {
             profile_shapes: *const c_char,
             output_name: *const c_char,
             high_priority: i32,
+            gpu_device_id: i32,
             message: *mut c_char,
             message_len: usize,
         ) -> *mut c_void;
@@ -126,6 +127,7 @@ impl NativeContentVecEngine {
             profile.profile_shapes.as_str(),
             output_name,
             profile.gpu_priority,
+            profile.gpu_device_id,
         )?;
         let output_len = engine_output_len(handle)?;
         info!(
@@ -198,7 +200,13 @@ impl NativeRmvpeEngine {
         // `handle` is unit in the no-TensorRT stub build; see the equivalent
         // binding in NativeContentVecEngine::load for the cfg rationale.
         #[cfg_attr(not(native_tensorrt), allow(clippy::let_unit_value))]
-        let handle = load_engine(&path, load_profile.as_str(), "pitchf", profile.gpu_priority)?;
+        let handle = load_engine(
+            &path,
+            load_profile.as_str(),
+            "pitchf",
+            profile.gpu_priority,
+            profile.gpu_device_id,
+        )?;
         let output_len = engine_output_len(handle)?;
         info!(
             "loaded native TensorRT RMVPE engine model={} engine={} waveform_shape={} output_len={}",
@@ -261,7 +269,13 @@ impl NativeRvcEngine {
         // `handle` is unit in the no-TensorRT stub build; see the equivalent
         // binding in NativeContentVecEngine::load for the cfg rationale.
         #[cfg_attr(not(native_tensorrt), allow(clippy::let_unit_value))]
-        let handle = load_engine(&path, load_profile.as_str(), "audio", profile.gpu_priority)?;
+        let handle = load_engine(
+            &path,
+            load_profile.as_str(),
+            "audio",
+            profile.gpu_priority,
+            profile.gpu_device_id,
+        )?;
         let output_len = engine_output_len(handle)?;
         info!(
             "loaded native TensorRT RVC engine model={} engine={} frames={} channels={} output_len={}",
@@ -363,7 +377,12 @@ fn ensure_native_engine(
         .parent()
         .ok_or_else(|| anyhow!("native TensorRT engine path has no parent"))?;
     std::fs::create_dir_all(parent)?;
-    build_engine(model_path, &engine_path, build_profile_shapes)?;
+    build_engine(
+        model_path,
+        &engine_path,
+        build_profile_shapes,
+        profile.gpu_device_id,
+    )?;
     Ok(engine_path)
 }
 
@@ -389,7 +408,12 @@ fn profile_with_scalars(profile: &TensorRtSessionProfile, scalars: &[(&str, &[us
 }
 
 #[cfg(native_tensorrt)]
-fn build_engine(model_path: &Path, engine_path: &Path, profile_shapes: &str) -> Result<()> {
+fn build_engine(
+    model_path: &Path,
+    engine_path: &Path,
+    profile_shapes: &str,
+    gpu_device_id: u32,
+) -> Result<()> {
     let tmp_engine = engine_path.with_extension(format!("engine.tmp-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp_engine);
 
@@ -397,13 +421,24 @@ fn build_engine(model_path: &Path, engine_path: &Path, profile_shapes: &str) -> 
     // shapes), so high builder optimization levels reuse measured tactic timings
     // instead of re-timing from scratch on each cache miss. Lives at the cache
     // root; TensorRT validates its header and ignores an incompatible blob.
-    let timing_cache = tensor_rt_cache_root()?.join("timing.cache");
+    let timing_cache = tensor_rt_cache_root()?
+        .join(format!("device-{gpu_device_id}"))
+        .join("timing.cache");
+    if let Some(parent) = timing_cache.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
     // Keep engine construction out of this process. ORT-free trtexec and the
     // ORT-free helper both build the RVC graph successfully, while the same
     // Builder API fails after ORT has initialized in the main process.
     let output =
-        match tensor_rt_builder_command(model_path, &tmp_engine, profile_shapes, &timing_cache)? {
+        match tensor_rt_builder_command(
+            model_path,
+            &tmp_engine,
+            profile_shapes,
+            &timing_cache,
+            gpu_device_id,
+        )? {
             BuilderCommand::Exe(mut command) | BuilderCommand::Cargo(mut command) => command
                 .output()
                 .with_context(|| "failed to launch native TensorRT builder helper")?,
@@ -458,6 +493,7 @@ fn tensor_rt_builder_command(
     engine_path: &Path,
     profile_shapes: &str,
     timing_cache: &Path,
+    gpu_device_id: u32,
 ) -> Result<BuilderCommand> {
     if let Some(path) = std::env::var_os("VC_RS_TENSORRT_BUILDER_HELPER")
         .filter(|value| !value.is_empty())
@@ -470,6 +506,7 @@ fn tensor_rt_builder_command(
             engine_path,
             profile_shapes,
             timing_cache,
+            gpu_device_id,
         );
         return Ok(BuilderCommand::Exe(command));
     }
@@ -483,6 +520,7 @@ fn tensor_rt_builder_command(
                 engine_path,
                 profile_shapes,
                 timing_cache,
+                gpu_device_id,
             );
             return Ok(BuilderCommand::Exe(command));
         }
@@ -501,6 +539,7 @@ fn tensor_rt_builder_command(
             engine_path,
             profile_shapes,
             timing_cache,
+            gpu_device_id,
         );
         return Ok(BuilderCommand::Cargo(command));
     }
@@ -519,6 +558,7 @@ fn add_builder_args(
     engine_path: &Path,
     profile_shapes: &str,
     timing_cache: &Path,
+    gpu_device_id: u32,
 ) {
     command
         .arg("--onnx")
@@ -528,7 +568,9 @@ fn add_builder_args(
         .arg("--profile")
         .arg(profile_shapes)
         .arg("--timing-cache")
-        .arg(timing_cache);
+        .arg(timing_cache)
+        .arg("--gpu-device-id")
+        .arg(gpu_device_id.to_string());
 
     #[cfg(windows)]
     {
@@ -665,7 +707,12 @@ fn tensor_rt_workspace_root() -> Option<PathBuf> {
 }
 
 #[cfg(not(native_tensorrt))]
-fn build_engine(model_path: &Path, _engine_path: &Path, _profile_shapes: &str) -> Result<()> {
+fn build_engine(
+    model_path: &Path,
+    _engine_path: &Path,
+    _profile_shapes: &str,
+    _gpu_device_id: u32,
+) -> Result<()> {
     bail!(
         "native TensorRT engine build was requested for {}, but this binary was built without native_tensorrt support",
         model_path.display()
@@ -678,7 +725,10 @@ fn load_engine(
     profile_shapes: &str,
     output_name: &str,
     gpu_priority: super::GpuPriority,
+    gpu_device_id: u32,
 ) -> Result<std::ptr::NonNull<c_void>> {
+    let gpu_device_id = i32::try_from(gpu_device_id)
+        .map_err(|_| anyhow!("GPU device ID {gpu_device_id} exceeds the supported i32 range"))?;
     let c_engine = path_cstring(engine_path, "TensorRT engine path")?;
     let c_profile = CString::new(profile_shapes)
         .context("TensorRT profile shape string contains an interior NUL byte")?;
@@ -690,6 +740,7 @@ fn load_engine(
             c_profile.as_ptr(),
             c_output.as_ptr(),
             i32::from(gpu_priority == super::GpuPriority::High),
+            gpu_device_id,
             message.as_mut_ptr(),
             message.len(),
         )
@@ -713,6 +764,7 @@ fn load_engine(
     _profile_shapes: &str,
     _output_name: &str,
     _gpu_priority: super::GpuPriority,
+    _gpu_device_id: u32,
 ) -> Result<()> {
     bail!("native TensorRT engine loading is unavailable in this binary")
 }

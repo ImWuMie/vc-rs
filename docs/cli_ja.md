@@ -124,7 +124,8 @@ GUI にはない機能です。バッチ処理や、設定変更の決定的な�
   モデル出力の音量を保持（デフォルト: 0.0）。
 
 その他に `--smoother sola|psola`、`--sola-search-ms`、`--crossfade-ms`、
-`--rvc-output-tail-discard-ms`、`--gpu-priority normal|high`、WASAPI 関連
+`--rvc-output-tail-discard-ms`、`--gpu-priority normal|high`、
+`--gpu-device-id <ID>`（CUDA / ネイティブ TensorRT のみ）、WASAPI 関連
 （`--audio-backend wasapi`、`--wasapi-exclusive*`、`--wasapi-buffer-ms`）など、
 GUI が固定している項目も CLI から指定できます。各オプションの一覧と既定値は
 `--help` で確認してください。

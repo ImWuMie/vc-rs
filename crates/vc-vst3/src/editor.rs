@@ -101,13 +101,14 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     ui.separator();
 
     // Snapshot current settings for display, releasing the lock immediately.
-    let (model, embedder, f0_model, provider) = {
+    let (model, embedder, f0_model, provider, gpu_device_id) = {
         let s = state.params.settings.read().unwrap();
         (
             s.model.clone(),
             s.embedder.clone(),
             s.f0_model.clone(),
             s.provider.clone(),
+            s.gpu_device_id,
         )
     };
 
@@ -139,6 +140,19 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
                     }
                 }
             });
+        let mut selected_gpu_device_id = gpu_device_id;
+        if ui
+            .add_enabled(
+                matches!(provider.as_str(), "cuda" | "tensorrt"),
+                egui::DragValue::new(&mut selected_gpu_device_id)
+                    .prefix("GPU Device ID: ")
+                    .range(0..=i32::MAX as u32),
+            )
+            .changed()
+        {
+            state.params.settings.write().unwrap().gpu_device_id = selected_gpu_device_id;
+            mark_dirty(state);
+        }
         if ui.button("Load / Reload").clicked() {
             state.reload.store(true, Ordering::SeqCst);
         }

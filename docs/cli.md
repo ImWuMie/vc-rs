@@ -129,7 +129,8 @@ lower `--chunk-ms`** to reduce latency.
 
 Other options the GUI keeps pinned are also available from the CLI:
 `--smoother sola|psola`, `--sola-search-ms`, `--crossfade-ms`,
-`--rvc-output-tail-discard-ms`, `--gpu-priority normal|high`, and the WASAPI
+`--rvc-output-tail-discard-ms`, `--gpu-priority normal|high`,
+`--gpu-device-id <ID>` (CUDA/native TensorRT only), and the WASAPI
 controls (`--audio-backend wasapi`, `--wasapi-exclusive*`, `--wasapi-buffer-ms`).
 See `--help` for the full list and defaults.
 

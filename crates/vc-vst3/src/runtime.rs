@@ -456,6 +456,7 @@ impl WorkerCtx {
             f0_model: &settings.f0_model,
             provider,
             gpu_priority: settings.gpu_priority(),
+            gpu_device_id: settings.gpu_device_id,
             sample_rate: self.sample_rate,
             chunk_samples,
             // pitch / speaker / gains are DAW parameters; the worker applies the

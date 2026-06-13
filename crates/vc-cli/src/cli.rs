@@ -228,6 +228,8 @@ pub struct RunArgs {
     pub provider: Provider,
     #[arg(long, value_enum, default_value_t = GpuPriority::High)]
     pub gpu_priority: GpuPriority,
+    #[arg(long, default_value_t = 0, help = "CUDA device ID for CUDA/TensorRT")]
+    pub gpu_device_id: u32,
     #[arg(long, default_value_t = 0)]
     pub speaker_id: i64,
     #[arg(long, default_value_t = 0.0)]
@@ -298,6 +300,8 @@ pub struct WavArgs {
     pub provider: Provider,
     #[arg(long, value_enum, default_value_t = GpuPriority::High)]
     pub gpu_priority: GpuPriority,
+    #[arg(long, default_value_t = 0, help = "CUDA device ID for CUDA/TensorRT")]
+    pub gpu_device_id: u32,
     #[arg(long, default_value_t = 0)]
     pub speaker_id: i64,
     #[arg(long, default_value_t = 0.0)]
@@ -559,6 +563,16 @@ mod tests {
             panic!("expected run command");
         };
         assert_eq!(args.gpu_priority, GpuPriority::Normal);
+    }
+
+    #[test]
+    fn parses_gpu_device_id() {
+        let cli =
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--gpu-device-id", "2"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.gpu_device_id, 2);
     }
 
     #[test]

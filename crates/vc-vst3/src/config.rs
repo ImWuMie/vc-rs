@@ -37,6 +37,8 @@ pub struct PluginConfig {
     pub provider: String,
     /// "high" | "normal". Only native TensorRT consumes this setting.
     pub gpu_priority: String,
+    /// CUDA device ID used by CUDA and native TensorRT backends.
+    pub gpu_device_id: u32,
     pub f0_threshold: f32,
     pub silence_threshold: f32,
     /// Noise gate attack/release/floor. Static (applied at Load/Reload); the
@@ -69,6 +71,7 @@ impl Default for PluginConfig {
             rvc_engine: None,
             provider: default_provider().to_string(),
             gpu_priority: "high".to_string(),
+            gpu_device_id: 0,
             f0_threshold: 0.3,
             silence_threshold: 0.0001,
             noise_gate_attack_ms: 5.0,
@@ -273,7 +276,10 @@ mod tests {
     #[test]
     fn gpu_priority_defaults_high_and_parses_normal() {
         assert_eq!(PluginConfig::default().gpu_priority(), GpuPriority::High);
+        assert_eq!(PluginConfig::default().gpu_device_id, 0);
         let config: PluginConfig = toml::from_str("gpu_priority = \"normal\"").unwrap();
         assert_eq!(config.gpu_priority(), GpuPriority::Normal);
+        let config: PluginConfig = toml::from_str("gpu_device_id = 2").unwrap();
+        assert_eq!(config.gpu_device_id, 2);
     }
 }

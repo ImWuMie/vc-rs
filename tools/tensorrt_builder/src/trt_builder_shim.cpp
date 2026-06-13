@@ -275,6 +275,7 @@ extern "C" int trt_build_engine(
     char const* engine_path,
     char const* profile_shapes,
     char const* timing_cache_path,
+    int32_t gpu_device_id,
     char* message,
     std::size_t message_len
 ) {
@@ -286,6 +287,11 @@ extern "C" int trt_build_engine(
         msg.append("invalid TensorRT build arguments\n");
         return 2;
     }
+    if (!cuda_ok(cudaSetDevice(gpu_device_id), msg, "cudaSetDevice")) {
+        msg.append("requested GPU device ID: %d\n", gpu_device_id);
+        return 1;
+    }
+    msg.append("using CUDA device ID %d for TensorRT engine build\n", gpu_device_id);
 
     std::map<std::string, nvinfer1::Dims> profile;
     if (!parse_profile_shapes(profile_shapes, profile, msg)) {

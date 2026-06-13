@@ -11,6 +11,7 @@ unsafe extern "C" {
         engine_path: *const c_char,
         profile_shapes: *const c_char,
         timing_cache_path: *const c_char,
+        gpu_device_id: c_int,
         message: *mut c_char,
         message_len: usize,
     ) -> c_int;
@@ -35,6 +36,7 @@ enum Mode {
         save_engine: PathBuf,
         profile: String,
         timing_cache: Option<PathBuf>,
+        gpu_device_id: i32,
     },
     Run {
         engine: PathBuf,
@@ -87,6 +89,7 @@ fn main() {
             save_engine,
             profile,
             timing_cache,
+            gpu_device_id,
         } => {
             let onnx = cstring_path(&onnx, "onnx path");
             let save_engine = cstring_path(&save_engine, "engine path");
@@ -103,6 +106,7 @@ fn main() {
                     save_engine.as_ptr(),
                     profile.as_ptr(),
                     timing_cache_ptr,
+                    gpu_device_id,
                     message.as_mut_ptr(),
                     message.len(),
                 )
@@ -144,6 +148,7 @@ fn parse_args() -> Result<Args, String> {
     let mut save_engine = None;
     let mut profile = None;
     let mut timing_cache = None;
+    let mut gpu_device_id = 0;
     let mut frames = 40;
     let mut channels = 768;
 
@@ -170,6 +175,16 @@ fn parse_args() -> Result<Args, String> {
                 timing_cache = Some(PathBuf::from(
                     iter.next().ok_or("--timing-cache requires a path")?,
                 ));
+            }
+            "--gpu-device-id" => {
+                gpu_device_id = iter
+                    .next()
+                    .ok_or("--gpu-device-id requires a value")?
+                    .parse()
+                    .map_err(|_| "--gpu-device-id must be a non-negative integer")?;
+                if gpu_device_id < 0 {
+                    return Err("--gpu-device-id must be a non-negative integer".to_string());
+                }
             }
             "--frames" => {
                 frames = iter
@@ -199,6 +214,7 @@ fn parse_args() -> Result<Args, String> {
             save_engine: save_engine.ok_or("--onnx requires --save-engine")?,
             profile: profile.ok_or("--onnx requires --profile")?,
             timing_cache,
+            gpu_device_id,
         }
     } else {
         if save_engine.is_some() || profile.is_some() || timing_cache.is_some() {
@@ -231,6 +247,6 @@ fn parse_args() -> Result<Args, String> {
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  vc-tensorrt-builder --onnx <model.onnx> --save-engine <file.engine> --profile <name:1x...,...> [--timing-cache <file>]\n  vc-tensorrt-builder --engine <file.engine> [--frames 40] [--channels 768]"
+        "usage:\n  vc-tensorrt-builder --onnx <model.onnx> --save-engine <file.engine> --profile <name:1x...,...> [--timing-cache <file>] [--gpu-device-id <ID>]\n  vc-tensorrt-builder --engine <file.engine> [--frames 40] [--channels 768]"
     );
 }

@@ -411,6 +411,7 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
     char const* profile_shapes,
     char const* output_name,
     int32_t high_priority,
+    int32_t gpu_device_id,
     char* message,
     std::size_t message_len
 ) {
@@ -422,6 +423,11 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
         msg.append("invalid TensorRT engine create arguments\n");
         return nullptr;
     }
+    if (!cuda_ok(cudaSetDevice(gpu_device_id), msg, "cudaSetDevice")) {
+        msg.append("requested GPU device ID: %d\n", gpu_device_id);
+        return nullptr;
+    }
+    msg.append("using CUDA device ID %d for native TensorRT engine\n", gpu_device_id);
     std::map<std::string, nvinfer1::Dims> profile;
     if (!parse_profile_shapes(profile_shapes, profile, msg)) {
         return nullptr;

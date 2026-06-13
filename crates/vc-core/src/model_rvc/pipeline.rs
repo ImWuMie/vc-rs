@@ -233,6 +233,7 @@ pub struct RvcPipelineConfig<'a> {
     pub f0_model: &'a Path,
     pub provider: Provider,
     pub gpu_priority: super::GpuPriority,
+    pub gpu_device_id: u32,
     pub sample_rate: u32,
     pub chunk_samples: usize,
     pub speaker_id: i64,
@@ -331,6 +332,14 @@ impl RvcPipeline {
     }
 
     fn load_fixed_shape(config: RvcPipelineConfig<'_>) -> Result<Self> {
+        // Windows ML catalog providers may also use fixed-shape profiles, but
+        // their adapter selection is owned by Windows ML. Only explicit CUDA
+        // backends consume the user-selected CUDA device ID.
+        let gpu_device_id = if config.provider.is_cuda() || config.provider.is_tensorrt() {
+            config.gpu_device_id
+        } else {
+            0
+        };
         // NvTensorRtRtx (explicit, or auto-selected by `Provider::WindowsMl`) uses
         // the pinned-CPU run mode: it has no CUDA IoBinding/CUDA-graph path, so the
         // CUDA device-I/O modes from the env must not be applied to it.
@@ -387,10 +396,12 @@ impl RvcPipeline {
             input_samples_16k,
         )
         .with_gpu_priority(config.gpu_priority)
+        .with_gpu_device_id(gpu_device_id)
         .with_optional_model_cache_key(contentvec_model_cache_key);
         let rmvpe_profile =
             TensorRtSessionProfile::single_input(ModelRole::Rmvpe, "waveform", input_samples_16k)
                 .with_gpu_priority(config.gpu_priority)
+                .with_gpu_device_id(gpu_device_id)
                 .with_optional_model_cache_key(rmvpe_model_cache_key);
         #[cfg(feature = "ort")]
         let shared_waveform_shape = [1usize, input_samples_16k];
@@ -423,6 +434,7 @@ impl RvcPipeline {
                 let rvc_profile =
                     TensorRtSessionProfile::rvc(feature_len, expected_feat_channels_usize)
                         .with_gpu_priority(config.gpu_priority)
+                        .with_gpu_device_id(gpu_device_id)
                         .with_optional_model_cache_key(rvc_model_cache_key.clone());
                 info!(
                 "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} rvc={}",
@@ -473,6 +485,7 @@ impl RvcPipeline {
                     Some(TensorRtSharedWaveform::new(
                         &embedder.session,
                         &shared_waveform_shape,
+                        gpu_device_id,
                     )?)
                 } else {
                     None
@@ -531,6 +544,7 @@ impl RvcPipeline {
             let rvc_profile =
                 TensorRtSessionProfile::rvc(feature_len, expected_feat_channels_usize)
                     .with_gpu_priority(config.gpu_priority)
+                    .with_gpu_device_id(gpu_device_id)
                     .with_optional_model_cache_key(rvc_model_cache_key.clone());
             info!(
                 "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} rvc={}",
@@ -601,6 +615,7 @@ impl RvcPipeline {
                     Some(TensorRtSharedWaveform::new(
                         &embedder.session,
                         &shared_waveform_shape,
+                        gpu_device_id,
                     )?)
                 } else {
                     None
@@ -612,6 +627,7 @@ impl RvcPipeline {
                 let rvc_profile =
                     TensorRtSessionProfile::rvc(feature_len, expected_feat_channels_usize)
                         .with_gpu_priority(config.gpu_priority)
+                        .with_gpu_device_id(gpu_device_id)
                         .with_optional_model_cache_key(rvc_model_cache_key.clone());
                 info!(
                 "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} rvc={}",
