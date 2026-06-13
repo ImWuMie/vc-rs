@@ -378,6 +378,7 @@ fn register_best_catalog_ep_inner() -> Result<Option<CatalogExecutionProvider>> 
 fn register_catalog_ep_inner(provider: CatalogExecutionProvider) -> Result<bool> {
     with_catalog(|catalog_api, catalog| {
         let mut saw_candidate = false;
+        let mut last_error = None;
         for candidate in CATALOG_PRIORITY
             .iter()
             .filter(|candidate| candidate.provider == provider)
@@ -401,12 +402,23 @@ fn register_catalog_ep_inner(provider: CatalogExecutionProvider) -> Result<bool>
                         "failed to register Windows ML catalog EP {}: {err:#}",
                         candidate.catalog_name
                     );
+                    last_error = Some(err.context(format!(
+                        "failed to prepare/register Windows ML catalog EP {}",
+                        candidate.catalog_name
+                    )));
                 }
             }
         }
 
         if !saw_candidate {
             bail!("unknown Windows ML catalog EP {}", provider.label());
+        }
+        // Explicit provider selection must surface the real EnsureReady or
+        // registration failure. Returning false here used to replace it with a
+        // generic "not present or not ready" error, which made the standalone
+        // GUI's automatic preparation look as if it had never run.
+        if let Some(err) = last_error {
+            return Err(err);
         }
         Ok(false)
     })
@@ -533,11 +545,10 @@ fn try_register_candidate(
         unsafe { (api.get_ready_state)(ep, &mut state) },
         "WinMLEpGetReadyState",
     )?;
-    // NotPresent (2): the EP is listed for this device but not installed. Auto
-    // (allow_download = false) skips it so startup stays fast and falls back to
-    // DirectML; an explicit provider downloads it below via EnsureReady (which
-    // can take minutes the first time).
-    if state == 2 && !allow_download {
+    // Any non-Ready state may require a blocking download or preparation step.
+    // Standalone front-ends opt in; VST3 and automatic provider selection do
+    // not, so they must skip rather than unexpectedly blocking a host.
+    if state != 0 && !allow_download {
         return Ok(false);
     }
     check_hr(unsafe { (api.ensure_ready)(ep) }, "WinMLEpEnsureReady")?;
