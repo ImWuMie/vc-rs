@@ -9,6 +9,6 @@ mod realtime;
 
 pub use realtime::{
     write_wav_mono, AudioBackend, DenoiserMode, DeviceList, EngineController, EngineState,
-    EngineStatusSnapshot, LiveParams, RealtimeConfig, Smoother, TelemetrySnapshot,
+    EngineStatusSnapshot, RealtimeConfig, Smoother, TelemetrySnapshot,
 };
-pub use vc_core::model_rvc::OutputDynamicsConfig;
+pub use vc_core::model_rvc::{F0Config, LiveParams, NoiseGateShaping, OutputDynamicsConfig};

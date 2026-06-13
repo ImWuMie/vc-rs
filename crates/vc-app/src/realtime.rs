@@ -10,8 +10,8 @@ use rtrb::RingBuffer;
 use thread_priority::{set_current_thread_priority, ThreadPriority};
 use vc_core::dsp;
 use vc_core::model_rvc::{
-    F0PostprocessConfig, GpuPriority, OutputDynamicsConfig, PassthroughModel, RvcPipeline,
-    RvcPipelineConfig, VoiceModel,
+    F0Config, GpuPriority, LiveParams, NoiseGateShaping, OutputDynamicsConfig, PassthroughModel,
+    RvcPipeline, RvcPipelineConfig, VoiceModel,
 };
 use vc_core::sola::{self, ChunkSmootherConfig, SmoothingKind};
 use vc_core::Provider;
@@ -73,14 +73,11 @@ pub struct RealtimeConfig {
     pub smoother: Smoother,
     pub rvc_output_tail_discard_ms: u32,
     pub extra_convert_ms: u32,
-    pub f0_threshold: f32,
-    pub silence_threshold: f32,
+    pub f0: F0Config,
     pub denoiser_mode: DenoiserMode,
     // Denoiser mode and gate attack/release/floor are static (set at load);
     // the gate threshold is live (see `LiveParams`).
-    pub noise_gate_attack_ms: f32,
-    pub noise_gate_release_ms: f32,
-    pub noise_gate_floor: f32,
+    pub noise_gate_shaping: NoiseGateShaping,
     pub output_dynamics: OutputDynamicsConfig,
     pub passthrough: bool,
     pub debug_input_wav: Option<PathBuf>,
@@ -108,12 +105,9 @@ impl Default for RealtimeConfig {
             smoother: Smoother::Sola,
             rvc_output_tail_discard_ms: 10,
             extra_convert_ms: 100,
-            f0_threshold: 0.3,
-            silence_threshold: 0.0001,
+            f0: F0Config::default(),
             denoiser_mode: DenoiserMode::Off,
-            noise_gate_attack_ms: 5.0,
-            noise_gate_release_ms: 50.0,
-            noise_gate_floor: 0.0,
+            noise_gate_shaping: NoiseGateShaping::default(),
             output_dynamics: OutputDynamicsConfig::default(),
             passthrough: false,
             debug_input_wav: None,
@@ -136,13 +130,16 @@ impl RealtimeConfig {
         if !(0.0..=1.0).contains(&rms_mix_rate) || !rms_mix_rate.is_finite() {
             bail!("RMS mix rate must be a finite value in 0.0..=1.0");
         }
-        if !self.noise_gate_attack_ms.is_finite() || self.noise_gate_attack_ms < 0.0 {
+        if !self.noise_gate_shaping.attack_ms.is_finite() || self.noise_gate_shaping.attack_ms < 0.0
+        {
             bail!("noise gate attack must be a finite, non-negative value (ms)");
         }
-        if !self.noise_gate_release_ms.is_finite() || self.noise_gate_release_ms < 0.0 {
+        if !self.noise_gate_shaping.release_ms.is_finite()
+            || self.noise_gate_shaping.release_ms < 0.0
+        {
             bail!("noise gate release must be a finite, non-negative value (ms)");
         }
-        if !(0.0..=1.0).contains(&self.noise_gate_floor) {
+        if !(0.0..=1.0).contains(&self.noise_gate_shaping.floor) {
             bail!("noise gate floor must be in 0.0..=1.0");
         }
         if !self.passthrough
@@ -152,35 +149,67 @@ impl RealtimeConfig {
         }
         Ok(())
     }
-}
 
-#[derive(Clone, Copy, Debug)]
-pub struct LiveParams {
-    pub pitch_shift: f32,
-    pub speaker_id: i64,
-    pub input_gain: f32,
-    pub output_gain: f32,
-    pub noise_gate_threshold: f32,
-}
-
-impl Default for LiveParams {
-    fn default() -> Self {
-        Self {
-            pitch_shift: 0.0,
-            speaker_id: 0,
-            input_gain: 1.0,
-            output_gain: 1.0,
-            noise_gate_threshold: 0.01,
+    /// Builds the borrowed `RvcPipelineConfig` for the realtime worker, mapping
+    /// the static engine config plus a live snapshot into the engine's load-time
+    /// shape. Centralizing this here keeps the static→pipeline field copy in one
+    /// place; `output_extra_ms` / `volume_excluded_ms` are derived from the
+    /// crossfade/SOLA/tail knobs, not stored, so they live with the mapping.
+    ///
+    /// Only valid for non-passthrough sessions — the model paths are unwrapped
+    /// with `expect("validated")` (guaranteed by `validate`). The live snapshot
+    /// seeds the load-time params; per-block updates still flow through
+    /// `RvcPipeline::apply_live`.
+    fn pipeline_config<'a>(
+        &'a self,
+        sample_rate: u32,
+        chunk_samples: usize,
+        live: &LiveParams,
+    ) -> RvcPipelineConfig<'a> {
+        // Passthrough emits raw input, so it carries no smoothing/tail latency;
+        // matches the guard around the worker's smoothing path.
+        let output_extra_ms = if self.passthrough {
+            0
+        } else {
+            self.crossfade_ms
+                .saturating_add(self.sola_search_ms)
+                .saturating_add(self.rvc_output_tail_discard_ms)
+        };
+        RvcPipelineConfig {
+            model: self.model.as_ref().expect("validated"),
+            embedder: self.embedder.as_ref().expect("validated"),
+            embedder_output: self.embedder_output.as_deref(),
+            f0_model: self.f0_model.as_ref().expect("validated"),
+            provider: self.provider,
+            gpu_priority: self.gpu_priority,
+            sample_rate,
+            chunk_samples,
+            speaker_id: live.speaker_id,
+            pitch_shift: live.pitch_shift,
+            f0: self.f0.clone(),
+            input_gain: live.input_gain,
+            noise_gate_enabled: self.denoiser_mode == DenoiserMode::NoiseGate,
+            noise_gate_threshold: live.noise_gate_threshold,
+            noise_gate_shaping: self.noise_gate_shaping,
+            output_extra_ms,
+            volume_excluded_ms: self.crossfade_ms,
+            extra_convert_ms: self.extra_convert_ms,
+            output_gain: live.output_gain,
+            output_dynamics: self.output_dynamics,
         }
     }
 }
 
+// `LiveParams` itself now lives in vc-core (re-exported via `lib.rs`) so the
+// per-chunk live-update path is shared with the VST3 host callback; this is the
+// lock-free worker-facing mirror that the audio side never touches.
 #[derive(Default)]
 struct AtomicLiveParams {
     pitch_shift: AtomicU32,
     speaker_id: AtomicI64,
     input_gain: AtomicU32,
     output_gain: AtomicU32,
+    noise_gate_enabled: AtomicBool,
     noise_gate_threshold: AtomicU32,
 }
 
@@ -199,6 +228,8 @@ impl AtomicLiveParams {
             .store(value.input_gain.to_bits(), Ordering::Relaxed);
         self.output_gain
             .store(value.output_gain.to_bits(), Ordering::Relaxed);
+        self.noise_gate_enabled
+            .store(value.noise_gate_enabled, Ordering::Relaxed);
         self.noise_gate_threshold
             .store(value.noise_gate_threshold.to_bits(), Ordering::Relaxed);
     }
@@ -209,6 +240,7 @@ impl AtomicLiveParams {
             speaker_id: self.speaker_id.load(Ordering::Relaxed),
             input_gain: f32::from_bits(self.input_gain.load(Ordering::Relaxed)),
             output_gain: f32::from_bits(self.output_gain.load(Ordering::Relaxed)),
+            noise_gate_enabled: self.noise_gate_enabled.load(Ordering::Relaxed),
             noise_gate_threshold: f32::from_bits(self.noise_gate_threshold.load(Ordering::Relaxed)),
         }
     }
@@ -505,15 +537,9 @@ enum RuntimeModel {
 }
 
 impl RuntimeModel {
-    fn apply_live(&mut self, live: LiveParams, denoiser_mode: DenoiserMode) {
+    fn apply_live(&mut self, live: &LiveParams) {
         if let Self::Rvc(model) = self {
-            model.set_pitch_shift(live.pitch_shift);
-            model.set_speaker_id(live.speaker_id);
-            model.set_input_gain(live.input_gain);
-            model.set_output_gain(live.output_gain);
-            if denoiser_mode == DenoiserMode::NoiseGate {
-                model.set_noise_gate(true, live.noise_gate_threshold);
-            }
+            model.apply_live(live);
         }
     }
 }
@@ -563,48 +589,13 @@ impl RealtimeSession {
         let output_rate = audio.output_sample_rate();
         let input_chunk = dsp::chunk_samples_for_rate(input_rate, config.chunk_ms);
         let output_chunk = dsp::chunk_samples_for_rate(output_rate, config.chunk_ms);
-        let output_extra_ms = if config.passthrough {
-            0
-        } else {
-            config
-                .crossfade_ms
-                .saturating_add(config.sola_search_ms)
-                .saturating_add(config.rvc_output_tail_discard_ms)
-        };
         let current_live = live.load();
         let debug_input = Arc::new(Mutex::new(Vec::new()));
         let debug_output = Arc::new(Mutex::new(Vec::new()));
         let model = if config.passthrough {
             RuntimeModel::Passthrough(PassthroughModel)
         } else {
-            let pipeline_config = RvcPipelineConfig {
-                model: config.model.as_ref().expect("validated"),
-                embedder: config.embedder.as_ref().expect("validated"),
-                embedder_output: config.embedder_output.as_deref(),
-                f0_model: config.f0_model.as_ref().expect("validated"),
-                provider: config.provider,
-                gpu_priority: config.gpu_priority,
-                sample_rate: input_rate,
-                chunk_samples: input_chunk,
-                speaker_id: current_live.speaker_id,
-                pitch_shift: current_live.pitch_shift,
-                f0_threshold: config.f0_threshold,
-                silence_threshold: config.silence_threshold,
-                input_gain: current_live.input_gain,
-                noise_gate_enabled: config.denoiser_mode == DenoiserMode::NoiseGate,
-                noise_gate_threshold: current_live.noise_gate_threshold,
-                noise_gate_attack_ms: config.noise_gate_attack_ms,
-                noise_gate_release_ms: config.noise_gate_release_ms,
-                noise_gate_floor: config.noise_gate_floor,
-                output_extra_ms,
-                volume_excluded_ms: config.crossfade_ms,
-                extra_convert_ms: config.extra_convert_ms,
-                output_gain: current_live.output_gain,
-                output_dynamics: config.output_dynamics,
-                // F0 post-processing is disabled by default; GUI/CLI wiring is a
-                // separate task.
-                f0_postprocess: F0PostprocessConfig::default(),
-            };
+            let pipeline_config = config.pipeline_config(input_rate, input_chunk, &current_live);
             let pipeline = match config.denoiser_mode {
                 DenoiserMode::Off | DenoiserMode::NoiseGate => RvcPipeline::load(pipeline_config)?,
                 DenoiserMode::Rnnoise => {
@@ -685,7 +676,7 @@ impl RealtimeSession {
                                 samples.extend_from_slice(&input_acc[..input_chunk]);
                             }
                         }
-                        model.apply_live(live.load(), config.denoiser_mode);
+                        model.apply_live(&live.load());
                         let out = model.process(&input_acc[..input_chunk], input_rate);
                         input_acc.clear();
                         let Ok(out) = out else {
@@ -914,6 +905,7 @@ mod tests {
             speaker_id: 7,
             input_gain: 0.5,
             output_gain: 2.0,
+            noise_gate_enabled: true,
             noise_gate_threshold: 0.025,
         };
         let atomic = AtomicLiveParams::new(params);
@@ -922,6 +914,7 @@ mod tests {
         assert_eq!(out.speaker_id, params.speaker_id);
         assert_eq!(out.input_gain, params.input_gain);
         assert_eq!(out.output_gain, params.output_gain);
+        assert_eq!(out.noise_gate_enabled, params.noise_gate_enabled);
         assert_eq!(out.noise_gate_threshold, params.noise_gate_threshold);
     }
 

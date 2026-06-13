@@ -9,8 +9,8 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use vc_app::{
-    AudioBackend, DenoiserMode, EngineController, EngineState, LiveParams, OutputDynamicsConfig,
-    RealtimeConfig, Smoother, TelemetrySnapshot,
+    AudioBackend, DenoiserMode, EngineController, EngineState, F0Config, LiveParams,
+    NoiseGateShaping, OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot,
 };
 use vc_core::Provider;
 
@@ -229,6 +229,10 @@ impl GuiSettings {
             speaker_id: self.speaker_id,
             input_gain: self.input_gain,
             output_gain: self.output_gain,
+            // Gate on/off rides the unified live path now, so toggling the
+            // denoiser between off and noise-gate takes effect without a reload;
+            // rnnoise still needs a reload (it rebuilds a stateful denoiser).
+            noise_gate_enabled: self.denoiser == "noise-gate",
             noise_gate_threshold: self.noise_gate_threshold,
         }
     }
@@ -257,12 +261,17 @@ impl GuiSettings {
             },
             rvc_output_tail_discard_ms: self.rvc_output_tail_discard_ms,
             extra_convert_ms: self.extra_convert_ms,
-            f0_threshold: self.f0_threshold,
-            silence_threshold: self.silence_threshold,
+            f0: F0Config {
+                f0_threshold: self.f0_threshold,
+                silence_threshold: self.silence_threshold,
+                ..F0Config::default()
+            },
             denoiser_mode: parse_denoiser(&self.denoiser)?,
-            noise_gate_attack_ms: self.noise_gate_attack_ms,
-            noise_gate_release_ms: self.noise_gate_release_ms,
-            noise_gate_floor: self.noise_gate_floor,
+            noise_gate_shaping: NoiseGateShaping {
+                attack_ms: self.noise_gate_attack_ms,
+                release_ms: self.noise_gate_release_ms,
+                floor: self.noise_gate_floor,
+            },
             output_dynamics: OutputDynamicsConfig {
                 volume_envelope: self.volume_envelope,
                 rms_mix_rate: self.rms_mix_rate,

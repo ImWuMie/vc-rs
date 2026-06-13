@@ -11,7 +11,7 @@ use vc_app::{
 };
 use vc_core::dsp;
 use vc_core::model_rvc::{
-    F0PostprocessConfig, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig, VoiceModel,
+    F0Config, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig, VoiceModel,
 };
 use vc_core::sola::{self, ChunkSmootherConfig, SmoothingKind};
 
@@ -27,6 +27,9 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         speaker_id: args.speaker_id,
         input_gain: args.input_gain,
         output_gain: args.output_gain,
+        // Gate on/off is static for the CLI session (no live denoiser control),
+        // so derive it from the selected mode; the unified live path applies it.
+        noise_gate_enabled: denoiser_mode == DenoiserMode::NoiseGate,
         noise_gate_threshold: args.noise_gate_threshold,
     };
     let wasapi_input_exclusive = args.wasapi_input_exclusive();
@@ -51,12 +54,17 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         smoother: args.smoother.into(),
         rvc_output_tail_discard_ms: args.rvc_output_tail_discard_ms,
         extra_convert_ms: args.extra_convert_ms,
-        f0_threshold: args.f0_threshold,
-        silence_threshold: args.silence_threshold,
+        f0: F0Config {
+            f0_threshold: args.f0_threshold,
+            silence_threshold: args.silence_threshold,
+            ..F0Config::default()
+        },
         denoiser_mode,
-        noise_gate_attack_ms: args.noise_gate_attack_ms,
-        noise_gate_release_ms: args.noise_gate_release_ms,
-        noise_gate_floor: args.noise_gate_floor,
+        noise_gate_shaping: NoiseGateShaping {
+            attack_ms: args.noise_gate_attack_ms,
+            release_ms: args.noise_gate_release_ms,
+            floor: args.noise_gate_floor,
+        },
         output_dynamics: OutputDynamicsConfig {
             volume_envelope: args.volume_envelope,
             rms_mix_rate: args.rms_mix_rate,
@@ -140,14 +148,20 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         chunk_samples,
         speaker_id: args.speaker_id,
         pitch_shift: args.pitch_shift,
-        f0_threshold: args.f0_threshold,
-        silence_threshold: 0.0,
+        f0: F0Config {
+            f0_threshold: args.f0_threshold,
+            // WAV mode treats nothing as silence so the whole clip converts.
+            silence_threshold: 0.0,
+            ..F0Config::default()
+        },
         input_gain: pipeline_input_gain,
         noise_gate_enabled: denoiser_mode == Denoiser::NoiseGate,
         noise_gate_threshold: args.noise_gate_threshold,
-        noise_gate_attack_ms: args.noise_gate_attack_ms,
-        noise_gate_release_ms: args.noise_gate_release_ms,
-        noise_gate_floor: args.noise_gate_floor,
+        noise_gate_shaping: NoiseGateShaping {
+            attack_ms: args.noise_gate_attack_ms,
+            release_ms: args.noise_gate_release_ms,
+            floor: args.noise_gate_floor,
+        },
         output_extra_ms,
         volume_excluded_ms: DEFAULT_CROSSFADE_MS,
         extra_convert_ms: args.extra_convert_ms,
@@ -159,9 +173,6 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             target_output_rms: args.target_output_rms,
             max_output_gain: args.max_output_gain,
         },
-        // F0 post-processing is disabled by default; CLI/preset wiring is a
-        // separate task.
-        f0_postprocess: F0PostprocessConfig::default(),
     })?;
     let mut output = Vec::with_capacity(samples.len());
     let mut chunks = 0usize;

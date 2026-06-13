@@ -58,9 +58,9 @@ fn build_input_denoiser(config: &RvcPipelineConfig<'_>) -> InputDenoiser {
         InputDenoiser::Gate(dsp::NoiseGate::new(
             config.sample_rate as f32,
             config.noise_gate_threshold,
-            config.noise_gate_attack_ms,
-            config.noise_gate_release_ms,
-            config.noise_gate_floor,
+            config.noise_gate_shaping.attack_ms,
+            config.noise_gate_shaping.release_ms,
+            config.noise_gate_shaping.floor,
         ))
     } else {
         InputDenoiser::Off
@@ -139,6 +139,93 @@ impl Default for OutputDynamicsConfig {
     }
 }
 
+/// Static (load-time) shaping for the input noise gate.
+///
+/// Same rationale as [`OutputDynamicsConfig`]: every front-end carries these
+/// three knobs verbatim and passes them straight through, so grouping them
+/// means adding a gate-shaping knob touches the struct, not each front-end's
+/// field-by-field mapping. The gate's `enabled`/`threshold` are deliberately
+/// *not* here: they are live (per-block) parameters, kept as separate
+/// initial-value fields on `RvcPipelineConfig`. Attack/release/floor shape the
+/// smoothing coefficients fixed when the gate is constructed.
+#[derive(Clone, Copy, Debug)]
+pub struct NoiseGateShaping {
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub floor: f32,
+}
+
+impl Default for NoiseGateShaping {
+    fn default() -> Self {
+        Self {
+            attack_ms: 5.0,
+            release_ms: 50.0,
+            floor: 0.0,
+        }
+    }
+}
+
+/// Static (load-time) F0 configuration.
+///
+/// Same grouping rationale as [`OutputDynamicsConfig`]: these knobs travel
+/// together from every front-end through `RealtimeConfig` into
+/// `RvcPipelineConfig`. `f0_postprocess` is plumbed but inert by default
+/// (`F0PostprocessConfig::default()` has `enabled: false`); exposing it to the
+/// front-ends is a separate, behaviour-changing task. Keeping it in this struct
+/// means that wiring becomes "fill in a field" rather than threading a new knob
+/// through every boundary.
+#[derive(Clone, Debug)]
+pub struct F0Config {
+    /// RMVPE voiced/unvoiced confidence threshold.
+    pub f0_threshold: f32,
+    /// Input RMS below which a chunk is treated as silence.
+    pub silence_threshold: f32,
+    pub postprocess: F0PostprocessConfig,
+}
+
+impl Default for F0Config {
+    fn default() -> Self {
+        Self {
+            f0_threshold: 0.3,
+            silence_threshold: 0.0001,
+            postprocess: F0PostprocessConfig::default(),
+        }
+    }
+}
+
+/// Live (per-block) conversion parameters: the knobs a host can change between
+/// chunks without reloading the pipeline. Applied through
+/// [`RvcPipeline::apply_live`], which is the single live-update entry point
+/// shared by every front-end (the standalone worker and the VST3 host callback).
+///
+/// `noise_gate_enabled`/`noise_gate_threshold` live here, but the gate's
+/// attack/release/floor and the denoiser *variant* selection (off / gate /
+/// rnnoise) are static load-time config: switching to/from rnnoise rebuilds a
+/// stateful denoiser and so requires a reload, and `apply_live` cannot replace
+/// an active rnnoise stage (see `set_noise_gate`).
+#[derive(Clone, Copy, Debug)]
+pub struct LiveParams {
+    pub pitch_shift: f32,
+    pub speaker_id: i64,
+    pub input_gain: f32,
+    pub output_gain: f32,
+    pub noise_gate_enabled: bool,
+    pub noise_gate_threshold: f32,
+}
+
+impl Default for LiveParams {
+    fn default() -> Self {
+        Self {
+            pitch_shift: 0.0,
+            speaker_id: 0,
+            input_gain: 1.0,
+            output_gain: 1.0,
+            noise_gate_enabled: false,
+            noise_gate_threshold: 0.01,
+        }
+    }
+}
+
 pub struct RvcPipelineConfig<'a> {
     pub model: &'a Path,
     pub embedder: &'a Path,
@@ -150,20 +237,16 @@ pub struct RvcPipelineConfig<'a> {
     pub chunk_samples: usize,
     pub speaker_id: i64,
     pub pitch_shift: f32,
-    pub f0_threshold: f32,
-    pub silence_threshold: f32,
+    pub f0: F0Config,
     pub input_gain: f32,
     pub noise_gate_enabled: bool,
     pub noise_gate_threshold: f32,
-    pub noise_gate_attack_ms: f32,
-    pub noise_gate_release_ms: f32,
-    pub noise_gate_floor: f32,
+    pub noise_gate_shaping: NoiseGateShaping,
     pub output_extra_ms: u32,
     pub volume_excluded_ms: u32,
     pub extra_convert_ms: u32,
     pub output_gain: f32,
     pub output_dynamics: OutputDynamicsConfig,
-    pub f0_postprocess: F0PostprocessConfig,
 }
 
 impl RvcPipeline {
@@ -219,13 +302,13 @@ impl RvcPipeline {
             shared_waveform: None,
             speaker_id: config.speaker_id,
             pitch_shift: config.pitch_shift,
-            f0_threshold: config.f0_threshold,
-            silence_threshold: config.silence_threshold,
+            f0_threshold: config.f0.f0_threshold,
+            silence_threshold: config.f0.silence_threshold,
             input_gain: config.input_gain,
             input_denoiser: build_input_denoiser(&config),
-            noise_gate_attack_ms: config.noise_gate_attack_ms,
-            noise_gate_release_ms: config.noise_gate_release_ms,
-            noise_gate_floor: config.noise_gate_floor,
+            noise_gate_attack_ms: config.noise_gate_shaping.attack_ms,
+            noise_gate_release_ms: config.noise_gate_shaping.release_ms,
+            noise_gate_floor: config.noise_gate_shaping.floor,
             noise_gate_sample_rate: config.sample_rate as f32,
             output_extra_ms: config.output_extra_ms,
             volume_excluded_ms: config.volume_excluded_ms,
@@ -242,7 +325,7 @@ impl RvcPipeline {
             pitchf_untrimmed_scratch: Vec::new(),
             pitchf_scratch: Vec::new(),
             pitch_scratch: Vec::new(),
-            f0_postprocess: F0Postprocessor::new(config.f0_postprocess.clone()),
+            f0_postprocess: F0Postprocessor::new(config.f0.postprocess.clone()),
             pitchf_postprocessed_scratch: Vec::new(),
         })
     }
@@ -359,7 +442,7 @@ impl RvcPipeline {
                     TensorRtSessionPurpose::Probe,
                 )?;
                 let rmvpe_output_shape =
-                    pitch_probe.warmup_output_shape(input_samples_16k, config.f0_threshold)?;
+                    pitch_probe.warmup_output_shape(input_samples_16k, config.f0.f0_threshold)?;
                 drop(pitch_probe);
 
                 let mut rvc_probe = RvcModelSession::load(
@@ -408,7 +491,7 @@ impl RvcPipeline {
                 )?;
                 pitch.enable_tensorrt_binding(
                     &rmvpe_output_shape,
-                    config.f0_threshold,
+                    config.f0.f0_threshold,
                     shared_waveform.as_ref(),
                 )?;
 
@@ -486,7 +569,7 @@ impl RvcPipeline {
                 tensor_rt_run_mode,
                 TensorRtSessionPurpose::Final,
             )?;
-            pitch.warmup_output_shape(input_samples_16k, config.f0_threshold)?;
+            pitch.warmup_output_shape(input_samples_16k, config.f0.f0_threshold)?;
 
             (embedder, pitch, rvc)
         } else {
@@ -552,10 +635,10 @@ impl RvcPipeline {
                     TensorRtSessionPurpose::Final,
                 )?;
                 let rmvpe_output_shape =
-                    pitch.warmup_output_shape(input_samples_16k, config.f0_threshold)?;
+                    pitch.warmup_output_shape(input_samples_16k, config.f0.f0_threshold)?;
                 pitch.enable_tensorrt_binding(
                     &rmvpe_output_shape,
-                    config.f0_threshold,
+                    config.f0.f0_threshold,
                     shared_waveform.as_ref(),
                 )?;
 
@@ -585,13 +668,13 @@ impl RvcPipeline {
             shared_waveform,
             speaker_id: config.speaker_id,
             pitch_shift: config.pitch_shift,
-            f0_threshold: config.f0_threshold,
-            silence_threshold: config.silence_threshold,
+            f0_threshold: config.f0.f0_threshold,
+            silence_threshold: config.f0.silence_threshold,
             input_gain: config.input_gain,
             input_denoiser: build_input_denoiser(&config),
-            noise_gate_attack_ms: config.noise_gate_attack_ms,
-            noise_gate_release_ms: config.noise_gate_release_ms,
-            noise_gate_floor: config.noise_gate_floor,
+            noise_gate_attack_ms: config.noise_gate_shaping.attack_ms,
+            noise_gate_release_ms: config.noise_gate_shaping.release_ms,
+            noise_gate_floor: config.noise_gate_shaping.floor,
             noise_gate_sample_rate: config.sample_rate as f32,
             output_extra_ms: config.output_extra_ms,
             volume_excluded_ms: config.volume_excluded_ms,
@@ -608,7 +691,7 @@ impl RvcPipeline {
             pitchf_untrimmed_scratch: Vec::new(),
             pitchf_scratch: Vec::new(),
             pitch_scratch: Vec::new(),
-            f0_postprocess: F0Postprocessor::new(config.f0_postprocess.clone()),
+            f0_postprocess: F0Postprocessor::new(config.f0.postprocess.clone()),
             pitchf_postprocessed_scratch: Vec::new(),
         })
     }
@@ -660,6 +743,19 @@ impl RvcPipeline {
 
     pub fn set_output_gain(&mut self, output_gain: f32) {
         self.output_gain = output_gain;
+    }
+
+    /// Apply a full [`LiveParams`] snapshot. The single per-chunk live-update
+    /// path: the standalone worker and the VST3 host callback both build a
+    /// `LiveParams` and call this, so the live knobs stay wired identically
+    /// across front-ends. `set_noise_gate` keeps the rnnoise guard, so passing
+    /// `noise_gate_enabled: false` never tears down an active rnnoise stage.
+    pub fn apply_live(&mut self, live: &LiveParams) {
+        self.set_pitch_shift(live.pitch_shift);
+        self.set_speaker_id(live.speaker_id);
+        self.set_input_gain(live.input_gain);
+        self.set_output_gain(live.output_gain);
+        self.set_noise_gate(live.noise_gate_enabled, live.noise_gate_threshold);
     }
 }
 

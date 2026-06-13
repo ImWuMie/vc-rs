@@ -15,7 +15,8 @@ use nice_plug::prelude::util;
 use rtrb::{Consumer, Producer, RingBuffer};
 use vc_core::dsp::chunk_samples_for_rate;
 use vc_core::model_rvc::{
-    F0PostprocessConfig, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig, VoiceModel,
+    F0Config, LiveParams, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
+    VoiceModel,
 };
 use vc_core::sola::{self, ChunkSmoother, ChunkSmootherConfig, SmoothingKind};
 
@@ -301,15 +302,17 @@ impl WorkerCtx {
                 continue;
             };
 
-            // Apply automatable parameters before converting this chunk.
-            pipeline.set_pitch_shift(self.params.pitch_shift.value());
-            pipeline.set_speaker_id(self.params.speaker_id.value() as i64);
-            pipeline.set_input_gain(util::db_to_gain(self.params.input_gain_db.value()));
-            pipeline.set_output_gain(util::db_to_gain(self.params.output_gain_db.value()));
-            pipeline.set_noise_gate(
-                self.params.noise_gate.value(),
-                util::db_to_gain(self.params.noise_gate_threshold_db.value()),
-            );
+            // Apply automatable parameters before converting this chunk. Builds
+            // the same `LiveParams` the standalone worker does, so both drive the
+            // single `apply_live` entry point rather than diverging set_* calls.
+            pipeline.apply_live(&LiveParams {
+                pitch_shift: self.params.pitch_shift.value(),
+                speaker_id: self.params.speaker_id.value() as i64,
+                input_gain: util::db_to_gain(self.params.input_gain_db.value()),
+                output_gain: util::db_to_gain(self.params.output_gain_db.value()),
+                noise_gate_enabled: self.params.noise_gate.value(),
+                noise_gate_threshold: util::db_to_gain(self.params.noise_gate_threshold_db.value()),
+            });
 
             let out = match pipeline.process(chunk, self.sample_rate) {
                 Ok(out) => out,
@@ -484,17 +487,22 @@ impl WorkerCtx {
             // values are placeholders that get overwritten on the first chunk.
             speaker_id: 0,
             pitch_shift: 0.0,
-            f0_threshold: settings.f0_threshold,
-            silence_threshold: settings.silence_threshold,
+            f0: F0Config {
+                f0_threshold: settings.f0_threshold,
+                silence_threshold: settings.silence_threshold,
+                ..F0Config::default()
+            },
             input_gain: 1.0,
             // Gate on/off + threshold are DAW parameters applied per chunk
             // (overwriting these load-time placeholders); attack/release/floor
             // are static and shape the gate built here.
             noise_gate_enabled: false,
             noise_gate_threshold: 0.01,
-            noise_gate_attack_ms: settings.noise_gate_attack_ms,
-            noise_gate_release_ms: settings.noise_gate_release_ms,
-            noise_gate_floor: settings.noise_gate_floor,
+            noise_gate_shaping: NoiseGateShaping {
+                attack_ms: settings.noise_gate_attack_ms,
+                release_ms: settings.noise_gate_release_ms,
+                floor: settings.noise_gate_floor,
+            },
             output_extra_ms: self.output_extra_ms(),
             volume_excluded_ms: self.crossfade_ms,
             extra_convert_ms: settings.extra_convert_ms,
@@ -506,8 +514,6 @@ impl WorkerCtx {
                 target_output_rms: settings.target_output_rms,
                 max_output_gain: settings.max_output_gain,
             },
-            // F0 post-processing is disabled by default; UI wiring is a separate task.
-            f0_postprocess: F0PostprocessConfig::default(),
         })
     }
 }
