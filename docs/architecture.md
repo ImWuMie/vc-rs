@@ -76,6 +76,14 @@ behind, bounded queues make the failure mode explicit: input overrun drops new
 input samples, output underrun emits silence, and output overflow drops newly
 produced samples rather than blocking the realtime callback.
 
+Standalone sessions with a complete model set keep both RVC and passthrough
+routes available on the worker. The live passthrough flag is sampled once per
+input chunk. Passthrough stops invoking RVC inference and applies input gain,
+the configured input denoiser, device-rate resampling, and output gain. When
+conversion resumes, the worker clears stale RVC rolling context and smoother
+history before processing the next chunk. Model-free sessions expose only the
+passthrough route.
+
 ## Chunk Lifecycle
 
 Realtime audio arrives in device callback-sized blocks, but the model operates

@@ -56,6 +56,15 @@ impl<M: VoiceModel> ChunkConverter<M> {
         &mut self.model
     }
 
+    /// Discards output-joining history without rebuilding the owned model.
+    ///
+    /// Realtime callers use this after a period where model processing was
+    /// paused. Reusing the old smoother history would join fresh model output
+    /// against audio emitted before the pause.
+    pub fn reset_streaming_state(&mut self) {
+        self.smoother = None;
+    }
+
     pub fn process_chunk(
         &mut self,
         input: &[f32],
@@ -219,6 +228,24 @@ mod tests {
         assert_eq!(first.audio, vec![0.0; 4]);
         assert_ne!(second.audio, vec![0.0; 4]);
         assert_eq!(changed_rate.audio, vec![0.0; 4]);
+    }
+
+    #[test]
+    fn reset_streaming_state_discards_smoother_history() {
+        let outputs = [
+            Ok(output(vec![1.0; 8], 1_000)),
+            Ok(output(vec![2.0; 8], 1_000)),
+            Ok(output(vec![3.0; 8], 1_000)),
+        ];
+        let mut converter = ChunkConverter::new(FakeModel::new(outputs), config());
+
+        converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
+        let joined = converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
+        assert_ne!(joined.audio, vec![0.0; 4]);
+
+        converter.reset_streaming_state();
+        let reset = converter.process_chunk(&[0.0; 4], 1_000, None).unwrap();
+        assert_eq!(reset.audio, vec![0.0; 4]);
     }
 
     #[test]

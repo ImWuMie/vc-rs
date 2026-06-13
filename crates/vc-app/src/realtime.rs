@@ -12,7 +12,7 @@ use vc_core::dsp;
 use vc_core::model_rvc::{
     set_process_gpu_priority, set_process_power_throttling, ChunkConverter, ChunkOutputConfig,
     ChunkStats, F0Config, GpuPriority, LiveParams, NoiseGateShaping, OutputDynamicsConfig,
-    PassthroughModel, RvcPipeline, RvcPipelineConfig, VoiceModel,
+    RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
 use vc_core::Provider;
@@ -120,6 +120,10 @@ impl Default for RealtimeConfig {
 }
 
 impl RealtimeConfig {
+    fn has_complete_model_set(&self) -> bool {
+        self.model.is_some() && self.embedder.is_some() && self.f0_model.is_some()
+    }
+
     pub fn validate(&self) -> Result<()> {
         if (self.wasapi_input_exclusive || self.wasapi_output_exclusive)
             && self.audio_backend != AudioBackend::Wasapi
@@ -159,25 +163,20 @@ impl RealtimeConfig {
     /// place; `output_extra_ms` / `volume_excluded_ms` are derived from the
     /// crossfade/SOLA/tail knobs, not stored, so they live with the mapping.
     ///
-    /// Only valid for non-passthrough sessions — the model paths are unwrapped
-    /// with `expect("validated")` (guaranteed by `validate`). The live snapshot
-    /// seeds the load-time params; per-block updates still flow through
-    /// `RvcPipeline::apply_live`.
+    /// Only valid when all model paths are present. This includes switchable
+    /// sessions whose initial route is passthrough; their RVC pipeline is still
+    /// loaded for later live activation. The live snapshot seeds the load-time
+    /// params; per-block updates still flow through `RvcPipeline::apply_live`.
     fn pipeline_config<'a>(
         &'a self,
         sample_rate: u32,
         chunk_samples: usize,
         live: &LiveParams,
     ) -> RvcPipelineConfig<'a> {
-        // Passthrough emits raw input, so it carries no smoothing/tail latency;
-        // matches the guard around the worker's smoothing path.
-        let output_extra_ms = if self.passthrough {
-            0
-        } else {
-            self.crossfade_ms
-                .saturating_add(self.sola_search_ms)
-                .saturating_add(self.rvc_output_tail_discard_ms)
-        };
+        let output_extra_ms = self
+            .crossfade_ms
+            .saturating_add(self.sola_search_ms)
+            .saturating_add(self.rvc_output_tail_discard_ms);
         RvcPipelineConfig {
             model: self.model.as_ref().expect("validated"),
             embedder: self.embedder.as_ref().expect("validated"),
@@ -268,6 +267,7 @@ pub struct EngineStatusSnapshot {
     pub output_device: String,
     pub input_sample_rate: u32,
     pub output_sample_rate: u32,
+    pub passthrough_live_switchable: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -345,6 +345,7 @@ pub struct EngineController {
     devices: Arc<Mutex<DeviceList>>,
     telemetry: Arc<Telemetry>,
     live: Arc<AtomicLiveParams>,
+    passthrough: Arc<AtomicBool>,
     control: Option<JoinHandle<()>>,
 }
 
@@ -359,15 +360,17 @@ impl EngineController {
         let devices = Arc::new(Mutex::new(DeviceList::default()));
         let telemetry = Arc::new(Telemetry::default());
         let live = Arc::new(AtomicLiveParams::new(initial_live));
+        let passthrough = Arc::new(AtomicBool::new(false));
         let control = {
             let status = Arc::clone(&status);
             let devices = Arc::clone(&devices);
             let telemetry = Arc::clone(&telemetry);
             let live = Arc::clone(&live);
+            let passthrough = Arc::clone(&passthrough);
             thread::Builder::new()
                 .name("vc-app-control".to_string())
                 .stack_size(64 * 1024 * 1024)
-                .spawn(move || control_loop(rx, status, devices, telemetry, live))
+                .spawn(move || control_loop(rx, status, devices, telemetry, live, passthrough))
                 .expect("failed to spawn vc-app control thread")
         };
         Self {
@@ -376,6 +379,7 @@ impl EngineController {
             devices,
             telemetry,
             live,
+            passthrough,
             control: Some(control),
         }
     }
@@ -395,6 +399,10 @@ impl EngineController {
 
     pub fn set_live_params(&self, params: LiveParams) {
         self.live.store(params);
+    }
+
+    pub fn set_passthrough(&self, enabled: bool) {
+        self.passthrough.store(enabled, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> (EngineStatusSnapshot, TelemetrySnapshot, DeviceList) {
@@ -426,11 +434,13 @@ fn control_loop(
     devices: Arc<Mutex<DeviceList>>,
     telemetry: Arc<Telemetry>,
     live: Arc<AtomicLiveParams>,
+    passthrough: Arc<AtomicBool>,
 ) {
     let mut session: Option<RealtimeSession> = None;
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Command::Apply(config)) => {
+                passthrough.store(config.passthrough, Ordering::Relaxed);
                 set_status(&status, EngineState::Stopping, "Stopping previous session");
                 drop(session.take());
                 set_status(
@@ -451,7 +461,12 @@ fn control_loop(
                     );
                 }
                 telemetry.reset();
-                match RealtimeSession::start(config, Arc::clone(&telemetry), Arc::clone(&live)) {
+                match RealtimeSession::start(
+                    config,
+                    Arc::clone(&telemetry),
+                    Arc::clone(&live),
+                    Arc::clone(&passthrough),
+                ) {
                     Ok(new_session) => {
                         if let Ok(mut current) = status.lock() {
                             *current = new_session.status();
@@ -499,6 +514,7 @@ fn set_status(
             status.output_device.clear();
             status.input_sample_rate = 0;
             status.output_sample_rate = 0;
+            status.passthrough_live_switchable = false;
         }
     }
 }
@@ -531,16 +547,139 @@ fn wasapi_device_names() -> Result<(Vec<String>, Vec<String>)> {
     bail!("WASAPI is only available on Windows")
 }
 
-// Only ever one live value, held by the worker and dereferenced on every audio
-// block. Boxing the `Rvc` variant to even out the size would just add a pointer
-// chase to the inference hot path for no real memory benefit, so keep it inline.
+enum PassthroughDenoiser {
+    Off,
+    Gate(dsp::NoiseGate),
+    #[cfg(feature = "rnnoise")]
+    Rnnoise(Box<vc_core::rnnoise::RnnoiseDenoiser>),
+}
+
+struct PassthroughProcessor {
+    mode: DenoiserMode,
+    shaping: NoiseGateShaping,
+    input_rate: u32,
+    output_rate: u32,
+    denoiser: PassthroughDenoiser,
+    resampler: dsp::StreamingResampleMono,
+    input_scratch: Vec<f32>,
+}
+
+impl PassthroughProcessor {
+    fn new(
+        mode: DenoiserMode,
+        shaping: NoiseGateShaping,
+        input_rate: u32,
+        output_rate: u32,
+        live: &LiveParams,
+    ) -> Result<Self> {
+        let mut processor = Self {
+            mode,
+            shaping,
+            input_rate,
+            output_rate,
+            denoiser: PassthroughDenoiser::Off,
+            resampler: dsp::StreamingResampleMono::new(input_rate as usize, output_rate as usize)?,
+            input_scratch: Vec::new(),
+        };
+        processor.reset(live)?;
+        Ok(processor)
+    }
+
+    fn reset(&mut self, live: &LiveParams) -> Result<()> {
+        self.resampler =
+            dsp::StreamingResampleMono::new(self.input_rate as usize, self.output_rate as usize)?;
+        self.denoiser = match self.mode {
+            DenoiserMode::Rnnoise => {
+                #[cfg(feature = "rnnoise")]
+                {
+                    PassthroughDenoiser::Rnnoise(Box::new(vc_core::rnnoise::RnnoiseDenoiser::new(
+                        self.input_rate,
+                    )?))
+                }
+                #[cfg(not(feature = "rnnoise"))]
+                {
+                    bail!("RNNoise support is not enabled in this build")
+                }
+            }
+            DenoiserMode::Off | DenoiserMode::NoiseGate => PassthroughDenoiser::Off,
+        };
+        self.update_live_denoiser(live);
+        Ok(())
+    }
+
+    fn update_live_denoiser(&mut self, live: &LiveParams) {
+        if self.mode == DenoiserMode::Rnnoise {
+            return;
+        }
+        if !live.noise_gate_enabled {
+            self.denoiser = PassthroughDenoiser::Off;
+            return;
+        }
+        match &mut self.denoiser {
+            PassthroughDenoiser::Gate(gate) => gate.set_threshold(live.noise_gate_threshold),
+            _ => {
+                self.denoiser = PassthroughDenoiser::Gate(dsp::NoiseGate::new(
+                    self.input_rate as f32,
+                    live.noise_gate_threshold,
+                    self.shaping.attack_ms,
+                    self.shaping.release_ms,
+                    self.shaping.floor,
+                ));
+            }
+        }
+    }
+
+    fn process_chunk(
+        &mut self,
+        audio: &[f32],
+        live: &LiveParams,
+        prepared: &mut Vec<f32>,
+    ) -> Result<ChunkStats> {
+        self.update_live_denoiser(live);
+        self.input_scratch.clear();
+        self.input_scratch.extend(
+            audio
+                .iter()
+                .map(|sample| (*sample * live.input_gain.max(0.0)).clamp(-1.0, 1.0)),
+        );
+        match &mut self.denoiser {
+            PassthroughDenoiser::Off => {}
+            PassthroughDenoiser::Gate(gate) => gate.process_in_place(&mut self.input_scratch),
+            #[cfg(feature = "rnnoise")]
+            PassthroughDenoiser::Rnnoise(denoiser) => {
+                denoiser.process_in_place(&mut self.input_scratch)?
+            }
+        }
+        let input_rms = dsp::rms(&self.input_scratch);
+        prepared.clear();
+        self.resampler.process_into(&self.input_scratch, prepared)?;
+        let output_gain = live.output_gain.max(0.0);
+        if (output_gain - 1.0).abs() > f32::EPSILON {
+            for sample in prepared.iter_mut() {
+                *sample = (*sample * output_gain).clamp(-1.0, 1.0);
+            }
+        }
+        Ok(ChunkStats {
+            silent: false,
+            inference_time: Duration::ZERO,
+            input_rms,
+            output_rms: dsp::rms(prepared),
+            model_output_samples: prepared.len(),
+        })
+    }
+}
+
+// Stateful processing remains on the inference worker. Passthrough-only
+// sessions preserve the model-free diagnostic path; switchable sessions retain
+// loaded RVC sessions but stop invoking them while passthrough is active.
 #[allow(clippy::large_enum_variant)]
 enum RuntimeModel {
-    Passthrough {
-        model: PassthroughModel,
-        resampler: dsp::StreamingResampleMono,
+    PassthroughOnly(PassthroughProcessor),
+    Switchable {
+        passthrough: PassthroughProcessor,
+        rvc: ChunkConverter<RvcPipeline>,
+        passthrough_active: bool,
     },
-    Rvc(ChunkConverter<RvcPipeline>),
 }
 
 impl RuntimeModel {
@@ -549,24 +688,32 @@ impl RuntimeModel {
         audio: &[f32],
         sample_rate: u32,
         live: &LiveParams,
+        passthrough_requested: bool,
         prepared: &mut Vec<f32>,
     ) -> Result<ChunkStats> {
         match self {
-            Self::Passthrough { model, resampler } => {
-                let out = model.process(audio, sample_rate)?;
-                prepared.clear();
-                resampler.process_into(&out.audio, prepared)?;
-                Ok(ChunkStats {
-                    silent: out.silent,
-                    inference_time: out.inference_time,
-                    input_rms: out.input_rms,
-                    output_rms: out.output_rms,
-                    model_output_samples: out.audio.len(),
-                })
-            }
-            Self::Rvc(converter) => {
-                converter.model_mut().apply_live(live);
-                let converted = converter.process_chunk(audio, sample_rate, None)?;
+            Self::PassthroughOnly(passthrough) => passthrough.process_chunk(audio, live, prepared),
+            Self::Switchable {
+                passthrough,
+                rvc,
+                passthrough_active,
+            } => {
+                if passthrough_requested {
+                    if !*passthrough_active {
+                        passthrough.reset(live)?;
+                        *passthrough_active = true;
+                    }
+                    return passthrough.process_chunk(audio, live, prepared);
+                }
+                if *passthrough_active {
+                    // RVC was intentionally idle, so neither its rolling model
+                    // context nor its output smoother may be joined to new input.
+                    rvc.model_mut().reset_streaming_state()?;
+                    rvc.reset_streaming_state();
+                    *passthrough_active = false;
+                }
+                rvc.model_mut().apply_live(live);
+                let converted = rvc.process_chunk(audio, sample_rate, None)?;
                 *prepared = converted.audio;
                 Ok(converted.stats)
             }
@@ -593,6 +740,7 @@ impl RealtimeSession {
         config: RealtimeConfig,
         telemetry: Arc<Telemetry>,
         live: Arc<AtomicLiveParams>,
+        passthrough_live: Arc<AtomicBool>,
     ) -> Result<Self> {
         // Process-wide GPU scheduling priority (all backends). Applied here on
         // the controller thread, off the audio callback, and re-applied on every
@@ -619,15 +767,15 @@ impl RealtimeSession {
         let current_live = live.load();
         let debug_input = Arc::new(Mutex::new(Vec::new()));
         let debug_output = Arc::new(Mutex::new(Vec::new()));
-        let model = if config.passthrough {
-            RuntimeModel::Passthrough {
-                model: PassthroughModel,
-                resampler: dsp::StreamingResampleMono::new(
-                    input_rate as usize,
-                    output_rate as usize,
-                )?,
-            }
-        } else {
+        let passthrough_processor = PassthroughProcessor::new(
+            config.denoiser_mode,
+            config.noise_gate_shaping,
+            input_rate,
+            output_rate,
+            &current_live,
+        )?;
+        let passthrough_live_switchable = config.has_complete_model_set();
+        let model = if passthrough_live_switchable {
             let pipeline_config = config.pipeline_config(input_rate, input_chunk, &current_live);
             let pipeline = match config.denoiser_mode {
                 DenoiserMode::Off | DenoiserMode::NoiseGate => RvcPipeline::load(pipeline_config)?,
@@ -642,17 +790,23 @@ impl RealtimeSession {
                     }
                 }
             };
-            RuntimeModel::Rvc(ChunkConverter::new(
-                pipeline,
-                ChunkOutputConfig {
-                    kind: config.smoother.kind(),
-                    output_sample_rate: output_rate,
-                    output_chunk_samples: output_chunk,
-                    crossfade_ms: config.crossfade_ms,
-                    sola_search_ms: config.sola_search_ms,
-                    tail_discard_ms: config.rvc_output_tail_discard_ms,
-                },
-            ))
+            RuntimeModel::Switchable {
+                passthrough: passthrough_processor,
+                rvc: ChunkConverter::new(
+                    pipeline,
+                    ChunkOutputConfig {
+                        kind: config.smoother.kind(),
+                        output_sample_rate: output_rate,
+                        output_chunk_samples: output_chunk,
+                        crossfade_ms: config.crossfade_ms,
+                        sola_search_ms: config.sola_search_ms,
+                        tail_discard_ms: config.rvc_output_tail_discard_ms,
+                    },
+                ),
+                passthrough_active: config.passthrough,
+            }
+        } else {
+            RuntimeModel::PassthroughOnly(passthrough_processor)
         };
 
         let output_capacity = output_chunk * OUTPUT_QUEUE_CHUNKS;
@@ -711,6 +865,7 @@ impl RealtimeSession {
                             &input_acc[..input_chunk],
                             input_rate,
                             &live.load(),
+                            passthrough_live.load(Ordering::Relaxed),
                             &mut prepared,
                         );
                         input_acc.clear();
@@ -772,6 +927,7 @@ impl RealtimeSession {
                 output_device: audio.output_name().to_string(),
                 input_sample_rate: input_rate,
                 output_sample_rate: output_rate,
+                passthrough_live_switchable,
             },
             debug_input_wav: config.debug_input_wav,
             debug_output_wav: config.debug_output_wav,
@@ -929,6 +1085,100 @@ mod tests {
         }
         .validate()
         .is_ok());
+    }
+
+    #[test]
+    fn complete_model_set_controls_live_passthrough_capability() {
+        let model = PathBuf::from("model.onnx");
+        let complete = RealtimeConfig {
+            model: Some(model.clone()),
+            embedder: Some(model.clone()),
+            f0_model: Some(model),
+            ..Default::default()
+        };
+        assert!(complete.has_complete_model_set());
+        assert!(!RealtimeConfig {
+            passthrough: true,
+            model: Some(PathBuf::from("model.onnx")),
+            ..Default::default()
+        }
+        .has_complete_model_set());
+    }
+
+    #[test]
+    fn passthrough_processor_applies_input_and_output_gain() {
+        let live = LiveParams {
+            input_gain: 2.0,
+            output_gain: 2.0,
+            ..Default::default()
+        };
+        let mut processor = PassthroughProcessor::new(
+            DenoiserMode::Off,
+            NoiseGateShaping::default(),
+            48_000,
+            48_000,
+            &live,
+        )
+        .unwrap();
+        let mut prepared = Vec::new();
+
+        let stats = processor
+            .process_chunk(&[0.25; 480], &live, &mut prepared)
+            .unwrap();
+
+        assert!(prepared.iter().all(|sample| (*sample - 1.0).abs() < 1e-6));
+        assert!((stats.input_rms - 0.5).abs() < 1e-6);
+        assert!((stats.output_rms - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn passthrough_processor_applies_live_noise_gate() {
+        let live = LiveParams {
+            noise_gate_enabled: true,
+            noise_gate_threshold: 0.5,
+            ..Default::default()
+        };
+        let mut processor = PassthroughProcessor::new(
+            DenoiserMode::NoiseGate,
+            NoiseGateShaping {
+                attack_ms: 0.0,
+                release_ms: 0.0,
+                floor: 0.0,
+            },
+            48_000,
+            48_000,
+            &live,
+        )
+        .unwrap();
+        let mut prepared = Vec::new();
+
+        processor
+            .process_chunk(&[0.01; 480], &live, &mut prepared)
+            .unwrap();
+
+        assert!(dsp::rms(&prepared) < 1e-6);
+    }
+
+    #[cfg(feature = "rnnoise")]
+    #[test]
+    fn passthrough_processor_runs_rnnoise_and_preserves_chunk_length() {
+        let live = LiveParams::default();
+        let mut processor = PassthroughProcessor::new(
+            DenoiserMode::Rnnoise,
+            NoiseGateShaping::default(),
+            48_000,
+            48_000,
+            &live,
+        )
+        .unwrap();
+        let mut prepared = Vec::new();
+
+        processor
+            .process_chunk(&[0.0; 960], &live, &mut prepared)
+            .unwrap();
+
+        assert_eq!(prepared.len(), 960);
+        assert!(prepared.iter().all(|sample| sample.is_finite()));
     }
 
     #[test]

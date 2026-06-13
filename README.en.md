@@ -134,12 +134,17 @@ still supply your own RVC voice model (`.onnx`).
    it exceeds the chunk budget).
 
 Settings are saved automatically (`%APPDATA%\vc-rs\gui.toml`) and restored on the
-next launch. A **Passthrough** toggle (no conversion) is available for checking
-the signal path.
+next launch. When all three models are loaded, **Passthrough** switches live at
+the next worker chunk boundary. RVC inference stops while passthrough is active;
+switching back discards stale streaming context before conversion resumes.
+Model-free passthrough remains available, but that session cannot switch live
+back to RVC.
 
 Choose `off`, `noise-gate`, or `rnnoise` under **Input denoiser**. RNNoise uses
-an embedded model and needs no additional model download. Denoiser changes apply
-on **Apply / Start**. RNNoise is not included in VST3.
+an embedded model and needs no additional model download. Passthrough applies
+Input gain, the selected input denoiser, and Output gain. Switching between
+`off` and `noise-gate`, including the gate threshold, is live; switching to
+RNNoise requires **Apply / Start**. RNNoise is not included in VST3.
 
 ## Tuning real-time settings
 

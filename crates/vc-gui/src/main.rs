@@ -409,13 +409,22 @@ impl eframe::App for VcGui {
             if ui.button("Stop").clicked() {
                 self.stop();
             }
+            let passthrough_enabled =
+                status.state != EngineState::Running || status.passthrough_live_switchable;
             if ui
-                .checkbox(&mut self.settings.passthrough, "Passthrough")
+                .add_enabled(
+                    passthrough_enabled,
+                    egui::Checkbox::new(&mut self.settings.passthrough, "Passthrough"),
+                )
                 .changed()
             {
+                self.controller.set_passthrough(self.settings.passthrough);
                 self.changed();
             }
         });
+        if status.state == EngineState::Running && !status.passthrough_live_switchable {
+            ui.label("Live passthrough switching requires all three models; Apply / Start after selecting them.");
+        }
         ui.separator();
 
         egui::ScrollArea::vertical().show(ui, |ui| {

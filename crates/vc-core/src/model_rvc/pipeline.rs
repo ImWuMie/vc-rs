@@ -51,6 +51,24 @@ impl InputDenoiser {
         }
         Ok(())
     }
+
+    fn reset(&mut self, sample_rate: f32, threshold: f32, shaping: NoiseGateShaping) -> Result<()> {
+        *self = match self {
+            InputDenoiser::Off => InputDenoiser::Off,
+            InputDenoiser::Gate(_) => InputDenoiser::Gate(dsp::NoiseGate::new(
+                sample_rate,
+                threshold,
+                shaping.attack_ms,
+                shaping.release_ms,
+                shaping.floor,
+            )),
+            #[cfg(feature = "rnnoise")]
+            InputDenoiser::Rnnoise(_) => InputDenoiser::Rnnoise(Box::new(
+                crate::rnnoise::RnnoiseDenoiser::new(sample_rate as u32)?,
+            )),
+        };
+        Ok(())
+    }
 }
 
 fn build_input_denoiser(config: &RvcPipelineConfig<'_>) -> InputDenoiser {
@@ -82,6 +100,7 @@ pub struct RvcPipeline {
     // disabled); the remaining fields let `set_noise_gate` rebuild the gate
     // when it is toggled back on without a full pipeline reload.
     input_denoiser: InputDenoiser,
+    noise_gate_threshold: f32,
     noise_gate_attack_ms: f32,
     noise_gate_release_ms: f32,
     noise_gate_floor: f32,
@@ -307,6 +326,7 @@ impl RvcPipeline {
             silence_threshold: config.f0.silence_threshold,
             input_gain: config.input_gain,
             input_denoiser: build_input_denoiser(&config),
+            noise_gate_threshold: config.noise_gate_threshold,
             noise_gate_attack_ms: config.noise_gate_shaping.attack_ms,
             noise_gate_release_ms: config.noise_gate_shaping.release_ms,
             noise_gate_floor: config.noise_gate_shaping.floor,
@@ -688,6 +708,7 @@ impl RvcPipeline {
             silence_threshold: config.f0.silence_threshold,
             input_gain: config.input_gain,
             input_denoiser: build_input_denoiser(&config),
+            noise_gate_threshold: config.noise_gate_threshold,
             noise_gate_attack_ms: config.noise_gate_shaping.attack_ms,
             noise_gate_release_ms: config.noise_gate_shaping.release_ms,
             noise_gate_floor: config.noise_gate_shaping.floor,
@@ -733,6 +754,7 @@ impl RvcPipeline {
     /// release are not live-adjustable (they shape the smoothing coefficients
     /// fixed at construction).
     pub fn set_noise_gate(&mut self, enabled: bool, threshold: f32) {
+        self.noise_gate_threshold = threshold;
         // Standalone live-parameter updates must not replace a configured
         // stateful denoiser. Future denoiser variants need the same guard.
         #[cfg(feature = "rnnoise")]
@@ -772,6 +794,33 @@ impl RvcPipeline {
         self.set_input_gain(live.input_gain);
         self.set_output_gain(live.output_gain);
         self.set_noise_gate(live.noise_gate_enabled, live.noise_gate_threshold);
+    }
+
+    /// Discards rolling audio/F0 context while retaining loaded inference
+    /// sessions.
+    ///
+    /// Standalone passthrough can pause RVC processing for an arbitrary time.
+    /// On resume, old audio context must not be concatenated with the new live
+    /// input. Denoiser state is reset too because RNNoise owns fixed-delay
+    /// buffers that may otherwise emit audio captured before the pause.
+    pub fn reset_streaming_state(&mut self) -> Result<()> {
+        self.input_denoiser.reset(
+            self.noise_gate_sample_rate,
+            self.noise_gate_threshold,
+            NoiseGateShaping {
+                attack_ms: self.noise_gate_attack_ms,
+                release_ms: self.noise_gate_release_ms,
+                floor: self.noise_gate_floor,
+            },
+        )?;
+        self.stream_state = RvcStreamState::new();
+        self.input_reference_scratch.clear();
+        self.rms_mix_scratch = dsp::RmsMixScratch::default();
+        self.pitchf_untrimmed_scratch.clear();
+        self.pitchf_scratch.clear();
+        self.pitch_scratch.clear();
+        self.pitchf_postprocessed_scratch.clear();
+        Ok(())
     }
 }
 
