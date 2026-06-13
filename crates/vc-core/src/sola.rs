@@ -392,12 +392,39 @@ fn psola_offset_with_period_with_scratch(
     }
 
     psola_pitch_mark_weights_into(&reference[..frame], period, weights)?;
+    let reference = &reference[..frame];
+    let weights = &weights[..frame];
+
+    // The reference-side energies (`sum(y*y)` and `sum(y*y*w)`) are
+    // offset-independent; hoist them out of the search instead of recomputing
+    // them per offset as the previous `weighted_correlation` /
+    // `normalized_correlation` calls did.
+    let mut ref_energy_weighted = 0.0f32;
+    let mut ref_energy_plain = 0.0f32;
+    for (&y, &w) in reference.iter().zip(weights) {
+        ref_energy_weighted += y * y * w;
+        ref_energy_plain += y * y;
+    }
+
+    // The unweighted window energy slides by one sample per offset (see
+    // `dsp::sola_offset`); only the cross-correlation numerators and the
+    // weighted window energy must be recomputed per offset.
+    let mut window_energy_plain = dsp::dot(&candidate[..frame], &candidate[..frame]);
     let mut best_offset = 0;
     let mut best_score = f32::MIN;
     for offset in 0..=max_offset {
+        if offset > 0 {
+            let leaving = candidate[offset - 1];
+            let entering = candidate[offset + frame - 1];
+            window_energy_plain += entering * entering - leaving * leaving;
+        }
         let window = &candidate[offset..offset + frame];
-        let pitch_score = weighted_correlation(window, &reference[..frame], weights);
-        let full_score = normalized_correlation(window, &reference[..frame]);
+        let (nom_weighted, window_energy_weighted) =
+            weighted_window_terms(window, reference, weights);
+        let pitch_score =
+            nom_weighted / (window_energy_weighted * ref_energy_weighted + 1e-9).sqrt();
+        let nom_plain = dsp::dot(window, reference);
+        let full_score = nom_plain / (window_energy_plain * ref_energy_plain + 1e-9).sqrt();
         let score = pitch_score * 0.8 + full_score * 0.2;
         if score.is_finite() && score > best_score {
             best_score = score;
@@ -452,30 +479,53 @@ fn add_pitch_mark_weight(weights: &mut [f32], mark: usize, radius: usize) {
     }
 }
 
-fn normalized_correlation(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
-    let mut nom = 0.0;
-    let mut a_energy = 0.0;
-    let mut b_energy = 0.0;
-    for (&x, &y) in a.iter().zip(b).take(n) {
-        nom += x * y;
-        a_energy += x * x;
-        b_energy += y * y;
+/// Offset-dependent terms of the pitch-weighted correlation: the numerator
+/// `sum(x*y*w)` and the weighted window energy `sum(x*x*w)`. The reference-side
+/// energy `sum(y*y*w)` is offset-independent and hoisted by the caller, so it is
+/// not recomputed here.
+fn weighted_window_terms(window: &[f32], reference: &[f32], weights: &[f32]) -> (f32, f32) {
+    // Split both reductions into independent accumulator lanes so the compiler
+    // can auto-vectorize them (same rationale as `dsp::dot`: a single `+=`
+    // reduction forces a strict, non-associative f32 chain that blocks SIMD).
+    // Eight lanes match a 256-bit register; lane assignment is fixed, so the
+    // result is deterministic run-to-run.
+    const LANES: usize = 8;
+    let n = window.len().min(reference.len()).min(weights.len());
+    let window = &window[..n];
+    let reference = &reference[..n];
+    let weights = &weights[..n];
+    let mut nom = [0.0f32; LANES];
+    let mut window_energy = [0.0f32; LANES];
+    let mut w_chunks = window.chunks_exact(LANES);
+    let mut r_chunks = reference.chunks_exact(LANES);
+    let mut wt_chunks = weights.chunks_exact(LANES);
+    for ((cw, cr), cwt) in w_chunks
+        .by_ref()
+        .zip(r_chunks.by_ref())
+        .zip(wt_chunks.by_ref())
+    {
+        for lane in 0..LANES {
+            let xw = cw[lane] * cwt[lane];
+            nom[lane] += xw * cr[lane];
+            window_energy[lane] += xw * cw[lane];
+        }
     }
-    nom / (a_energy * b_energy + 1e-9).sqrt()
-}
-
-fn weighted_correlation(a: &[f32], b: &[f32], weights: &[f32]) -> f32 {
-    let n = a.len().min(b.len()).min(weights.len());
-    let mut nom = 0.0;
-    let mut a_energy = 0.0;
-    let mut b_energy = 0.0;
-    for ((&x, &y), &weight) in a.iter().zip(b).zip(weights).take(n) {
-        nom += x * y * weight;
-        a_energy += x * x * weight;
-        b_energy += y * y * weight;
+    let mut nom_tail = 0.0;
+    let mut energy_tail = 0.0;
+    for ((&x, &y), &weight) in w_chunks
+        .remainder()
+        .iter()
+        .zip(r_chunks.remainder())
+        .zip(wt_chunks.remainder())
+    {
+        let xw = x * weight;
+        nom_tail += xw * y;
+        energy_tail += xw * x;
     }
-    nom / (a_energy * b_energy + 1e-9).sqrt()
+    (
+        nom.iter().sum::<f32>() + nom_tail,
+        window_energy.iter().sum::<f32>() + energy_tail,
+    )
 }
 
 fn vcclient_prev_strength_into(input: &[f32], output: &mut Vec<f32>) {

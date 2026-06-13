@@ -384,16 +384,29 @@ pub fn sola_offset(candidate: &[f32], reference: &[f32], search: usize) -> usize
     }
 
     let max_offset = search.min(candidate.len().saturating_sub(frame));
-    let mut best_offset = 0;
-    let mut best_score = f32::MIN;
+    let reference = &reference[..frame];
     // Reference energy is independent of `offset`; hoist it out of the search
     // loop so the normalized cross-correlation denominator only recomputes the
-    // window-dependent term per iteration. Result (best_offset) is unchanged.
-    let reference_energy = dot(&reference[..frame], &reference[..frame]);
+    // window-dependent term per iteration.
+    let reference_energy = dot(reference, reference);
+    // The window energy `dot(window, window)` is the only other offset-dependent
+    // term, and sliding the frame by one sample just drops the leaving sample's
+    // square and adds the entering sample's. Maintaining it incrementally keeps
+    // the denominator O(1) per offset, so each step costs one cross-correlation
+    // `dot` instead of two. Numerically equivalent to the full recompute (f32
+    // accumulation drifts negligibly over the bounded search range).
+    let mut window_energy = dot(&candidate[..frame], &candidate[..frame]);
+    let mut best_offset = 0;
+    let mut best_score = f32::MIN;
     for offset in 0..=max_offset {
+        if offset > 0 {
+            let leaving = candidate[offset - 1];
+            let entering = candidate[offset + frame - 1];
+            window_energy += entering * entering - leaving * leaving;
+        }
         let window = &candidate[offset..offset + frame];
-        let nom = dot(window, &reference[..frame]);
-        let den = (dot(window, window) * reference_energy + 1e-9).sqrt();
+        let nom = dot(window, reference);
+        let den = (window_energy * reference_energy + 1e-9).sqrt();
         let score = nom / den;
         if score > best_score {
             best_score = score;
@@ -415,8 +428,32 @@ pub fn sola_offset_with_threshold(
     sola_offset(candidate, reference, search)
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    // Reduce into independent accumulator lanes rather than a single `.sum()`.
+    // f32 addition is not associative, so a plain `.sum()` forces a strict
+    // left-to-right reduction that the compiler cannot auto-vectorize; eight
+    // lanes (a 256-bit register's worth) let it emit SIMD. The lane assignment
+    // is fixed, so the result is deterministic run-to-run (not bit-identical to
+    // the scalar sum, which the SOLA search tolerates).
+    const LANES: usize = 8;
+    let n = a.len().min(b.len());
+    let a = &a[..n];
+    let b = &b[..n];
+    let mut acc = [0.0f32; LANES];
+    let mut a_chunks = a.chunks_exact(LANES);
+    let mut b_chunks = b.chunks_exact(LANES);
+    for (ca, cb) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        for lane in 0..LANES {
+            acc[lane] += ca[lane] * cb[lane];
+        }
+    }
+    let tail: f32 = a_chunks
+        .remainder()
+        .iter()
+        .zip(b_chunks.remainder())
+        .map(|(x, y)| x * y)
+        .sum();
+    acc.iter().sum::<f32>() + tail
 }
 
 /// One-pole smoothing coefficient for an exponential follower with the given
