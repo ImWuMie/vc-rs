@@ -10,8 +10,8 @@ use rtrb::RingBuffer;
 use thread_priority::{set_current_thread_priority, ThreadPriority};
 use vc_core::dsp;
 use vc_core::model_rvc::{
-    F0Config, GpuPriority, LiveParams, NoiseGateShaping, OutputDynamicsConfig, PassthroughModel,
-    RvcPipeline, RvcPipelineConfig, VoiceModel,
+    set_process_gpu_priority, F0Config, GpuPriority, LiveParams, NoiseGateShaping,
+    OutputDynamicsConfig, PassthroughModel, RvcPipeline, RvcPipelineConfig, VoiceModel,
 };
 use vc_core::sola::{self, ChunkSmootherConfig, SmoothingKind};
 use vc_core::Provider;
@@ -577,6 +577,10 @@ impl RealtimeSession {
         telemetry: Arc<Telemetry>,
         live: Arc<AtomicLiveParams>,
     ) -> Result<Self> {
+        // Process-wide GPU scheduling priority (all backends). Applied here on
+        // the controller thread, off the audio callback, and re-applied on every
+        // reconfigure so a changed setting takes effect on the next session.
+        set_process_gpu_priority(config.gpu_priority);
         let audio = RealtimeAudio::open(
             config.audio_backend,
             config.wasapi_input_exclusive,

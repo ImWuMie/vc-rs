@@ -450,6 +450,9 @@ impl eframe::App for VcGui {
                             .changed();
                     }
                 });
+            // GPU priority now applies to every backend: a process-wide Windows
+            // GPU scheduling priority class (set on engine start) plus, on the
+            // TensorRT path, a CUDA stream priority. So it's shown for all builds.
             egui::ComboBox::from_label("GPU Priority")
                 .selected_text(&self.settings.gpu_priority)
                 .show_ui(ui, |ui| {

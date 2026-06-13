@@ -11,7 +11,8 @@ use vc_app::{
 };
 use vc_core::dsp;
 use vc_core::model_rvc::{
-    F0Config, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig, VoiceModel,
+    set_process_gpu_priority, F0Config, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline,
+    RvcPipelineConfig, VoiceModel,
 };
 use vc_core::sola::{self, ChunkSmootherConfig, SmoothingKind};
 
@@ -137,6 +138,9 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
     let output_extra_ms = DEFAULT_CROSSFADE_MS
         .saturating_add(DEFAULT_SOLA_SEARCH_MS)
         .saturating_add(args.rvc_output_tail_discard_ms);
+    // WAV mode builds the pipeline directly (realtime goes via vc-app, which
+    // applies this on session start); set the process GPU priority here too.
+    set_process_gpu_priority(args.gpu_priority.into());
     let mut model = RvcPipeline::load(RvcPipelineConfig {
         model: &args.model,
         embedder: &args.embedder,

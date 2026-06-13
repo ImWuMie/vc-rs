@@ -7,15 +7,19 @@ mod native_tensorrt;
 mod onnx_meta;
 mod pipeline;
 mod pitch;
+mod process_priority;
 mod sessions;
 mod shape;
 mod stream;
 mod tensorrt;
 
-/// GPU scheduling priority requested for native TensorRT inference streams.
+/// GPU scheduling priority requested for inference work.
 ///
-/// CUDA stream priority is a scheduling hint for compute kernels. It does not
-/// guarantee execution order and does not prioritize host/device transfers.
+/// Applied at two layers (see [`set_process_gpu_priority`]): a process-wide
+/// Windows GPU scheduling priority class that affects every backend, plus a
+/// native TensorRT CUDA *stream* priority on the TRT path. Both are scheduling
+/// hints only — they do not guarantee execution order and do not prioritize
+/// host/device transfers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GpuPriority {
     Normal,
@@ -35,6 +39,7 @@ pub use inspect::inspect_model;
 pub use pipeline::{
     F0Config, LiveParams, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
+pub use process_priority::set_process_gpu_priority;
 
 #[cfg(test)]
 mod tests;

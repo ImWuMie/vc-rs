@@ -12,6 +12,13 @@ versioning and publishing procedure.
 
 ## [Unreleased]
 
+### Changed
+
+- GPU Priority now applies to every backend, not just native TensorRT: it sets a
+  process-wide Windows GPU scheduling priority class (in addition to the
+  TensorRT CUDA stream priority on that path), so the control is shown in the GUI
+  for Windows ML / CPU builds as well.
+
 ## [0.2.1] - 2026-06-10
 
 ### Added
