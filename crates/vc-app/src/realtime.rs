@@ -11,8 +11,8 @@ use thread_priority::{set_current_thread_priority, ThreadPriority};
 use vc_core::dsp;
 use vc_core::model_rvc::{
     set_process_gpu_priority, set_process_power_throttling, ChunkConverter, ChunkOutputConfig,
-    ChunkStats, F0Config, GpuPriority, LiveParams, NoiseGateShaping, OutputDynamicsConfig,
-    RvcPipeline, RvcPipelineConfig,
+    ChunkStats, F0Config, GpuPriority, LiveParams, LoadProgress, NoiseGateShaping,
+    OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
 use vc_core::Provider;
@@ -172,6 +172,7 @@ impl RealtimeConfig {
         sample_rate: u32,
         chunk_samples: usize,
         live: &LiveParams,
+        progress: Option<&'a dyn Fn(LoadProgress)>,
     ) -> RvcPipelineConfig<'a> {
         let output_extra_ms = self
             .crossfade_ms
@@ -199,6 +200,7 @@ impl RealtimeConfig {
             extra_convert_ms: self.extra_convert_ms,
             output_gain: live.output_gain,
             output_dynamics: self.output_dynamics,
+            progress,
         }
     }
 }
@@ -263,6 +265,7 @@ pub enum EngineState {
 pub struct EngineStatusSnapshot {
     pub state: EngineState,
     pub message: String,
+    pub detail: Option<String>,
     pub input_device: String,
     pub output_device: String,
     pub input_sample_rate: u32,
@@ -443,29 +446,14 @@ fn control_loop(
                 passthrough.store(config.passthrough, Ordering::Relaxed);
                 set_status(&status, EngineState::Stopping, "Stopping previous session");
                 drop(session.take());
-                set_status(
-                    &status,
-                    EngineState::Starting,
-                    "Loading model and audio devices",
-                );
-                // Surface a distinct status while a Windows ML EP downloads on
-                // first use: the registration that triggers the (blocking,
-                // possibly multi-minute) download happens inside the model load
-                // below, so detect it here and update the message beforehand.
-                #[cfg(all(windows, feature = "windowsml"))]
-                if vc_core::windows_ml::provider_download_pending(config.provider) {
-                    set_status(
-                        &status,
-                        EngineState::Starting,
-                        "Downloading execution provider… first run can take a few minutes",
-                    );
-                }
+                set_status(&status, EngineState::Starting, "Validating configuration");
                 telemetry.reset();
                 match RealtimeSession::start(
                     config,
                     Arc::clone(&telemetry),
                     Arc::clone(&live),
                     Arc::clone(&passthrough),
+                    &status,
                 ) {
                     Ok(new_session) => {
                         if let Ok(mut current) = status.lock() {
@@ -473,7 +461,7 @@ fn control_loop(
                         }
                         session = Some(new_session);
                     }
-                    Err(err) => set_status(&status, EngineState::Error, format!("{err:#}")),
+                    Err(err) => set_error(&status, &err),
                 }
             }
             Ok(Command::Stop) => {
@@ -509,6 +497,7 @@ fn set_status(
     if let Ok(mut status) = status.lock() {
         status.state = state;
         status.message = message.into();
+        status.detail = None;
         if state != EngineState::Running {
             status.input_device.clear();
             status.output_device.clear();
@@ -516,6 +505,35 @@ fn set_status(
             status.output_sample_rate = 0;
             status.passthrough_live_switchable = false;
         }
+    }
+}
+
+fn set_error(status: &Mutex<EngineStatusSnapshot>, error: &anyhow::Error) {
+    if let Ok(mut status) = status.lock() {
+        status.state = EngineState::Error;
+        status.message = error.to_string();
+        status.detail = Some(format!("{error:#}"));
+        status.input_device.clear();
+        status.output_device.clear();
+        status.input_sample_rate = 0;
+        status.output_sample_rate = 0;
+        status.passthrough_live_switchable = false;
+    }
+}
+
+fn load_progress_message(progress: LoadProgress) -> String {
+    match progress {
+        LoadProgress::Idle => "Idle".to_string(),
+        LoadProgress::ValidatingConfig => "Validating configuration".to_string(),
+        LoadProgress::PreparingProvider => "Preparing execution provider".to_string(),
+        LoadProgress::DownloadingProvider => "Downloading execution provider".to_string(),
+        LoadProgress::BuildingEngine { role } => {
+            format!("Building {} TensorRT engine", role.label())
+        }
+        LoadProgress::LoadingModel { role } => format!("Loading {} model", role.label()),
+        LoadProgress::OpeningAudioDevices => "Opening audio devices".to_string(),
+        LoadProgress::Running => "Running".to_string(),
+        LoadProgress::Failed => "Failed".to_string(),
     }
 }
 
@@ -742,6 +760,7 @@ impl RealtimeSession {
         telemetry: Arc<Telemetry>,
         live: Arc<AtomicLiveParams>,
         passthrough_live: Arc<AtomicBool>,
+        status: &Arc<Mutex<EngineStatusSnapshot>>,
     ) -> Result<Self> {
         // Process-wide GPU scheduling priority (all backends). Applied here on
         // the controller thread, off the audio callback, and re-applied on every
@@ -753,6 +772,7 @@ impl RealtimeSession {
         // thread (ORT intra-op pool, TensorRT CUDA orchestration, worker), which
         // a per-thread override on the worker alone would not.
         set_process_power_throttling(config.gpu_priority == GpuPriority::High);
+        set_status(status, EngineState::Starting, "Opening audio devices");
         let audio = RealtimeAudio::open(
             config.audio_backend,
             config.wasapi_input_exclusive,
@@ -777,7 +797,19 @@ impl RealtimeSession {
         )?;
         let passthrough_live_switchable = config.has_complete_model_set();
         let model = if passthrough_live_switchable {
-            let pipeline_config = config.pipeline_config(input_rate, input_chunk, &current_live);
+            let report_progress = |progress| {
+                set_status(
+                    status,
+                    EngineState::Starting,
+                    load_progress_message(progress),
+                );
+            };
+            let pipeline_config = config.pipeline_config(
+                input_rate,
+                input_chunk,
+                &current_live,
+                Some(&report_progress),
+            );
             let pipeline = match config.denoiser_mode {
                 DenoiserMode::Off | DenoiserMode::NoiseGate => RvcPipeline::load(pipeline_config)?,
                 DenoiserMode::Rnnoise => {
@@ -924,6 +956,7 @@ impl RealtimeSession {
             status: EngineStatusSnapshot {
                 state: EngineState::Running,
                 message: format!("Running ({})", audio.backend_label()),
+                detail: None,
                 input_device: audio.input_name().to_string(),
                 output_device: audio.output_name().to_string(),
                 input_sample_rate: input_rate,

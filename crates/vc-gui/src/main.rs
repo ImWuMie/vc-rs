@@ -396,6 +396,13 @@ impl eframe::App for VcGui {
                 ));
             }
         });
+        if let Some(detail) = &status.detail {
+            egui::CollapsingHeader::new("Error details")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.monospace(detail);
+                });
+        }
         if let Some(error) = &self.ui_error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
         }

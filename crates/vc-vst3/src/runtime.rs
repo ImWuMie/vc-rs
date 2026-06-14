@@ -15,13 +15,28 @@ use nice_plug::prelude::util;
 use rtrb::{Consumer, Producer, RingBuffer};
 use vc_core::dsp::chunk_samples_for_rate;
 use vc_core::model_rvc::{
-    ChunkConverter, ChunkOutputConfig, F0Config, LiveParams, NoiseGateShaping,
+    ChunkConverter, ChunkOutputConfig, F0Config, LiveParams, LoadProgress, NoiseGateShaping,
     OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
 
 use crate::config::PluginConfig;
 use crate::params::VcRvcParams;
+
+#[derive(Clone, Debug)]
+pub(crate) struct PluginStatus {
+    pub summary: String,
+    pub detail: Option<String>,
+}
+
+impl PluginStatus {
+    pub fn new(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+            detail: None,
+        }
+    }
+}
 
 const INPUT_QUEUE_CHUNKS: usize = 4;
 const OUTPUT_QUEUE_CHUNKS: usize = 4;
@@ -65,7 +80,7 @@ impl PluginRuntime {
         params: Arc<VcRvcParams>,
         reload: Arc<AtomicBool>,
         dirty: Arc<AtomicBool>,
-        status: Arc<Mutex<String>>,
+        status: Arc<Mutex<PluginStatus>>,
         sample_rate: u32,
         max_block: usize,
     ) -> Self {
@@ -207,7 +222,7 @@ struct WorkerCtx {
     params: Arc<VcRvcParams>,
     reload: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
-    status: Arc<Mutex<String>>,
+    status: Arc<Mutex<PluginStatus>>,
     sample_rate: u32,
     crossfade_ms: u32,
     sola_search_ms: u32,
@@ -334,8 +349,33 @@ impl WorkerCtx {
 
     fn set_status(&self, text: impl Into<String>) {
         if let Ok(mut status) = self.status.lock() {
-            *status = text.into();
+            *status = PluginStatus::new(text);
         }
+    }
+
+    fn set_error(&self, summary: impl Into<String>, detail: impl Into<String>) {
+        if let Ok(mut status) = self.status.lock() {
+            *status = PluginStatus {
+                summary: summary.into(),
+                detail: Some(detail.into()),
+            };
+        }
+    }
+
+    fn report_load_progress(&self, progress: LoadProgress) {
+        self.set_status(match progress {
+            LoadProgress::Idle => "idle".to_string(),
+            LoadProgress::ValidatingConfig => "validating configuration".to_string(),
+            LoadProgress::PreparingProvider => "preparing execution provider".to_string(),
+            LoadProgress::DownloadingProvider => "downloading execution provider".to_string(),
+            LoadProgress::BuildingEngine { role } => {
+                format!("building {} TensorRT engine", role.label())
+            }
+            LoadProgress::LoadingModel { role } => format!("loading {} model", role.label()),
+            LoadProgress::OpeningAudioDevices => "opening audio devices".to_string(),
+            LoadProgress::Running => "running".to_string(),
+            LoadProgress::Failed => "failed".to_string(),
+        });
     }
 
     fn set_idle_status(&self) {
@@ -409,7 +449,7 @@ impl WorkerCtx {
             }
             Err(err) => {
                 nice_plug::nice_error!("vc-vst3: failed to load RVC pipeline: {err:#}");
-                self.set_status(format!("load failed: {err}"));
+                self.set_error(format!("load failed: {err}"), format!("{err:#}"));
                 (None, kind)
             }
         }
@@ -449,6 +489,7 @@ impl WorkerCtx {
         provider: vc_core::Provider,
         chunk_samples: usize,
     ) -> anyhow::Result<RvcPipeline> {
+        let report_progress = |progress| self.report_load_progress(progress);
         RvcPipeline::load(RvcPipelineConfig {
             model: &settings.model,
             embedder: &settings.embedder,
@@ -491,6 +532,7 @@ impl WorkerCtx {
                 target_output_rms: settings.target_output_rms,
                 max_output_gain: settings.max_output_gain,
             },
+            progress: Some(&report_progress),
         })
     }
 }

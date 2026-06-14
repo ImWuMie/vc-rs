@@ -183,6 +183,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             target_output_rms: args.target_output_rms,
             max_output_gain: args.max_output_gain,
         },
+        progress: None,
     })?;
     let mut converter = ChunkConverter::new(
         model,

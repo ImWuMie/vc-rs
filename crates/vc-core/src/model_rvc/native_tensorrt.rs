@@ -361,6 +361,13 @@ fn native_engine_path(profile: &TensorRtSessionProfile) -> Result<PathBuf> {
         .join("native.engine"))
 }
 
+pub(super) fn native_engine_is_cached(profile: &TensorRtSessionProfile) -> bool {
+    native_engine_path(profile)
+        .ok()
+        .and_then(|path| path.metadata().ok())
+        .is_some_and(|metadata| metadata.len() > 0)
+}
+
 fn ensure_native_engine(
     model_path: &Path,
     profile: &TensorRtSessionProfile,

@@ -17,7 +17,7 @@ use nice_plug_egui::{create_egui_editor, resizable_window::ResizableWindow, widg
 
 use crate::params::VcRvcParams;
 use crate::plugin_identity;
-use crate::runtime::{MAX_CHUNK_MS, MIN_CHUNK_MS};
+use crate::runtime::{PluginStatus, MAX_CHUNK_MS, MIN_CHUNK_MS};
 
 /// Granularity for the millisecond sliders.
 const MS_STEP: u32 = 10;
@@ -53,15 +53,15 @@ pub struct EditorState {
     /// Set when settings are edited, cleared by the worker once it applies them.
     /// Drives the "unapplied changes" indicator.
     pub dirty: Arc<AtomicBool>,
-    /// Human-readable worker status shown in the UI.
-    pub status: Arc<Mutex<String>>,
+    /// Worker status shown in the UI.
+    pub status: Arc<Mutex<PluginStatus>>,
 }
 
 pub fn create(
     params: Arc<VcRvcParams>,
     reload: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
-    status: Arc<Mutex<String>>,
+    status: Arc<Mutex<PluginStatus>>,
 ) -> Option<Box<dyn Editor>> {
     let egui_state = params.editor_state.clone();
     create_egui_editor(
@@ -96,8 +96,19 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     ui.heading(plugin_identity::NAME);
 
     // Status line (updated by the worker thread).
-    let status = state.status.lock().map(|s| s.clone()).unwrap_or_default();
-    ui.label(format!("Status: {status}"));
+    let status = state
+        .status
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_else(|_| PluginStatus::new("status unavailable"));
+    ui.label(format!("Status: {}", status.summary));
+    if let Some(detail) = status.detail {
+        egui::CollapsingHeader::new("Error details")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.monospace(detail);
+            });
+    }
     ui.separator();
 
     // Snapshot current settings for display, releasing the lock immediately.

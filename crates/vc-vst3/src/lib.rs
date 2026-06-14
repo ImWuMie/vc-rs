@@ -19,7 +19,7 @@ mod runtime;
 
 use config::PluginConfig;
 use params::VcRvcParams;
-use runtime::PluginRuntime;
+use runtime::{PluginRuntime, PluginStatus};
 
 pub(crate) mod plugin_identity {
     #[cfg(feature = "tensorrt")]
@@ -58,8 +58,8 @@ pub struct VcRvcPlugin {
     reload: Arc<AtomicBool>,
     /// GUI sets on edit, worker clears on apply: drives the "unapplied" hint.
     dirty: Arc<AtomicBool>,
-    /// worker → GUI: human-readable status.
-    status: Arc<Mutex<String>>,
+    /// worker → GUI: short status plus optional expandable error detail.
+    status: Arc<Mutex<PluginStatus>>,
 }
 
 impl Default for VcRvcPlugin {
@@ -69,7 +69,7 @@ impl Default for VcRvcPlugin {
             runtime: None,
             reload: Arc::new(AtomicBool::new(false)),
             dirty: Arc::new(AtomicBool::new(false)),
-            status: Arc::new(Mutex::new("idle".to_string())),
+            status: Arc::new(Mutex::new(PluginStatus::new("idle"))),
         }
     }
 }

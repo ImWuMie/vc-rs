@@ -11,6 +11,7 @@ use super::api::{ModelOutput, VoiceModel};
 use super::f0_postprocess::{F0PostprocessConfig, F0Postprocessor};
 use super::feature::FeatureTensor;
 use super::inspect::{inspect_contentvec_input_name, inspect_rvc_model};
+use super::native_tensorrt::native_engine_is_cached;
 use super::pitch::{
     align_pitchf_to_features_into, center_crop_pitchf_to_features_into, coarse_pitch_into,
     pitchf_tail_for_output_into, voiced_ratio,
@@ -275,6 +276,60 @@ pub struct RvcPipelineConfig<'a> {
     pub extra_convert_ms: u32,
     pub output_gain: f32,
     pub output_dynamics: OutputDynamicsConfig,
+    /// Optional load-time progress callback. It is invoked only while building
+    /// the pipeline, never from inference or an audio callback.
+    pub progress: Option<&'a dyn Fn(LoadProgress)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoadModelRole {
+    ContentVec,
+    Rmvpe,
+    Rvc,
+}
+
+impl LoadModelRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ContentVec => "ContentVec",
+            Self::Rmvpe => "RMVPE",
+            Self::Rvc => "RVC",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoadProgress {
+    Idle,
+    ValidatingConfig,
+    PreparingProvider,
+    DownloadingProvider,
+    BuildingEngine { role: LoadModelRole },
+    LoadingModel { role: LoadModelRole },
+    OpeningAudioDevices,
+    Running,
+    Failed,
+}
+
+fn report_progress(config: &RvcPipelineConfig<'_>, progress: LoadProgress) {
+    if let Some(report) = config.progress {
+        report(progress);
+    }
+}
+
+fn report_native_load_progress(
+    config: &RvcPipelineConfig<'_>,
+    profile: &TensorRtSessionProfile,
+    role: LoadModelRole,
+) {
+    if let Some(progress) = native_engine_build_progress(native_engine_is_cached(profile), role) {
+        report_progress(config, progress);
+    }
+    report_progress(config, LoadProgress::LoadingModel { role });
+}
+
+fn native_engine_build_progress(cached: bool, role: LoadModelRole) -> Option<LoadProgress> {
+    (!cached).then_some(LoadProgress::BuildingEngine { role })
 }
 
 impl RvcPipeline {
@@ -291,14 +346,22 @@ impl RvcPipeline {
     }
 
     pub fn load(config: RvcPipelineConfig<'_>) -> Result<Self> {
+        report_progress(&config, LoadProgress::ValidatingConfig);
         if provider_needs_fixed_shape_profile(config.provider) {
             return Self::load_fixed_shape(config);
         }
 
+        report_progress(&config, LoadProgress::PreparingProvider);
         // CLI-facing configuration is milliseconds for consistency with other latency knobs.
         // The RVC shape and trimming code below use the fixed 48 kHz model domain, so keep the
         // conversion at load time and leave the per-chunk processing path in samples.
         let extra_convert_samples = extra_convert_samples_from_ms(config.extra_convert_ms);
+        report_progress(
+            &config,
+            LoadProgress::LoadingModel {
+                role: LoadModelRole::Rvc,
+            },
+        );
         let rvc = RvcModelSession::load(
             config.model,
             config.provider,
@@ -308,23 +371,37 @@ impl RvcPipeline {
             TensorRtSessionPurpose::Main,
         )?;
         let expected_feat_channels = rvc.expected_feat_channels;
+        report_progress(
+            &config,
+            LoadProgress::LoadingModel {
+                role: LoadModelRole::ContentVec,
+            },
+        );
+        let embedder = HubertEmbedderSession::load(
+            config.embedder,
+            config.provider,
+            expected_feat_channels,
+            config.embedder_output,
+            None,
+            TensorRtRunMode::PinnedCpu,
+            TensorRtSessionPurpose::Main,
+        )?;
+        report_progress(
+            &config,
+            LoadProgress::LoadingModel {
+                role: LoadModelRole::Rmvpe,
+            },
+        );
+        let pitch = RmvpePitchSession::load(
+            config.f0_model,
+            config.provider,
+            None,
+            TensorRtRunMode::PinnedCpu,
+            TensorRtSessionPurpose::Main,
+        )?;
         Ok(Self {
-            embedder: HubertEmbedderSession::load(
-                config.embedder,
-                config.provider,
-                expected_feat_channels,
-                config.embedder_output,
-                None,
-                TensorRtRunMode::PinnedCpu,
-                TensorRtSessionPurpose::Main,
-            )?,
-            pitch: RmvpePitchSession::load(
-                config.f0_model,
-                config.provider,
-                None,
-                TensorRtRunMode::PinnedCpu,
-                TensorRtSessionPurpose::Main,
-            )?,
+            embedder,
+            pitch,
             rvc,
             #[cfg(feature = "ort")]
             shared_waveform: None,
@@ -362,6 +439,7 @@ impl RvcPipeline {
     }
 
     fn load_fixed_shape(config: RvcPipelineConfig<'_>) -> Result<Self> {
+        report_progress(&config, LoadProgress::PreparingProvider);
         // Windows ML catalog providers may also use fixed-shape profiles, but
         // their adapter selection is owned by Windows ML. Only explicit CUDA
         // backends consume the user-selected CUDA device ID.
@@ -445,6 +523,12 @@ impl RvcPipeline {
             }
             #[cfg(feature = "ort")]
             {
+                report_progress(
+                    &config,
+                    LoadProgress::LoadingModel {
+                        role: LoadModelRole::ContentVec,
+                    },
+                );
                 let mut embedder_probe = HubertEmbedderSession::load(
                     config.embedder,
                     config.provider,
@@ -476,6 +560,12 @@ impl RvcPipeline {
                 rvc_profile.profile_shapes
             );
 
+                report_progress(
+                    &config,
+                    LoadProgress::LoadingModel {
+                        role: LoadModelRole::Rmvpe,
+                    },
+                );
                 let mut pitch_probe = RmvpePitchSession::load(
                     config.f0_model,
                     config.provider,
@@ -487,6 +577,12 @@ impl RvcPipeline {
                     pitch_probe.warmup_output_shape(input_samples_16k, config.f0.f0_threshold)?;
                 drop(pitch_probe);
 
+                report_progress(
+                    &config,
+                    LoadProgress::LoadingModel {
+                        role: LoadModelRole::Rvc,
+                    },
+                );
                 let mut rvc_probe = RvcModelSession::load(
                     config.model,
                     config.provider,
@@ -557,6 +653,7 @@ impl RvcPipeline {
             // (native_tensorrt.rs has no in-process Builder), so the historical
             // "build RVC before other TensorRT runtimes in the same process"
             // ordering no longer applies and ContentVec can load first.
+            report_native_load_progress(&config, &contentvec_profile, LoadModelRole::ContentVec);
             let embedder = HubertEmbedderSession::load(
                 config.embedder,
                 config.provider,
@@ -589,6 +686,7 @@ impl RvcPipeline {
                 rmvpe_profile.profile_shapes,
                 rvc_profile.profile_shapes
             );
+            report_native_load_progress(&config, &rvc_profile, LoadModelRole::Rvc);
             let mut rvc = RvcModelSession::load(
                 config.model,
                 config.provider,
@@ -606,6 +704,7 @@ impl RvcPipeline {
                 config.speaker_id,
             )?;
 
+            report_native_load_progress(&config, &rmvpe_profile, LoadModelRole::Rmvpe);
             let mut pitch = RmvpePitchSession::load(
                 config.f0_model,
                 config.provider,
@@ -626,6 +725,12 @@ impl RvcPipeline {
             }
             #[cfg(feature = "ort")]
             {
+                report_progress(
+                    &config,
+                    LoadProgress::LoadingModel {
+                        role: LoadModelRole::ContentVec,
+                    },
+                );
                 let mut embedder = HubertEmbedderSession::load(
                     config.embedder,
                     config.provider,
@@ -673,6 +778,12 @@ impl RvcPipeline {
                 rvc_profile.profile_shapes
             );
 
+                report_progress(
+                    &config,
+                    LoadProgress::LoadingModel {
+                        role: LoadModelRole::Rmvpe,
+                    },
+                );
                 let mut pitch = RmvpePitchSession::load(
                     config.f0_model,
                     config.provider,
@@ -688,6 +799,12 @@ impl RvcPipeline {
                     shared_waveform.as_ref(),
                 )?;
 
+                report_progress(
+                    &config,
+                    LoadProgress::LoadingModel {
+                        role: LoadModelRole::Rvc,
+                    },
+                );
                 let mut rvc = RvcModelSession::load(
                     config.model,
                     config.provider,
@@ -1185,5 +1302,21 @@ impl std::fmt::Debug for RvcPipeline {
             .field("target_output_rms", &self.target_output_rms)
             .field("max_output_gain", &self.max_output_gain)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn native_engine_build_progress_is_only_reported_for_cache_miss() {
+        assert_eq!(native_engine_build_progress(true, LoadModelRole::Rvc), None);
+        assert_eq!(
+            native_engine_build_progress(false, LoadModelRole::Rvc),
+            Some(LoadProgress::BuildingEngine {
+                role: LoadModelRole::Rvc
+            })
+        );
     }
 }
