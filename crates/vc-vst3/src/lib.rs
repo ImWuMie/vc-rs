@@ -19,7 +19,7 @@ mod runtime;
 
 use config::PluginConfig;
 use params::VcRvcParams;
-use runtime::{PluginRuntime, PluginStatus};
+use runtime::{PluginRuntime, PluginStatus, ReloadWaker};
 
 pub(crate) mod plugin_identity {
     #[cfg(feature = "tensorrt")]
@@ -62,6 +62,9 @@ pub struct VcRvcPlugin {
     dirty: Arc<AtomicBool>,
     /// worker → GUI: short status plus optional expandable error detail.
     status: Arc<Mutex<PluginStatus>>,
+    /// Editor → worker: wakes the parked worker when a reload is submitted, so a
+    /// Load / Reload applies immediately even while the host is idle.
+    reload_waker: Arc<ReloadWaker>,
 }
 
 impl Default for VcRvcPlugin {
@@ -73,6 +76,7 @@ impl Default for VcRvcPlugin {
             loading: Arc::new(AtomicBool::new(false)),
             dirty: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(PluginStatus::new("idle"))),
+            reload_waker: Arc::new(ReloadWaker::default()),
         }
     }
 }
@@ -119,6 +123,7 @@ impl Plugin for VcRvcPlugin {
             self.loading.clone(),
             self.dirty.clone(),
             self.status.clone(),
+            self.reload_waker.clone(),
         )
     }
 
@@ -154,6 +159,7 @@ impl Plugin for VcRvcPlugin {
             self.loading.clone(),
             self.dirty.clone(),
             self.status.clone(),
+            &self.reload_waker,
             sample_rate,
             max_block,
         );

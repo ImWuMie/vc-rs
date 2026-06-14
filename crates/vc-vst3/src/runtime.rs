@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
 
 use nice_plug::prelude::util;
@@ -47,8 +47,44 @@ const OUTPUT_QUEUE_CHUNKS: usize = 4;
 pub const MIN_CHUNK_MS: u32 = 50;
 pub const MAX_CHUNK_MS: u32 = 1000;
 
+/// Lets the editor's Load / Reload submit (a non-realtime UI thread) wake the
+/// current worker even while the host is idle and not calling `process()`, so a
+/// reload starts immediately instead of waiting for the worker's park timeout.
+///
+/// The worker handle is republished on every `PluginRuntime::start`, so this
+/// stays correct across `initialize()`-driven worker restarts (sample-rate or
+/// block-size changes). The realtime `process()` path deliberately does NOT use
+/// this — it unparks through the [`Thread`] stored directly in [`PluginRuntime`]
+/// so the audio callback never takes a lock. The editor and worker registration
+/// are both off the audio thread, so the `Mutex` here is fine.
+#[derive(Default)]
+pub(crate) struct ReloadWaker {
+    thread: Mutex<Option<Thread>>,
+}
+
+impl ReloadWaker {
+    fn register(&self, thread: Thread) {
+        if let Ok(mut slot) = self.thread.lock() {
+            *slot = Some(thread);
+        }
+    }
+
+    /// Unpark the current worker, if any. Called after the editor sets `reload`.
+    pub(crate) fn wake(&self) {
+        if let Ok(slot) = self.thread.lock() {
+            if let Some(thread) = slot.as_ref() {
+                thread.unpark();
+            }
+        }
+    }
+}
+
 /// Owns the worker thread and the audio-thread ends of the ring buffers.
 pub struct PluginRuntime {
+    /// Worker `Thread` handle for the realtime wake path (input queued in
+    /// `process_block`, and Drop). Stored directly so the audio callback unparks
+    /// without a lock; refreshed whenever the worker is (re)spawned.
+    worker_thread: Thread,
     input_producer: Producer<f32>,
     output_consumer: Consumer<f32>,
     running: Arc<AtomicBool>,
@@ -72,12 +108,18 @@ impl PluginRuntime {
     /// settings present at init. `chunk_ms` can change live: the rings are sized
     /// for `MAX_CHUNK_MS` so the worker can adopt a new chunk size on reload, and
     /// the reported latency is updated from the audio thread afterwards.
+    // The worker is wired up from a handful of independent shared handles
+    // (editor/worker handshake flags, status, reload waker) plus the audio
+    // format; bundling them into a struct would only move the same fields behind
+    // an extra type without making the lifecycle clearer.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         params: Arc<VcRvcParams>,
         reload: Arc<AtomicBool>,
         loading: Arc<AtomicBool>,
         dirty: Arc<AtomicBool>,
         status: Arc<Mutex<PluginStatus>>,
+        reload_waker: &Arc<ReloadWaker>,
         sample_rate: u32,
         max_block: usize,
     ) -> Self {
@@ -131,7 +173,14 @@ impl PluginRuntime {
         }
         .spawn();
 
+        // Publish the worker handle for both wake paths: the realtime path keeps
+        // its own clone, while the editor's reload submit goes through the shared
+        // ReloadWaker (re-registered here so it tracks worker restarts).
+        let worker_thread = worker.thread().clone();
+        reload_waker.register(worker_thread.clone());
+
         Self {
+            worker_thread,
             input_producer,
             output_consumer,
             running,
@@ -179,7 +228,13 @@ impl PluginRuntime {
         }
 
         // Queue input; drop on overflow (worker is behind, audio keeps flowing).
-        let _ = self.input_producer.push_partial_slice(&self.mono_in);
+        let (pushed, _) = self.input_producer.push_partial_slice(&self.mono_in);
+        if !pushed.is_empty() {
+            // Wake the worker now that input is queued instead of letting it find
+            // the data on a fixed poll. unpark is wait-free (token store, or one
+            // OS wakeup when actually parked), so it is safe on the audio thread.
+            self.worker_thread.unpark();
+        }
 
         // Pull up to n converted samples; pad the remainder with silence.
         if self.mono_out.len() < n {
@@ -210,6 +265,10 @@ impl PluginRuntime {
 impl Drop for PluginRuntime {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // Wake a parked worker so it observes the cleared running flag and exits.
+        // The host may unload us while idle (no process() wakes arriving), so the
+        // join below would otherwise block until the worker's park timeout.
+        self.worker_thread.unpark();
         let Some(handle) = self.worker.take() else {
             self.loading.store(false, Ordering::SeqCst);
             return;
@@ -310,7 +369,17 @@ impl WorkerCtx {
                 }
             }
             if input_acc.len() < chunk_samples {
-                thread::sleep(Duration::from_millis(2));
+                // Re-check the stop flag before parking so a stop requested
+                // between the loop head and here exits without waiting.
+                if !self.running.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Wait for an unpark — input queued in process_block, a reload
+                // submitted from the editor, or Drop — or the safety timeout.
+                // Replaces the fixed 2 ms poll: a reload submitted while the host
+                // is idle starts immediately, and there is no idle spin when the
+                // host stops calling process().
+                thread::park_timeout(Duration::from_millis(100));
                 continue;
             }
 

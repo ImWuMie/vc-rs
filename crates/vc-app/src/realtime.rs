@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -740,8 +740,66 @@ impl RuntimeModel {
     }
 }
 
+/// Minimal worker-wakeup channel: the audio input callback calls [`wake`] after
+/// queuing samples so the inference worker can `park`/`unpark` instead of
+/// polling on a fixed sleep. `OnceLock` defers capturing the worker `Thread`
+/// until the worker spawns and registers itself, preserving the
+/// build-streams-then-spawn-then-play startup order (a stream-build failure must
+/// not have started the worker). A fresh `WorkerWake` is created per session, so
+/// the one-shot registration is never reused across worker restarts.
+///
+/// [`wake`]: WorkerWake::wake
+#[derive(Default)]
+struct WorkerWake {
+    thread: OnceLock<Thread>,
+}
+
+impl WorkerWake {
+    /// Called once by the worker on spawn. First registration wins; the worker
+    /// is the only registrant.
+    fn register_current(&self) {
+        let _ = self.thread.set(thread::current());
+    }
+
+    /// Unpark the worker if it has registered. Wait-free: `unpark` only stores a
+    /// token (or performs one OS wakeup when the worker is actually parked), so
+    /// it is safe to call from the realtime audio callback.
+    fn wake(&self) {
+        if let Some(thread) = self.thread.get() {
+            thread.unpark();
+        }
+    }
+}
+
+/// Pull from the input ring into `input_acc` until it holds one inference chunk
+/// or the ring is drained, returning whether a full chunk is ready.
+///
+/// Kept free of model/telemetry/IO so the accumulation logic is unit testable
+/// and the frame-grid/alignment-sensitive work stays in the worker. Only the
+/// chunk-sized deficit is read, so a callback block larger than `input_chunk`
+/// leaves its remainder in the ring for the next chunk, and sub-chunk blocks
+/// coalesce across calls.
+fn accumulate_input_chunk(
+    consumer: &mut rtrb::Consumer<f32>,
+    input_acc: &mut Vec<f32>,
+    input_chunk: usize,
+) -> bool {
+    let available = consumer
+        .slots()
+        .min(input_chunk.saturating_sub(input_acc.len()));
+    if available > 0 {
+        let old = input_acc.len();
+        input_acc.resize(old + available, 0.0);
+        if consumer.pop_entire_slice(&mut input_acc[old..]).is_err() {
+            input_acc.truncate(old);
+        }
+    }
+    input_acc.len() >= input_chunk
+}
+
 struct RealtimeSession {
     running: Arc<AtomicBool>,
+    wake: Arc<WorkerWake>,
     worker: Option<JoinHandle<()>>,
     input_stream: Option<AudioStream>,
     output_stream: Option<AudioStream>,
@@ -844,6 +902,7 @@ impl RealtimeSession {
 
         let output_capacity = output_chunk * OUTPUT_QUEUE_CHUNKS;
         let running = Arc::new(AtomicBool::new(true));
+        let wake = Arc::new(WorkerWake::default());
         // Build the device streams before spawning the inference worker: a
         // stream failure then returns without ever starting (and stopping) the
         // worker and its model/CUDA context. The streams stay paused until
@@ -853,9 +912,11 @@ impl RealtimeSession {
             input_chunk * INPUT_QUEUE_CHUNKS,
             output_capacity,
             &running,
+            &wake,
             &telemetry,
         )?;
         let worker_running = Arc::clone(&running);
+        let worker_wake = Arc::clone(&wake);
         let worker_telemetry = Arc::clone(&telemetry);
         let worker_debug_input = Arc::clone(&debug_input);
         let worker_debug_output = Arc::clone(&debug_output);
@@ -865,6 +926,12 @@ impl RealtimeSession {
             thread::Builder::new()
                 .name("vc-app-inference".to_string())
                 .spawn(move || {
+                    // Register before the first park so the input callback's
+                    // wake() can reach this thread. A wake() that races ahead of
+                    // registration is recovered by the self-wake below plus the
+                    // park timeout; the ring is the source of truth either way.
+                    worker_wake.register_current();
+                    worker_wake.wake();
                     if let Err(err) = set_current_thread_priority(ThreadPriority::Max) {
                         tracing::warn!("failed to set inference worker thread priority: {err}");
                     }
@@ -872,21 +939,19 @@ impl RealtimeSession {
                     let mut input_acc = Vec::<f32>::with_capacity(input_chunk * 2);
                     let mut prepared = Vec::<f32>::with_capacity(output_chunk * 2);
                     while worker_running.load(Ordering::SeqCst) {
-                        let available = input_consumer
-                            .slots()
-                            .min(input_chunk.saturating_sub(input_acc.len()));
-                        if available > 0 {
-                            let old = input_acc.len();
-                            input_acc.resize(old + available, 0.0);
-                            if input_consumer
-                                .pop_entire_slice(&mut input_acc[old..])
-                                .is_err()
-                            {
-                                input_acc.truncate(old);
+                        if !accumulate_input_chunk(&mut input_consumer, &mut input_acc, input_chunk)
+                        {
+                            // Re-check the stop flag before parking so a stop
+                            // requested between the loop head and here exits
+                            // without waiting for the timeout or a final wake().
+                            if !worker_running.load(Ordering::SeqCst) {
+                                break;
                             }
-                        }
-                        if input_acc.len() < input_chunk {
-                            thread::sleep(Duration::from_millis(2));
+                            // Wait for the input callback's wake() (sent after it
+                            // queues samples) or the safety timeout. Replaces the
+                            // fixed 2 ms poll: no wasted tail latency when input
+                            // arrives, no idle spin when the input stream stops.
+                            thread::park_timeout(Duration::from_millis(100));
                             continue;
                         }
                         if capture_input {
@@ -944,12 +1009,13 @@ impl RealtimeSession {
         if let Err(err) = output_stream.play().and_then(|_| input_stream.play()) {
             drop(input_stream);
             drop(output_stream);
-            stop_startup_worker(&running, &mut worker);
+            stop_startup_worker(&running, &wake, &mut worker);
             return Err(err);
         }
 
         Ok(Self {
             running,
+            wake,
             worker: worker.take(),
             input_stream: Some(input_stream),
             output_stream: Some(output_stream),
@@ -980,6 +1046,9 @@ impl RealtimeSession {
 impl Drop for RealtimeSession {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // Wake a parked worker so it observes the cleared running flag and exits
+        // even when the input stream has already stopped delivering wake()s.
+        self.wake.wake();
         drop(self.input_stream.take());
         drop(self.output_stream.take());
         if let Some(worker) = self.worker.take() {
@@ -1018,17 +1087,26 @@ fn build_streams(
     input_capacity: usize,
     output_capacity: usize,
     running: &Arc<AtomicBool>,
+    wake: &Arc<WorkerWake>,
     telemetry: &Arc<Telemetry>,
 ) -> Result<StreamEndpoints> {
     let (mut input_producer, input_consumer) = RingBuffer::<f32>::new(input_capacity);
     let (output_producer, mut output_consumer) = RingBuffer::<f32>::new(output_capacity);
     let input_running = Arc::clone(running);
+    let input_wake = Arc::clone(wake);
     let input_telemetry = Arc::clone(telemetry);
     let input_stream = audio.build_input_stream(move |samples| {
         if !input_running.load(Ordering::Relaxed) {
             return;
         }
-        let (_, remainder) = input_producer.push_partial_slice(samples);
+        let (pushed, remainder) = input_producer.push_partial_slice(samples);
+        if !pushed.is_empty() {
+            // Notify the worker that input is queued instead of letting it find
+            // the data on a fixed poll. Only the input callback wakes the worker;
+            // the output callback (consuming the output ring) is not a reason to
+            // run inference.
+            input_wake.wake();
+        }
         if !remainder.is_empty() {
             input_telemetry
                 .input_overruns
@@ -1056,11 +1134,17 @@ fn build_streams(
     Ok((input_stream, output_stream, input_consumer, output_producer))
 }
 
-fn stop_startup_worker(running: &AtomicBool, worker: &mut Option<JoinHandle<()>>) {
+fn stop_startup_worker(
+    running: &AtomicBool,
+    wake: &WorkerWake,
+    worker: &mut Option<JoinHandle<()>>,
+) {
     // Stream playback can still fail after the inference worker starts. Always
     // stop and join it before returning so failed Apply attempts cannot leave a
-    // model/CUDA context alive behind the next session.
+    // model/CUDA context alive behind the next session. Wake it first: with no
+    // playing input stream it may already be parked waiting for input.
     running.store(false, Ordering::SeqCst);
+    wake.wake();
     if let Some(worker) = worker.take() {
         let _ = worker.join();
     }
@@ -1220,5 +1304,80 @@ mod tests {
         assert!(should_queue_silent_output(0, 1_000));
         assert!(should_queue_silent_output(1_000, 1_000));
         assert!(!should_queue_silent_output(1_001, 1_000));
+    }
+
+    #[test]
+    fn worker_wake_token_persists_when_unpark_precedes_park() {
+        // A wake() that lands before the worker parks must not be lost: the next
+        // park returns immediately on the stored token.
+        let wake = WorkerWake::default();
+        wake.register_current();
+        wake.wake();
+        let start = std::time::Instant::now();
+        thread::park_timeout(Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn accumulate_input_chunk_coalesces_subchunk_blocks() {
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(16);
+        let mut acc = Vec::new();
+        let _ = producer.push_partial_slice(&[1.0, 2.0]);
+        assert!(!accumulate_input_chunk(&mut consumer, &mut acc, 4));
+        assert_eq!(acc, vec![1.0, 2.0]);
+        let _ = producer.push_partial_slice(&[3.0, 4.0]);
+        assert!(accumulate_input_chunk(&mut consumer, &mut acc, 4));
+        assert_eq!(acc, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn accumulate_input_chunk_carries_oversized_block_remainder() {
+        // A callback block larger than one chunk must not lose its tail: only the
+        // chunk-sized deficit is read, the rest stays in the ring for next time.
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(16);
+        let mut acc = Vec::new();
+        let _ = producer.push_partial_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(accumulate_input_chunk(&mut consumer, &mut acc, 4));
+        assert_eq!(acc, vec![1.0, 2.0, 3.0, 4.0]);
+        acc.clear();
+        assert!(!accumulate_input_chunk(&mut consumer, &mut acc, 4));
+        assert_eq!(acc, vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn accumulate_input_chunk_processes_backlog_without_waiting() {
+        // Two chunks queued at once must both complete on back-to-back calls so
+        // the worker drains a backlog instead of parking between chunks.
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(16);
+        let mut acc = Vec::new();
+        let _ = producer.push_partial_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert!(accumulate_input_chunk(&mut consumer, &mut acc, 4));
+        acc.clear();
+        assert!(accumulate_input_chunk(&mut consumer, &mut acc, 4));
+        assert_eq!(acc, vec![5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn stop_wakes_a_parked_worker_within_bounded_time() {
+        // With no input arriving, a stop request must still terminate the worker:
+        // running=false + wake() releases the park.
+        let running = Arc::new(AtomicBool::new(true));
+        let wake = Arc::new(WorkerWake::default());
+        let worker_running = Arc::clone(&running);
+        let worker_wake = Arc::clone(&wake);
+        let mut worker = Some(thread::spawn(move || {
+            worker_wake.register_current();
+            worker_wake.wake();
+            while worker_running.load(Ordering::SeqCst) {
+                // No ring here: emulate the "no full chunk" branch directly.
+                if !worker_running.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::park_timeout(Duration::from_secs(5));
+            }
+        }));
+        let start = std::time::Instant::now();
+        stop_startup_worker(&running, &wake, &mut worker);
+        assert!(start.elapsed() < Duration::from_secs(4));
     }
 }

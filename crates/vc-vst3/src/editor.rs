@@ -18,7 +18,7 @@ use vc_core::gpu::{list_cuda_devices, GpuDevice};
 
 use crate::params::VcRvcParams;
 use crate::plugin_identity;
-use crate::runtime::{PluginStatus, MAX_CHUNK_MS, MIN_CHUNK_MS};
+use crate::runtime::{PluginStatus, ReloadWaker, MAX_CHUNK_MS, MIN_CHUNK_MS};
 
 /// Granularity for the millisecond sliders.
 const MS_STEP: u32 = 10;
@@ -60,6 +60,9 @@ pub struct EditorState {
     pub dirty: Arc<AtomicBool>,
     /// Worker status shown in the UI.
     pub status: Arc<Mutex<PluginStatus>>,
+    /// Wakes the worker the instant a reload is submitted, so Load / Reload
+    /// applies even when the host is idle and not calling `process()`.
+    pub reload_waker: Arc<ReloadWaker>,
     /// Populated only after the editor opens. CUDA discovery must never run
     /// during plugin scan, project restore, or from the audio callback.
     gpu_devices: Arc<Mutex<GpuDeviceDiscovery>>,
@@ -78,6 +81,7 @@ pub fn create(
     loading: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
     status: Arc<Mutex<PluginStatus>>,
+    reload_waker: Arc<ReloadWaker>,
 ) -> Option<Box<dyn Editor>> {
     let egui_state = params.editor_state.clone();
     let (gpu_devices, gpu_discovery_thread) = spawn_gpu_device_discovery();
@@ -89,6 +93,7 @@ pub fn create(
             loading,
             dirty,
             status,
+            reload_waker,
             gpu_devices,
             gpu_discovery_thread,
         },
@@ -196,6 +201,9 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
                 .is_ok()
         {
             state.reload.store(true, Ordering::SeqCst);
+            // Wake the worker so it picks up the request immediately, even if the
+            // host is idle and not driving process() (no input wakes arriving).
+            state.reload_waker.wake();
         }
         if state.dirty.load(Ordering::Relaxed) {
             ui.colored_label(
