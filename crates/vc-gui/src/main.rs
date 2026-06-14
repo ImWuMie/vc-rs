@@ -22,6 +22,7 @@ const GUI_SOLA_SEARCH_MS: u32 = 12;
 const RMS_HEALTHY_MIN: f32 = 0.01;
 const RMS_HEALTHY_MAX: f32 = 0.10;
 const RMS_HIGH_MAX: f32 = 0.25;
+const GPU_DEVICE_SELECTOR_AVAILABLE: bool = cfg!(any(feature = "cuda", feature = "tensorrt"));
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
@@ -495,7 +496,7 @@ impl eframe::App for VcGui {
                             .changed();
                     }
                 });
-            if matches!(self.settings.provider.as_str(), "cuda" | "tensorrt") {
+            if gpu_device_selector_visible(&self.settings.provider) {
                 ensure_gpu_device_discovery(&self.gpu_devices);
                 changed |=
                     gpu_device_control(ui, &mut self.settings.gpu_device_id, &self.gpu_devices);
@@ -631,6 +632,10 @@ impl eframe::App for VcGui {
         });
         ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
+}
+
+fn gpu_device_selector_visible(provider: &str) -> bool {
+    GPU_DEVICE_SELECTOR_AVAILABLE && matches!(provider, "cuda" | "tensorrt")
 }
 
 fn ensure_gpu_device_discovery(discovery: &Arc<Mutex<GpuDeviceDiscovery>>) {
@@ -970,6 +975,12 @@ mod tests {
         }];
         assert_eq!(gpu_device_label(0, &devices), "0: NVIDIA Test GPU");
         assert_eq!(gpu_device_label(7, &devices), "Unavailable: device 7");
+    }
+
+    #[test]
+    fn gpu_device_selector_is_hidden_for_windows_ml_providers() {
+        assert!(!gpu_device_selector_visible("windowsml"));
+        assert!(!gpu_device_selector_visible("windowsml-directml"));
     }
 
     #[test]

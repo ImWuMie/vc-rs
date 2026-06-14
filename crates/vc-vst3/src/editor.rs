@@ -24,6 +24,7 @@ use crate::runtime::{PluginStatus, MAX_CHUNK_MS, MIN_CHUNK_MS};
 const MS_STEP: u32 = 10;
 const MIN_EXTRA_CONVERT_MS: u32 = 0;
 const MAX_EXTRA_CONVERT_MS: u32 = 3000;
+const GPU_DEVICE_SELECTOR_AVAILABLE: bool = cfg!(any(feature = "cuda", feature = "tensorrt"));
 
 /// Backend choices offered in the GUI, scoped to the providers this package was
 /// actually built with (see `config::PluginConfig::provider`). The variants are
@@ -173,7 +174,7 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
                     }
                 }
             });
-        if matches!(provider.as_str(), "cuda" | "tensorrt") {
+        if gpu_device_selector_visible(&provider) {
             let mut selected_gpu_device_id = gpu_device_id;
             if gpu_device_control(ui, &mut selected_gpu_device_id, &state.gpu_devices) {
                 state.params.settings.write().unwrap().gpu_device_id = selected_gpu_device_id;
@@ -376,6 +377,9 @@ fn spawn_gpu_device_discovery() -> (
     Option<std::thread::JoinHandle<()>>,
 ) {
     let discovery = Arc::new(Mutex::new(GpuDeviceDiscovery::default()));
+    if !GPU_DEVICE_SELECTOR_AVAILABLE {
+        return (discovery, None);
+    }
     let result = Arc::clone(&discovery);
     let thread = match std::thread::Builder::new()
         .name("vc-vst3-gpu-discovery".to_string())
@@ -403,6 +407,10 @@ fn spawn_gpu_device_discovery() -> (
         }
     };
     (discovery, thread)
+}
+
+fn gpu_device_selector_visible(provider: &str) -> bool {
+    GPU_DEVICE_SELECTOR_AVAILABLE && matches!(provider, "cuda" | "tensorrt")
 }
 
 fn gpu_device_control(
@@ -471,5 +479,11 @@ mod tests {
         }];
         assert_eq!(gpu_device_label(0, &devices), "0: NVIDIA Test GPU");
         assert_eq!(gpu_device_label(7, &devices), "Unavailable: device 7");
+    }
+
+    #[test]
+    fn gpu_device_selector_is_hidden_for_windows_ml_providers() {
+        assert!(!gpu_device_selector_visible("windowsml"));
+        assert!(!gpu_device_selector_visible("windowsml-directml"));
     }
 }
