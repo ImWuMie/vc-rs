@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -12,6 +12,7 @@ use vc_app::{
     AudioBackend, DenoiserMode, EngineController, EngineState, F0Config, LiveParams,
     NoiseGateShaping, OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot,
 };
+use vc_core::gpu::{list_cuda_devices, GpuDevice};
 use vc_core::Provider;
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -301,6 +302,14 @@ struct VcGui {
     telemetry: TelemetrySnapshot,
     telemetry_updated_at: Instant,
     applied_chunk_ms: Option<u32>,
+    gpu_devices: Arc<Mutex<GpuDeviceDiscovery>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GpuDeviceDiscovery {
+    started: bool,
+    devices: Option<Vec<GpuDevice>>,
+    error: Option<String>,
 }
 
 impl VcGui {
@@ -317,6 +326,7 @@ impl VcGui {
             telemetry: TelemetrySnapshot::default(),
             telemetry_updated_at: Instant::now() - TELEMETRY_REFRESH,
             applied_chunk_ms: None,
+            gpu_devices: Arc::new(Mutex::new(GpuDeviceDiscovery::default())),
         }
     }
 
@@ -485,14 +495,11 @@ impl eframe::App for VcGui {
                             .changed();
                     }
                 });
-            changed |= ui
-                .add_enabled(
-                    matches!(self.settings.provider.as_str(), "cuda" | "tensorrt"),
-                    egui::DragValue::new(&mut self.settings.gpu_device_id)
-                        .prefix("GPU Device ID: ")
-                        .range(0..=i32::MAX as u32),
-                )
-                .changed();
+            if matches!(self.settings.provider.as_str(), "cuda" | "tensorrt") {
+                ensure_gpu_device_discovery(&self.gpu_devices);
+                changed |=
+                    gpu_device_control(ui, &mut self.settings.gpu_device_id, &self.gpu_devices);
+            }
 
             ui.separator();
             ui.heading("Audio");
@@ -624,6 +631,93 @@ impl eframe::App for VcGui {
         });
         ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
+}
+
+fn ensure_gpu_device_discovery(discovery: &Arc<Mutex<GpuDeviceDiscovery>>) {
+    if let Ok(mut current) = discovery.lock() {
+        if current.started {
+            return;
+        }
+        current.started = true;
+    } else {
+        return;
+    }
+
+    let result = Arc::clone(discovery);
+    if let Err(error) = std::thread::Builder::new()
+        .name("vc-gui-gpu-discovery".to_string())
+        .spawn(move || {
+            let update = match list_cuda_devices() {
+                Ok(devices) => GpuDeviceDiscovery {
+                    started: true,
+                    devices: Some(devices),
+                    error: None,
+                },
+                Err(error) => GpuDeviceDiscovery {
+                    started: true,
+                    devices: None,
+                    error: Some(format!("{error:#}")),
+                },
+            };
+            if let Ok(mut current) = result.lock() {
+                *current = update;
+            }
+        })
+    {
+        if let Ok(mut current) = discovery.lock() {
+            current.error = Some(format!("failed to spawn GPU discovery thread: {error}"));
+        }
+    }
+}
+
+fn gpu_device_control(
+    ui: &mut egui::Ui,
+    selected_id: &mut u32,
+    discovery: &Mutex<GpuDeviceDiscovery>,
+) -> bool {
+    let discovery = discovery
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or_default();
+    if let Some(devices) = discovery.devices {
+        let selected_text = gpu_device_label(*selected_id, &devices);
+        let mut changed = false;
+        egui::ComboBox::from_label("GPU Device")
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for device in devices {
+                    changed |= ui
+                        .selectable_value(
+                            selected_id,
+                            device.id,
+                            format!("{}: {}", device.id, device.display_name),
+                        )
+                        .changed();
+                }
+            });
+        changed
+    } else if let Some(error) = discovery.error {
+        let changed = ui
+            .add(
+                egui::DragValue::new(selected_id)
+                    .prefix("GPU Device ID: ")
+                    .range(0..=i32::MAX as u32),
+            )
+            .changed();
+        ui.small(format!("GPU enumeration failed: {error}"));
+        changed
+    } else {
+        ui.label("Detecting CUDA devices...");
+        false
+    }
+}
+
+fn gpu_device_label(selected_id: u32, devices: &[GpuDevice]) -> String {
+    devices
+        .iter()
+        .find(|device| device.id == selected_id)
+        .map(|device| format!("{}: {}", device.id, device.display_name))
+        .unwrap_or_else(|| format!("Unavailable: device {selected_id}"))
 }
 
 enum ModelKind {
@@ -866,6 +960,16 @@ mod tests {
         };
         settings.normalize_gui_managed_settings();
         assert_eq!(settings.gpu_priority, "high");
+    }
+
+    #[test]
+    fn gpu_device_label_preserves_unknown_saved_id() {
+        let devices = vec![GpuDevice {
+            id: 0,
+            display_name: "NVIDIA Test GPU".to_string(),
+        }];
+        assert_eq!(gpu_device_label(0, &devices), "0: NVIDIA Test GPU");
+        assert_eq!(gpu_device_label(7, &devices), "Unavailable: device 7");
     }
 
     #[test]

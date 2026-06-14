@@ -3872,6 +3872,7 @@ dependencies = [
  "cc",
  "clap",
  "divan",
+ "libloading 0.8.9",
  "nnnoiseless",
  "ort",
  "rubato",

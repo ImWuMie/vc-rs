@@ -17,6 +17,7 @@ mod provider;
 pub mod windows_ml;
 
 pub mod dsp;
+pub mod gpu;
 pub mod model_rvc;
 #[cfg(feature = "rnnoise")]
 pub mod rnnoise;

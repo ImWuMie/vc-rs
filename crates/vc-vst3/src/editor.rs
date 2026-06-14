@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use egui::{self, Vec2};
 use nice_plug::prelude::{Editor, ParamSetter};
 use nice_plug_egui::{create_egui_editor, resizable_window::ResizableWindow, widgets};
+use vc_core::gpu::{list_cuda_devices, GpuDevice};
 
 use crate::params::VcRvcParams;
 use crate::plugin_identity;
@@ -55,6 +56,16 @@ pub struct EditorState {
     pub dirty: Arc<AtomicBool>,
     /// Worker status shown in the UI.
     pub status: Arc<Mutex<PluginStatus>>,
+    /// Populated only after the editor opens. CUDA discovery must never run
+    /// during plugin scan, project restore, or from the audio callback.
+    gpu_devices: Arc<Mutex<GpuDeviceDiscovery>>,
+    gpu_discovery_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GpuDeviceDiscovery {
+    devices: Option<Vec<GpuDevice>>,
+    error: Option<String>,
 }
 
 pub fn create(
@@ -64,6 +75,7 @@ pub fn create(
     status: Arc<Mutex<PluginStatus>>,
 ) -> Option<Box<dyn Editor>> {
     let egui_state = params.editor_state.clone();
+    let (gpu_devices, gpu_discovery_thread) = spawn_gpu_device_discovery();
     create_egui_editor(
         egui_state,
         EditorState {
@@ -71,11 +83,21 @@ pub fn create(
             reload,
             dirty,
             status,
+            gpu_devices,
+            gpu_discovery_thread,
         },
         Default::default(),
         |_, _, _| {},
         |ui, setter, _queue, state| draw(ui, setter, state),
     )
+}
+
+impl Drop for EditorState {
+    fn drop(&mut self) {
+        if let Some(thread) = self.gpu_discovery_thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 fn draw(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorState) {
@@ -151,18 +173,12 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
                     }
                 }
             });
-        let mut selected_gpu_device_id = gpu_device_id;
-        if ui
-            .add_enabled(
-                matches!(provider.as_str(), "cuda" | "tensorrt"),
-                egui::DragValue::new(&mut selected_gpu_device_id)
-                    .prefix("GPU Device ID: ")
-                    .range(0..=i32::MAX as u32),
-            )
-            .changed()
-        {
-            state.params.settings.write().unwrap().gpu_device_id = selected_gpu_device_id;
-            mark_dirty(state);
+        if matches!(provider.as_str(), "cuda" | "tensorrt") {
+            let mut selected_gpu_device_id = gpu_device_id;
+            if gpu_device_control(ui, &mut selected_gpu_device_id, &state.gpu_devices) {
+                state.params.settings.write().unwrap().gpu_device_id = selected_gpu_device_id;
+                mark_dirty(state);
+            }
         }
         if ui.button("Load / Reload").clicked() {
             state.reload.store(true, Ordering::SeqCst);
@@ -355,6 +371,105 @@ fn spawn_picker(state: &EditorState, kind: ModelKind) {
     });
 }
 
+fn spawn_gpu_device_discovery() -> (
+    Arc<Mutex<GpuDeviceDiscovery>>,
+    Option<std::thread::JoinHandle<()>>,
+) {
+    let discovery = Arc::new(Mutex::new(GpuDeviceDiscovery::default()));
+    let result = Arc::clone(&discovery);
+    let thread = match std::thread::Builder::new()
+        .name("vc-vst3-gpu-discovery".to_string())
+        .spawn(move || {
+            let update = match list_cuda_devices() {
+                Ok(devices) => GpuDeviceDiscovery {
+                    devices: Some(devices),
+                    error: None,
+                },
+                Err(error) => GpuDeviceDiscovery {
+                    devices: None,
+                    error: Some(format!("{error:#}")),
+                },
+            };
+            if let Ok(mut current) = result.lock() {
+                *current = update;
+            }
+        }) {
+        Ok(thread) => Some(thread),
+        Err(error) => {
+            if let Ok(mut current) = discovery.lock() {
+                current.error = Some(format!("failed to spawn GPU discovery thread: {error}"));
+            }
+            None
+        }
+    };
+    (discovery, thread)
+}
+
+fn gpu_device_control(
+    ui: &mut egui::Ui,
+    selected_id: &mut u32,
+    discovery: &Mutex<GpuDeviceDiscovery>,
+) -> bool {
+    let discovery = discovery
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or_default();
+    if let Some(devices) = discovery.devices {
+        let selected_text = gpu_device_label(*selected_id, &devices);
+        let mut changed = false;
+        egui::ComboBox::from_id_salt("gpu-device")
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                for device in devices {
+                    changed |= ui
+                        .selectable_value(
+                            selected_id,
+                            device.id,
+                            format!("{}: {}", device.id, device.display_name),
+                        )
+                        .changed();
+                }
+            });
+        changed
+    } else if let Some(error) = discovery.error {
+        let changed = ui
+            .add(
+                egui::DragValue::new(selected_id)
+                    .prefix("GPU Device ID: ")
+                    .range(0..=i32::MAX as u32),
+            )
+            .changed();
+        ui.small(format!("GPU enumeration failed: {error}"));
+        changed
+    } else {
+        ui.label("Detecting CUDA devices...");
+        false
+    }
+}
+
+fn gpu_device_label(selected_id: u32, devices: &[GpuDevice]) -> String {
+    devices
+        .iter()
+        .find(|device| device.id == selected_id)
+        .map(|device| format!("{}: {}", device.id, device.display_name))
+        .unwrap_or_else(|| format!("Unavailable: device {selected_id}"))
+}
+
 fn mark_dirty(state: &EditorState) {
     state.dirty.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_device_label_preserves_unknown_saved_id() {
+        let devices = vec![GpuDevice {
+            id: 0,
+            display_name: "NVIDIA Test GPU".to_string(),
+        }];
+        assert_eq!(gpu_device_label(0, &devices), "0: NVIDIA Test GPU");
+        assert_eq!(gpu_device_label(7, &devices), "Unavailable: device 7");
+    }
 }
