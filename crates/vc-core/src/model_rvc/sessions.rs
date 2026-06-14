@@ -24,6 +24,16 @@ use super::native_tensorrt::{NativeContentVecEngine, NativeRmvpeEngine, NativeRv
 use super::onnx_meta::read_model_io;
 use super::tensorrt::*;
 
+/// Copies an embedder output (`shape` + `data`) into a reused `FeatureTensor`,
+/// clearing it first. Lets the extract paths fill a caller-owned buffer instead
+/// of allocating a fresh tensor each chunk.
+fn fill_feature_tensor(out: &mut FeatureTensor, shape: &[i64], data: &[f32]) {
+    out.data.clear();
+    out.data.extend_from_slice(data);
+    out.shape.clear();
+    out.shape.extend_from_slice(shape);
+}
+
 pub(super) struct HubertEmbedderSession {
     // Present only in the ORT build, where it backs CPU/CUDA inference. The
     // native TensorRT-only build drops ORT entirely and runs through `native`.
@@ -186,7 +196,14 @@ impl HubertEmbedderSession {
         Ok(())
     }
 
-    pub(super) fn extract(&mut self, audio_16k: &[f32]) -> Result<FeatureTensor> {
+    /// Runs ContentVec, writing the rank-3 feature tensor into `out` (a
+    /// caller-owned buffer reused across chunks) instead of allocating a fresh
+    /// `FeatureTensor` each call.
+    pub(super) fn extract_into(
+        &mut self,
+        audio_16k: &[f32],
+        out: &mut FeatureTensor,
+    ) -> Result<()> {
         let input_shape = [1usize, audio_16k.len()];
         validate_tensorrt_input_shape(
             self.provider,
@@ -196,17 +213,24 @@ impl HubertEmbedderSession {
         )?;
         #[cfg(feature = "ort")]
         if self.tensor_rt_binding.is_some() {
-            return self.extract_with_binding(audio_16k);
+            return self.extract_with_binding(audio_16k, out);
         }
         if let Some(native) = self.native.as_mut() {
-            return native.extract(audio_16k);
+            // The native TensorRT FFI still returns an owned tensor; copy it into
+            // the reused buffer so the contract matches the ORT paths.
+            let ft = native.extract(audio_16k)?;
+            fill_feature_tensor(out, &ft.shape, &ft.data);
+            return Ok(());
         }
         #[cfg(feature = "ort")]
         {
-            self.extract_with_session_run(audio_16k, &input_shape)
+            self.extract_with_session_run(audio_16k, &input_shape, out)
         }
         #[cfg(not(feature = "ort"))]
-        bail!("ContentVec session inference requires the `ort` feature; this build supports native TensorRT only")
+        {
+            let _ = out;
+            bail!("ContentVec session inference requires the `ort` feature; this build supports native TensorRT only")
+        }
     }
 
     #[cfg(feature = "ort")]
@@ -214,7 +238,8 @@ impl HubertEmbedderSession {
         &mut self,
         audio_16k: &[f32],
         input_shape: &[usize; 2],
-    ) -> Result<FeatureTensor> {
+        out: &mut FeatureTensor,
+    ) -> Result<()> {
         // Borrow the worker-owned input slice for synchronous ORT runs. Using
         // Tensor::from_array here would allocate and copy the full waveform on
         // every realtime chunk.
@@ -237,14 +262,16 @@ impl HubertEmbedderSession {
         if shape.len() != 3 {
             bail!("embedder output must be rank-3 [1, frames, channels], got {shape}");
         }
-        Ok(FeatureTensor {
-            data: data.to_vec(),
-            shape: shape.to_vec(),
-        })
+        fill_feature_tensor(out, shape, data);
+        Ok(())
     }
 
     #[cfg(feature = "ort")]
-    pub(super) fn extract_with_binding(&mut self, audio_16k: &[f32]) -> Result<FeatureTensor> {
+    pub(super) fn extract_with_binding(
+        &mut self,
+        audio_16k: &[f32],
+        out: &mut FeatureTensor,
+    ) -> Result<()> {
         let binding = self
             .tensor_rt_binding
             .as_mut()
@@ -288,10 +315,8 @@ impl HubertEmbedderSession {
                         format_usize_shape(&actual_shape)
                     );
                 }
-                Ok(FeatureTensor {
-                    data: data.to_vec(),
-                    shape: shape.to_vec(),
-                })
+                fill_feature_tensor(out, shape, data);
+                Ok(())
             }
             HubertTensorRtBinding::CudaGraph(binding) => {
                 let h2d_us = binding
@@ -333,10 +358,8 @@ impl HubertEmbedderSession {
                         format_usize_shape(&actual_shape)
                     );
                 }
-                Ok(FeatureTensor {
-                    data: data.to_vec(),
-                    shape: shape.to_vec(),
-                })
+                fill_feature_tensor(out, shape, data);
+                Ok(())
             }
         }
     }
@@ -351,6 +374,9 @@ pub(super) struct RmvpePitchSession {
     #[cfg(feature = "ort")]
     pub(super) tensor_rt_binding: Option<RmvpeTensorRtBinding>,
     native: Option<NativeRmvpeEngine>,
+    // Reused buffer for the pitch-shift-scaled F0 output, so `extract` does not
+    // allocate a fresh Vec every chunk. Returned as a borrowed slice.
+    pitchf_scratch: Vec<f32>,
 }
 
 impl RmvpePitchSession {
@@ -398,6 +424,7 @@ impl RmvpePitchSession {
             #[cfg(feature = "ort")]
             tensor_rt_binding: None,
             native,
+            pitchf_scratch: Vec::new(),
         })
     }
 
@@ -508,12 +535,15 @@ impl RmvpePitchSession {
         Ok(())
     }
 
+    /// Extracts F0, returning a borrowed slice into a reused internal buffer so
+    /// the realtime path does not allocate a fresh Vec each chunk. The result is
+    /// valid until the next `extract` call.
     pub(super) fn extract(
         &mut self,
         audio_16k: &[f32],
         pitch_shift: f32,
         threshold: f32,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<&[f32]> {
         let waveform_shape = [1usize, audio_16k.len()];
         validate_tensorrt_input_shape(
             self.provider,
@@ -526,7 +556,12 @@ impl RmvpePitchSession {
             return self.extract_with_binding(audio_16k, pitch_shift, threshold);
         }
         if let Some(native) = self.native.as_mut() {
-            return native.extract(audio_16k, pitch_shift, threshold);
+            // The native TensorRT FFI still returns an owned Vec; copy it into the
+            // reused scratch so the borrowed-slice contract holds across backends.
+            let raw = native.extract(audio_16k, pitch_shift, threshold)?;
+            self.pitchf_scratch.clear();
+            self.pitchf_scratch.extend_from_slice(&raw);
+            return Ok(self.pitchf_scratch.as_slice());
         }
         #[cfg(feature = "ort")]
         {
@@ -543,7 +578,7 @@ impl RmvpePitchSession {
         pitch_shift: f32,
         threshold: f32,
         waveform_shape: &[usize; 2],
-    ) -> Result<Vec<f32>> {
+    ) -> Result<&[f32]> {
         let threshold_value = [threshold];
         let waveform = TensorRef::from_array_view((*waveform_shape, audio_16k))?;
         let threshold = TensorRef::from_array_view(([1usize], threshold_value.as_slice()))?;
@@ -563,7 +598,12 @@ impl RmvpePitchSession {
             .ok_or_else(|| anyhow!("RMVPE output 'pitchf' not found"))?;
         let (_, data) = value.try_extract_tensor::<f32>()?;
         let factor = 2.0f32.powf(pitch_shift / 12.0);
-        Ok(data.iter().map(|f0| f0 * factor).collect())
+        // `data` borrows `outputs` (i.e. `self.session`); `pitchf_scratch` is a
+        // disjoint field, so scaling into it here is a valid split borrow.
+        self.pitchf_scratch.clear();
+        self.pitchf_scratch
+            .extend(data.iter().map(|f0| f0 * factor));
+        Ok(self.pitchf_scratch.as_slice())
     }
 
     #[cfg(feature = "ort")]
@@ -572,7 +612,7 @@ impl RmvpePitchSession {
         audio_16k: &[f32],
         pitch_shift: f32,
         threshold: f32,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<&[f32]> {
         let binding = self
             .tensor_rt_binding
             .as_mut()
@@ -608,7 +648,12 @@ impl RmvpePitchSession {
                     );
                 }
                 let factor = 2.0f32.powf(pitch_shift / 12.0);
-                Ok(data.iter().map(|f0| f0 * factor).collect())
+                // `data` borrows the bound output (self.tensor_rt_binding); the
+                // scratch is a disjoint field, so scaling into it is valid here.
+                self.pitchf_scratch.clear();
+                self.pitchf_scratch
+                    .extend(data.iter().map(|f0| f0 * factor));
+                Ok(self.pitchf_scratch.as_slice())
             }
             RmvpeTensorRtBinding::CudaGraph(binding) => {
                 let h2d_start = Instant::now();
@@ -650,7 +695,12 @@ impl RmvpePitchSession {
                     );
                 }
                 let factor = 2.0f32.powf(pitch_shift / 12.0);
-                Ok(data.iter().map(|f0| f0 * factor).collect())
+                // `data` borrows the bound output (self.tensor_rt_binding); the
+                // scratch is a disjoint field, so scaling into it is valid here.
+                self.pitchf_scratch.clear();
+                self.pitchf_scratch
+                    .extend(data.iter().map(|f0| f0 * factor));
+                Ok(self.pitchf_scratch.as_slice())
             }
         }
     }

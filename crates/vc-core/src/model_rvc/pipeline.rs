@@ -9,6 +9,7 @@ use crate::Provider;
 
 use super::api::{ModelOutput, VoiceModel};
 use super::f0_postprocess::{F0PostprocessConfig, F0Postprocessor};
+use super::feature::FeatureTensor;
 use super::inspect::{inspect_contentvec_input_name, inspect_rvc_model};
 use super::pitch::{
     align_pitchf_to_features_into, center_crop_pitchf_to_features_into, coarse_pitch_into,
@@ -119,6 +120,9 @@ pub struct RvcPipeline {
     // denoiser is active. Empty when the zero-copy (gain==1.0, denoiser-off) path
     // is taken.
     input_scratch: Vec<f32>,
+    // Reused embedder output tensor, refilled in place each chunk by
+    // `extract_into` so the per-chunk ContentVec output is not reallocated.
+    feature_tensor: FeatureTensor,
     input_reference_scratch: Vec<f32>,
     rms_mix_scratch: dsp::RmsMixScratch,
     pitchf_untrimmed_scratch: Vec<f32>,
@@ -346,6 +350,7 @@ impl RvcPipeline {
             max_output_gain: config.output_dynamics.max_output_gain,
             stream_state: RvcStreamState::new(),
             input_scratch: Vec::new(),
+            feature_tensor: FeatureTensor::default(),
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -729,6 +734,7 @@ impl RvcPipeline {
             max_output_gain: config.output_dynamics.max_output_gain,
             stream_state: RvcStreamState::new(),
             input_scratch: Vec::new(),
+            feature_tensor: FeatureTensor::default(),
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -821,6 +827,7 @@ impl RvcPipeline {
         )?;
         self.stream_state = RvcStreamState::new();
         self.input_scratch.clear();
+        self.feature_tensor = FeatureTensor::default();
         self.input_reference_scratch.clear();
         self.rms_mix_scratch = dsp::RmsMixScratch::default();
         self.pitchf_untrimmed_scratch.clear();
@@ -906,8 +913,12 @@ impl VoiceModel for RvcPipeline {
                 h2d_us
             );
         }
-        let mut features = self.embedder.extract(&self.stream_state.audio_16k_buffer)?;
-        let raw_feature_len = features
+        self.embedder.extract_into(
+            &self.stream_state.audio_16k_buffer,
+            &mut self.feature_tensor,
+        )?;
+        let raw_feature_len = self
+            .feature_tensor
             .shape
             .get(1)
             .copied()
@@ -927,17 +938,20 @@ impl VoiceModel for RvcPipeline {
                 // `silence_front_frames` is on RVC's repeated 10 ms grid. Drop
                 // the equivalent ContentVec frames before repeat so discarded
                 // context is not duplicated and shifted every chunk.
-                features.trim_front_frames(silence_front_frames / 2)?;
-                features.repeat_frames(2)?;
+                self.feature_tensor
+                    .trim_front_frames(silence_front_frames / 2)?;
+                self.feature_tensor.repeat_frames(2)?;
             } else {
-                features.repeat_frames(2)?;
-                features.trim_front_frames(silence_front_frames)?;
+                self.feature_tensor.repeat_frames(2)?;
+                self.feature_tensor
+                    .trim_front_frames(silence_front_frames)?;
             }
         } else {
-            features.repeat_frames(2)?;
+            self.feature_tensor.repeat_frames(2)?;
         }
         let embedder_time = embedder_start.elapsed();
-        let feature_len = features
+        let feature_len = self
+            .feature_tensor
             .shape
             .get(1)
             .copied()
@@ -953,7 +967,7 @@ impl VoiceModel for RvcPipeline {
             self.pitch
                 .extract(&self.stream_state.audio_16k_buffer, 0.0, self.f0_threshold)?;
         self.stream_state
-            .update_pitchf_from_rmvpe_frames(&pitchf_raw);
+            .update_pitchf_from_rmvpe_frames(pitchf_raw);
         let pitch_frames = self.stream_state.pitchf_buffer.len();
         let pitch_time = pitch_start.elapsed();
         // RMVPE's center-padded STFT and ContentVec's convolutional frontend do
@@ -1026,8 +1040,8 @@ impl VoiceModel for RvcPipeline {
         // in place on it; the output pitchf goes into `out_pitchf`.
         let rvc_start = Instant::now();
         self.rvc.infer(
-            &features.data,
-            &features.shape,
+            &self.feature_tensor.data,
+            &self.feature_tensor.shape,
             feature_len,
             pitch,
             pitchf,

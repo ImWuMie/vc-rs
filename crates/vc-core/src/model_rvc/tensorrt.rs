@@ -1109,7 +1109,9 @@ pub(super) fn tensor_rt_warmup_feature_len(
     extra_convert_samples: usize,
 ) -> Result<TensorRtWarmupInfo> {
     let silence = vec![0.0; input_samples_16k];
-    let features = embedder.extract(&silence)?;
+    // Warmup is a one-shot load-time probe, so a local tensor is fine here.
+    let mut features = super::feature::FeatureTensor::default();
+    embedder.extract_into(&silence, &mut features)?;
     let contentvec_output_shape = features.shape.clone();
     let contentvec_frames = feature_len_from_shape(&features.shape, "embedder warmup output")?;
     let feature_len = derive_rvc_feature_len(contentvec_frames, extra_convert_samples)?;

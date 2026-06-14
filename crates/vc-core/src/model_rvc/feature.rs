@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 
+#[derive(Default)]
 pub(super) struct FeatureTensor {
     pub(super) data: Vec<f32>,
     pub(super) shape: Vec<i64>,

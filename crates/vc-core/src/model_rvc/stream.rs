@@ -174,21 +174,12 @@ impl RvcStreamState {
         let out_size = out_size.max(1);
         let feature_size = feature_len_for_samples(convert_size_16k, EMBEDDER_SAMPLE_RATE);
 
-        if self.audio_buffer.len() < convert_size {
-            let mut padded = vec![0.0; convert_size - self.audio_buffer.len()];
-            padded.extend_from_slice(&self.audio_buffer);
-            self.audio_buffer = padded;
-        }
-        if self.audio_16k_buffer.len() < convert_size_16k {
-            let mut padded = vec![0.0; convert_size_16k - self.audio_16k_buffer.len()];
-            padded.extend_from_slice(&self.audio_16k_buffer);
-            self.audio_16k_buffer = padded;
-        }
-        if self.pitchf_buffer.len() < feature_size {
-            let mut padded = vec![0.0; feature_size - self.pitchf_buffer.len()];
-            padded.extend_from_slice(&self.pitchf_buffer);
-            self.pitchf_buffer = padded;
-        }
+        // Left-pad with zeros in place (reusing the buffers) when a chunk arrives
+        // before enough history has accumulated — startup and just after a
+        // passthrough->RVC switch resets the state.
+        left_pad_to_len_in_place(&mut self.audio_buffer, convert_size);
+        left_pad_to_len_in_place(&mut self.audio_16k_buffer, convert_size_16k);
+        left_pad_to_len_in_place(&mut self.pitchf_buffer, feature_size);
 
         keep_tail_in_place(&mut self.audio_buffer, convert_size);
         keep_tail_in_place(&mut self.audio_16k_buffer, convert_size_16k);
