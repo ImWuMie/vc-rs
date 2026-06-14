@@ -18,6 +18,13 @@ use vc_core::dsp::{self, NoiseGate, RmsMixScratch, StreamingResampleMono};
 use vc_core::sola::SmoothingKind;
 use vc_core::sola::{model_domain_chunk_smoother, prepare_model_output, ChunkSmootherConfig};
 
+// Wrap the system allocator so divan reports alloc/dealloc counts per iteration.
+// The buffer-reuse work on the worker path targets *zero* steady-state heap
+// traffic; wall-clock time alone can't show that, but the AllocProfiler's
+// "alloc" column makes a regression (a per-chunk Vec creeping back in) visible.
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
 fn main() {
     divan::main();
 }
@@ -222,21 +229,35 @@ mod sola_bench {
         let pitchf = vec![220.0f32; 256];
         joiner.prime_model_output(&audio, &pitchf);
 
-        bencher
-            .with_inputs(Vec::<f32>::new)
-            .bench_local_values(|mut out| {
-                let sola_offset = prepare_model_output(
-                    &audio,
-                    &pitchf,
-                    48_000,
-                    48_000,
-                    chunk,
-                    black_box(&mut joiner),
-                    None,
-                    &mut out,
-                )
-                .unwrap();
-                black_box((sola_offset, out));
-            });
+        // Reuse the output buffer across iterations exactly like the realtime
+        // worker reuses its `prepared`/`chunk_out` Vec across chunks. Warm its
+        // capacity once so the AllocProfiler measures steady-state traffic: a
+        // healthy same-rate join shows 0 allocs here.
+        let mut out = Vec::new();
+        let _ = prepare_model_output(
+            &audio,
+            &pitchf,
+            48_000,
+            48_000,
+            chunk,
+            &mut joiner,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        bencher.bench_local(|| {
+            let sola_offset = prepare_model_output(
+                &audio,
+                &pitchf,
+                48_000,
+                48_000,
+                chunk,
+                black_box(&mut joiner),
+                None,
+                black_box(&mut out),
+            )
+            .unwrap();
+            black_box(sola_offset);
+        });
     }
 }
