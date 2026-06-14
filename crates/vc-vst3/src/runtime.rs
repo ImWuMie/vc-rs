@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nice_plug::prelude::util;
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -47,11 +47,6 @@ const OUTPUT_QUEUE_CHUNKS: usize = 4;
 pub const MIN_CHUNK_MS: u32 = 50;
 pub const MAX_CHUNK_MS: u32 = 1000;
 
-/// Settle time before acting on a reload request. A burst of changes (e.g.
-/// toggling CPU/CUDA quickly) collapses into a single reload, because rebuilding
-/// the ONNX Runtime CUDA provider in rapid succession is fragile.
-const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
-
 /// Owns the worker thread and the audio-thread ends of the ring buffers.
 pub struct PluginRuntime {
     input_producer: Producer<f32>,
@@ -66,6 +61,7 @@ pub struct PluginRuntime {
     /// thread re-reports it to the host (see [`PluginRuntime::poll_latency_update`]).
     latency: Arc<AtomicU32>,
     last_reported_latency: u32,
+    loading: Arc<AtomicBool>,
 }
 
 impl PluginRuntime {
@@ -79,11 +75,17 @@ impl PluginRuntime {
     pub fn start(
         params: Arc<VcRvcParams>,
         reload: Arc<AtomicBool>,
+        loading: Arc<AtomicBool>,
         dirty: Arc<AtomicBool>,
         status: Arc<Mutex<PluginStatus>>,
         sample_rate: u32,
         max_block: usize,
     ) -> Self {
+        // Reload requests belong to one runtime lifecycle. Dropping a stale
+        // request here also guarantees the replacement starts with an enabled
+        // button rather than accepting a duplicate while it handles old work.
+        reload.store(false, Ordering::SeqCst);
+        loading.store(false, Ordering::SeqCst);
         let settings0 = params.settings.read().unwrap().clone();
         let crossfade_ms = settings0.crossfade_ms;
         let sola_search_ms = settings0.sola_search_ms;
@@ -115,6 +117,7 @@ impl PluginRuntime {
         let worker = WorkerCtx {
             params,
             reload,
+            loading: Arc::clone(&loading),
             dirty,
             status,
             sample_rate,
@@ -138,6 +141,7 @@ impl PluginRuntime {
             latency_samples,
             latency,
             last_reported_latency: latency_samples,
+            loading,
         }
     }
 
@@ -207,6 +211,7 @@ impl Drop for PluginRuntime {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         let Some(handle) = self.worker.take() else {
+            self.loading.store(false, Ordering::SeqCst);
             return;
         };
         // The host may call deactivate/drop from a thread that blocks while a
@@ -214,6 +219,7 @@ impl Drop for PluginRuntime {
         // worker to continue executing plugin code after the DAW unloads this
         // DLL, which is a harder crash mode than a bounded unload wait.
         let _ = handle.join();
+        self.loading.store(false, Ordering::SeqCst);
     }
 }
 
@@ -221,6 +227,7 @@ impl Drop for PluginRuntime {
 struct WorkerCtx {
     params: Arc<VcRvcParams>,
     reload: Arc<AtomicBool>,
+    loading: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
     status: Arc<Mutex<PluginStatus>>,
     sample_rate: u32,
@@ -242,7 +249,8 @@ impl WorkerCtx {
     }
 
     fn run(mut self) {
-        let mut chunk_samples = self.current_chunk_samples();
+        let initial_settings = self.params.settings.read().unwrap().clone();
+        let mut chunk_samples = self.chunk_samples(&initial_settings);
         let mut input_acc = Vec::<f32>::with_capacity(chunk_samples * 2);
         // Reused output buffer for the converted chunk, filled by `process_chunk`.
         let mut chunk_out = Vec::<f32>::with_capacity(chunk_samples * 2);
@@ -254,32 +262,33 @@ impl WorkerCtx {
         // boundary for model (re)initialization.
         let mut converter = None;
         self.set_idle_status();
-        let mut reload_at: Option<Instant> = None;
 
         while self.running.load(Ordering::SeqCst) {
-            // Coalesce reload requests (model/provider/chunk changes) and only act
-            // once they settle, then rebuild — dropping the old pipeline first so
-            // we never hold two CUDA contexts at once.
+            // The editor prevents another request while this one is loading, so
+            // the worker can act immediately without a debounce timer.
             if self.reload.swap(false, Ordering::SeqCst) {
-                reload_at = Some(Instant::now());
-            }
-            if reload_at.is_some_and(|t| t.elapsed() >= RELOAD_DEBOUNCE) {
-                reload_at = None;
-                // We're applying the current settings now; clear the
-                // "unapplied" indicator (a later edit re-sets it).
+                // Clear before taking the snapshot. An edit after this point
+                // re-sets dirty and remains visibly staged for the next load.
                 self.dirty.store(false, Ordering::SeqCst);
+                let settings = self.params.settings.read().unwrap().clone();
                 // chunk_ms may have changed; recompute and re-report latency.
-                chunk_samples = self.current_chunk_samples();
+                chunk_samples = self.chunk_samples(&settings);
                 self.latency
                     .store(self.latency_samples(chunk_samples), Ordering::Relaxed);
                 // Drop the old pipeline (releasing its CUDA context) before
                 // building the new one, so the two never coexist.
                 drop(converter.take());
-                let (new_pipeline, new_kind) = self.load_current(chunk_samples);
-                converter = new_pipeline
-                    .map(|pipeline| self.chunk_converter(pipeline, new_kind, chunk_samples));
+                converter = match self.load_current(&settings, chunk_samples) {
+                    Ok((new_pipeline, new_kind)) => new_pipeline
+                        .map(|pipeline| self.chunk_converter(pipeline, new_kind, chunk_samples)),
+                    Err(()) => {
+                        self.dirty.store(true, Ordering::SeqCst);
+                        None
+                    }
+                };
                 input_acc.clear();
                 self.drain_input();
+                self.loading.store(false, Ordering::SeqCst);
             }
 
             // Accumulate one input chunk.
@@ -387,15 +396,9 @@ impl WorkerCtx {
         }
     }
 
-    /// Current chunk size in samples, from the persisted (clamped) `chunk_ms`.
-    fn current_chunk_samples(&self) -> usize {
-        let chunk_ms = self
-            .params
-            .settings
-            .read()
-            .unwrap()
-            .chunk_ms
-            .clamp(MIN_CHUNK_MS, MAX_CHUNK_MS);
+    /// Chunk size in samples from the settings snapshot used for this load.
+    fn chunk_samples(&self, settings: &PluginConfig) -> usize {
+        let chunk_ms = settings.chunk_ms.clamp(MIN_CHUNK_MS, MAX_CHUNK_MS);
         chunk_samples_for_rate(self.sample_rate, chunk_ms)
     }
 
@@ -429,28 +432,30 @@ impl WorkerCtx {
         )
     }
 
-    /// Build a pipeline from the current persisted settings, reporting status.
-    /// Returns the pipeline (None if no models / load failed) and the smoothing
-    /// kind to use until the next reload.
-    fn load_current(&self, chunk_samples: usize) -> (Option<RvcPipeline>, SmoothingKind) {
-        let settings = self.params.settings.read().unwrap().clone();
+    /// Build a pipeline from one settings snapshot, reporting status. Missing
+    /// models are a valid silent configuration; load failures return `Err`.
+    fn load_current(
+        &self,
+        settings: &PluginConfig,
+        chunk_samples: usize,
+    ) -> Result<(Option<RvcPipeline>, SmoothingKind), ()> {
         let kind = settings.smoothing_kind();
         if !settings.has_models() {
             nice_plug::nice_warn!("vc-vst3: no models configured; running silent");
             self.set_status("no models configured");
-            return (None, kind);
+            return Ok((None, kind));
         }
         self.set_status("loading…");
         let provider = settings.provider();
-        match self.load_pipeline(&settings, provider, chunk_samples) {
+        match self.load_pipeline(settings, provider, chunk_samples) {
             Ok(pipeline) => {
                 self.set_status(format!("running ({})", provider.label()));
-                (Some(pipeline), kind)
+                Ok((Some(pipeline), kind))
             }
             Err(err) => {
                 nice_plug::nice_error!("vc-vst3: failed to load RVC pipeline: {err:#}");
                 self.set_error(format!("load failed: {err}"), format!("{err:#}"));
-                (None, kind)
+                Err(())
             }
         }
     }

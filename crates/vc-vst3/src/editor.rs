@@ -52,6 +52,9 @@ pub struct EditorState {
     pub params: Arc<VcRvcParams>,
     /// Set by the **Load / Reload** button to request a pipeline rebuild.
     pub reload: Arc<AtomicBool>,
+    /// True while the worker is rebuilding the pipeline. Prevents duplicate
+    /// reload requests without delaying the first request.
+    pub loading: Arc<AtomicBool>,
     /// Set when settings are edited, cleared by the worker once it applies them.
     /// Drives the "unapplied changes" indicator.
     pub dirty: Arc<AtomicBool>,
@@ -72,6 +75,7 @@ struct GpuDeviceDiscovery {
 pub fn create(
     params: Arc<VcRvcParams>,
     reload: Arc<AtomicBool>,
+    loading: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
     status: Arc<Mutex<PluginStatus>>,
 ) -> Option<Box<dyn Editor>> {
@@ -82,6 +86,7 @@ pub fn create(
         EditorState {
             params,
             reload,
+            loading,
             dirty,
             status,
             gpu_devices,
@@ -181,7 +186,15 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
                 mark_dirty(state);
             }
         }
-        if ui.button("Load / Reload").clicked() {
+        let loading = state.loading.load(Ordering::SeqCst);
+        if ui
+            .add_enabled(!loading, egui::Button::new("Load / Reload"))
+            .clicked()
+            && state
+                .loading
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
             state.reload.store(true, Ordering::SeqCst);
         }
         if state.dirty.load(Ordering::Relaxed) {

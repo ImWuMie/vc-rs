@@ -6,7 +6,7 @@
 //! realtime bridge.
 
 use std::num::NonZeroU32;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nice_plug::prelude::*;
@@ -56,6 +56,8 @@ pub struct VcRvcPlugin {
     runtime: Option<PluginRuntime>,
     /// GUI → worker: request a pipeline rebuild from the current settings.
     reload: Arc<AtomicBool>,
+    /// GUI/worker handshake: disables duplicate reload requests while loading.
+    loading: Arc<AtomicBool>,
     /// GUI sets on edit, worker clears on apply: drives the "unapplied" hint.
     dirty: Arc<AtomicBool>,
     /// worker → GUI: short status plus optional expandable error detail.
@@ -68,6 +70,7 @@ impl Default for VcRvcPlugin {
             params: Arc::new(VcRvcParams::default()),
             runtime: None,
             reload: Arc::new(AtomicBool::new(false)),
+            loading: Arc::new(AtomicBool::new(false)),
             dirty: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(PluginStatus::new("idle"))),
         }
@@ -113,6 +116,7 @@ impl Plugin for VcRvcPlugin {
         editor::create(
             self.params.clone(),
             self.reload.clone(),
+            self.loading.clone(),
             self.dirty.clone(),
             self.status.clone(),
         )
@@ -147,6 +151,7 @@ impl Plugin for VcRvcPlugin {
         let runtime = PluginRuntime::start(
             self.params.clone(),
             self.reload.clone(),
+            self.loading.clone(),
             self.dirty.clone(),
             self.status.clone(),
             sample_rate,
@@ -183,6 +188,8 @@ impl Plugin for VcRvcPlugin {
 
     fn deactivate(&mut self) {
         self.runtime = None;
+        self.reload.store(false, Ordering::SeqCst);
+        self.loading.store(false, Ordering::SeqCst);
     }
 }
 
