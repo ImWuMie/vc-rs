@@ -416,6 +416,23 @@ pub fn sola_offset(candidate: &[f32], reference: &[f32], search: usize) -> usize
     best_offset
 }
 
+/// Normalized cross-correlation of two equal-length windows (the shorter length
+/// is used if they differ). This is the exact score [`sola_offset`] maximizes at
+/// a single offset: `dot(a, b) / sqrt(dot(a, a) * dot(b, b))`. Returns a value in
+/// roughly `[-1, 1]`, and `0.0` for empty / zero-energy inputs. Diagnostics-only;
+/// the SOLA search keeps its own incremental energy bookkeeping.
+pub fn normalized_correlation(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let a = &a[..n];
+    let b = &b[..n];
+    let nom = dot(a, b);
+    let den = (dot(a, a) * dot(b, b) + 1e-9).sqrt();
+    nom / den
+}
+
 pub fn sola_offset_with_threshold(
     candidate: &[f32],
     reference: &[f32],
@@ -776,6 +793,32 @@ mod tests {
         let reference = [0.0, 1.0, 0.5, 0.0];
         let candidate = [0.2, 0.1, 0.0, 1.0, 0.5, 0.0, -0.1];
         assert_eq!(sola_offset(&candidate, &reference, 4), 2);
+    }
+
+    #[test]
+    fn normalized_correlation_matches_sola_score() {
+        // Perfectly aligned identical windows correlate to ~1.0.
+        let a = [0.0, 1.0, 0.5, -0.2];
+        assert_abs_diff_eq!(normalized_correlation(&a, &a), 1.0, epsilon = 1e-5);
+        // A scaled copy is still perfectly correlated (normalization removes gain).
+        let scaled: Vec<f32> = a.iter().map(|x| x * 3.0).collect();
+        assert_abs_diff_eq!(normalized_correlation(&a, &scaled), 1.0, epsilon = 1e-5);
+        // The value reported at the offset SOLA picks equals the score SOLA used.
+        let reference = [0.0, 1.0, 0.5, 0.0];
+        let candidate = [0.2, 0.1, 0.0, 1.0, 0.5, 0.0, -0.1];
+        let offset = sola_offset(&candidate, &reference, 4);
+        let window = &candidate[offset..offset + reference.len()];
+        assert_abs_diff_eq!(
+            normalized_correlation(window, &reference),
+            1.0,
+            epsilon = 1e-5
+        );
+    }
+
+    #[test]
+    fn normalized_correlation_handles_empty_and_silent() {
+        assert_eq!(normalized_correlation(&[], &[1.0, 0.0]), 0.0);
+        assert_eq!(normalized_correlation(&[0.0; 4], &[0.0; 4]), 0.0);
     }
 
     #[test]

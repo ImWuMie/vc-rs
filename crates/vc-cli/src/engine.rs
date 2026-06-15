@@ -19,6 +19,7 @@ use vc_core::sola::SmoothingKind;
 use crate::cli::{
     Denoiser, RunArgs, Smoother, WavArgs, DEFAULT_CROSSFADE_MS, DEFAULT_SOLA_SEARCH_MS,
 };
+use crate::join_report::JoinReport;
 
 pub fn run_realtime(args: RunArgs) -> Result<()> {
     args.validate_audio_options().map_err(anyhow::Error::msg)?;
@@ -202,6 +203,11 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
     let preroll = vec![0.0; chunk_samples];
     converter.prime(&preroll, spec.sample_rate)?;
 
+    let mut join_report = args
+        .join_report
+        .as_ref()
+        .map(|_| JoinReport::new(spec.sample_rate));
+
     let mut fixed_chunk_pad = Vec::new();
     let mut chunk_out = Vec::new();
     for chunk in samples.chunks(chunk_samples) {
@@ -218,8 +224,15 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             chunk.len(),
             stats.model_output_samples
         );
-        chunks += 1;
         output.extend_from_slice(&chunk_out);
+        if let Some(report) = join_report.as_mut() {
+            // Record after appending so the seam against the previous chunk is in
+            // `output`. Diagnostics are read back from the converter's smoother.
+            let diag = converter.last_join_diagnostics().unwrap_or_default();
+            let crossfade_target = converter.join_crossfade_samples().unwrap_or(0);
+            report.record(chunks, &output, chunk_samples, diag, crossfade_target);
+        }
+        chunks += 1;
     }
     if output.len() < samples.len() {
         let missing = samples.len() - output.len();
@@ -236,6 +249,15 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         args.output.display(),
         chunks
     );
+    if let (Some(report), Some(path)) = (join_report, args.join_report.as_ref()) {
+        report.write_csv(path)?;
+        info!("wrote join report to {}", path.display());
+        // Summary goes to stderr via info! line-by-line so it is visible without
+        // opening the CSV.
+        for line in report.summary().lines() {
+            info!("{line}");
+        }
+    }
     Ok(())
 }
 

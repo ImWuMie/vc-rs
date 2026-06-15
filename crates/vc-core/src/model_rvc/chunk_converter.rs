@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::sola::{self, ChunkSmoother, ChunkSmootherConfig, SmoothingKind};
+use crate::sola::{self, ChunkSmoother, ChunkSmootherConfig, JoinDiagnostics, SmoothingKind};
 
 use super::{ModelOutput, VoiceModel};
 
@@ -55,6 +55,25 @@ impl<M: VoiceModel> ChunkConverter<M> {
 
     pub fn model_mut(&mut self) -> &mut M {
         &mut self.model
+    }
+
+    /// Diagnostics for the most recent [`Self::process_chunk`] / [`Self::prime`]
+    /// join, or `None` before the first chunk builds the smoother. Diagnostics
+    /// only (offline join analysis); realtime callers can ignore it.
+    pub fn last_join_diagnostics(&self) -> Option<JoinDiagnostics> {
+        self.smoother
+            .as_ref()
+            .map(|(_, smoother)| smoother.last_diagnostics())
+    }
+
+    /// The configured crossfade window in model-domain samples, or `None` before
+    /// the first chunk builds the smoother. Diagnostics: comparing this against a
+    /// chunk's `crossfade_len` shows when the output chunk was shorter than the
+    /// crossfade window (the join then can't use the full overlap).
+    pub fn join_crossfade_samples(&self) -> Option<usize> {
+        self.smoother
+            .as_ref()
+            .map(|(_, smoother)| smoother.crossfade_samples())
     }
 
     /// Discards output-joining history without rebuilding the owned model.

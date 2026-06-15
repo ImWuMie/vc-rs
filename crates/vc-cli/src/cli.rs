@@ -344,6 +344,12 @@ pub struct WavArgs {
     pub target_output_rms: f32,
     #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_GAIN)]
     pub max_output_gain: f32,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write a per-chunk SOLA/PSOLA join report (CSV) for offline seam analysis"
+    )]
+    pub join_report: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
