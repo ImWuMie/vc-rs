@@ -144,10 +144,15 @@ Once every variant's ZIP has passed the Pre-Publish Check:
    [`../CHANGELOG.md`](../CHANGELOG.md) entry for this version is finalized and
    committed (see [Versioning](#versioning)).
 2. Run `scripts/release.ps1 -Publish` (`just release -Publish`). It re-runs the
-   scan, creates the annotated tag `v<version>` on the current commit, pushes it,
-   and creates the GitHub release with all four ZIPs attached (GitHub displays a
-   SHA-256 digest per asset). The tag matches the `v<version>` in the archive
-   names. Use `-Draft` to review the release before it goes public.
+   scan, requires a clean worktree, fetches `origin/main`, and stops unless
+   `origin/main` can fast-forward to the current commit. It then creates the
+   annotated tag `v<version>`, atomically pushes the current commit to `main`
+   together with the tag, and creates the GitHub release with all four ZIPs
+   attached (GitHub displays a SHA-256 digest per asset). A concurrent update or
+   any non-fast-forward push is rejected before the release is created. The tag
+   matches the `v<version>` in the archive names. Use `-Draft` to review the
+   release before it goes public. Use `-Remote` or `-ReleaseBranch` only when
+   intentionally publishing somewhere other than `origin/main`.
 3. Trim the release notes to this version's `CHANGELOG.md` section (the script
    seeds them from the whole file) and confirm the not-code-signed Windows
    warning is stated, consistent with the user-facing docs.

@@ -13,9 +13,12 @@
       4. Scan each ZIP for release blockers: prohibited files, backend
          cross-contamination, build-machine paths / user names leaked into our
          own binaries, and missing required files (LICENSE, notices, binaries).
-      5. (optional, -Publish) create the annotated tag v<version> and a GitHub
-         release with all four ZIPs attached. GitHub shows a SHA-256 digest for
-         each uploaded asset, so no separate checksum files are produced.
+      5. (optional, -Publish) require the remote release branch (main by
+         default) to fast-forward to the current commit, then atomically push
+         that branch update and the annotated v<version> tag before creating a
+         GitHub release with all four ZIPs attached. GitHub shows a SHA-256
+         digest for each uploaded asset, so no separate checksum files are
+         produced.
 
     Steps 1, 3, 4 are read-only / local and run by default. Step 5 is the only
     outward-facing action and is gated behind -Publish.
@@ -36,14 +39,21 @@
     toolchain on PATH for the tensorrt targets; dot-source scripts\activate.ps1).
 
 .PARAMETER Publish
-    Create the annotated git tag and the GitHub release. Without this switch the
+    Fast-forward the remote release branch to the current commit, push the
+    annotated git tag, and create the GitHub release. Without this switch the
     script only verifies locally. Requires the `gh` CLI.
 
 .PARAMETER Tag
     Tag name to create when publishing. Default: v<version>.
 
 .PARAMETER Remote
-    Git remote to push the tag to when publishing. Default: origin.
+    Git remote whose release branch and tag are pushed when publishing.
+    Default: origin.
+
+.PARAMETER ReleaseBranch
+    Remote branch advanced to the current commit when publishing. Its fetched
+    tip must be an ancestor of the current commit, so the update is
+    fast-forward-only. Default: main.
 
 .PARAMETER Draft
     Create the GitHub release as a draft (recommended for a final human review
@@ -70,6 +80,7 @@ param(
     [switch]$Publish,
     [string]$Tag,
     [string]$Remote = 'origin',
+    [string]$ReleaseBranch = 'main',
     [switch]$Draft,
     [string[]]$ScanPattern = @()
 )
@@ -256,20 +267,50 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     throw "The GitHub CLI (gh) is required for -Publish but was not found on PATH."
 }
 
+$worktreeChanges = @(git -C $repoRoot status --porcelain --untracked-files=normal)
+if ($LASTEXITCODE -ne 0) { throw "git status failed (exit $LASTEXITCODE)" }
+if ($worktreeChanges.Count -gt 0) {
+    throw "Publishing requires a clean worktree. Commit or remove local changes first."
+}
+
+$headCommit = (git -C $repoRoot rev-parse HEAD)
+if ($LASTEXITCODE -ne 0) { throw "git rev-parse HEAD failed (exit $LASTEXITCODE)" }
+$headCommit = $headCommit.Trim()
+
+# Fetch the exact remote release branch immediately before the ancestry check.
+# The subsequent normal/atomic push independently rejects a race that makes the
+# update non-fast-forward after this check.
+$remoteBranchRef = "refs/remotes/$Remote/$ReleaseBranch"
+$remoteBranchSource = "refs/heads/$ReleaseBranch"
+Write-Host "==> Fetching $Remote/$ReleaseBranch for fast-forward check" -ForegroundColor Cyan
+git -C $repoRoot fetch --no-tags $Remote "+${remoteBranchSource}:${remoteBranchRef}"
+if ($LASTEXITCODE -ne 0) { throw "git fetch $Remote $ReleaseBranch failed (exit $LASTEXITCODE)" }
+
+git -C $repoRoot merge-base --is-ancestor $remoteBranchRef $headCommit
+if ($LASTEXITCODE -ne 0) {
+    throw "$Remote/$ReleaseBranch cannot fast-forward to the current commit $headCommit. Merge or rebase first; nothing was published."
+}
+
 # Tag must point at the committed release state. Create it if missing; never move
 # an existing tag silently (a moved tag would mismatch already-built binaries).
-$existingTag = (git -C $repoRoot tag --list $Tag)
-if (-not $existingTag) {
+$existingTagCommit = (git -C $repoRoot rev-parse --verify --quiet "refs/tags/$Tag^{}")
+if ($LASTEXITCODE -eq 0) {
+    $existingTagCommit = $existingTagCommit.Trim()
+    if ($existingTagCommit -ne $headCommit) {
+        throw "Tag $Tag already points to $existingTagCommit, not current commit $headCommit."
+    }
+    Write-Host "==> Tag $Tag already exists at the current commit" -ForegroundColor Yellow
+} else {
     Write-Host "==> Creating annotated tag $Tag" -ForegroundColor Cyan
     git -C $repoRoot tag -a $Tag -m "Release $Tag"
     if ($LASTEXITCODE -ne 0) { throw "git tag failed (exit $LASTEXITCODE)" }
-} else {
-    Write-Host "==> Tag $Tag already exists; using it as-is" -ForegroundColor Yellow
 }
 
-Write-Host "==> Pushing tag $Tag to $Remote" -ForegroundColor Cyan
-git -C $repoRoot push $Remote $Tag
-if ($LASTEXITCODE -ne 0) { throw "git push tag failed (exit $LASTEXITCODE)" }
+Write-Host "==> Atomically pushing HEAD -> $Remote/$ReleaseBranch and tag $Tag" -ForegroundColor Cyan
+git -C $repoRoot push --atomic $Remote "HEAD:${remoteBranchSource}" "refs/tags/${Tag}:refs/tags/${Tag}"
+if ($LASTEXITCODE -ne 0) {
+    throw "Atomic push of $Remote/$ReleaseBranch and $Tag failed (exit $LASTEXITCODE). Nothing was released."
+}
 
 # GitHub shows a SHA-256 digest for each uploaded asset, so only the ZIPs are
 # attached — no separate checksum sidecars.

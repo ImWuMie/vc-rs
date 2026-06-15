@@ -72,7 +72,7 @@ verify *args:
 package *args:
     ./scripts/package-all.ps1 {{args}}
 
-# Verify built zips (scan); add -Build to build first, -Publish to tag and release.
+# Verify built zips; add -Build to build first, -Publish to FF main, tag, and release.
 release *args:
     ./scripts/release.ps1 {{args}}
 
