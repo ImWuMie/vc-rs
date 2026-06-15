@@ -21,6 +21,7 @@
 .DS_Store
 Thumbs.db
 *.log
+/docs/plans/
 
 # Local model assets (do not redistribute by default)
 *.onnx

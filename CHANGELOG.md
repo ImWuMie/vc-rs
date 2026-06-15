@@ -12,6 +12,17 @@ versioning and publishing procedure.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-15
+
+### Added
+
+- Live passthrough switching for standalone sessions with a complete model set.
+- Named GPU device selection for supported CUDA and TensorRT providers.
+- Staged model-loading progress in the GUI.
+- Chunk-join diagnostics for measuring output-boundary artifacts.
+- Shared conversion-pipeline architecture guidance, CI checks, cargo-deny
+  policy, a check-only pre-commit rustfmt hook, and CPU hot-path benchmarks.
+
 ### Changed
 
 - GPU Priority now applies to every backend, not just native TensorRT: it sets a
@@ -20,6 +31,27 @@ versioning and publishing procedure.
   for Windows ML / CPU builds as well. High additionally opts the process out of
   CPU power throttling (EcoQoS) so inference keeps full clock when the window is
   in the background, removing the large foreground/background timing difference.
+- CLI, GUI, VST3, and WAV conversion now reuse shared chunk-conversion,
+  smoothing, and output-assembly components.
+- Standalone realtime processing now wakes the input worker when audio arrives
+  instead of polling every 2 ms.
+- The GUI chunk-size control now supports values down to 40 ms.
+- Updated CPAL, nice-plug, egui, rfd, toml, rubato, and compatible transitive
+  dependencies.
+
+### Fixed
+
+- Reduced audible chunk-join artifacts at small chunk sizes.
+- Restored VST3 processing correctly after plugin reload.
+- Opened CPAL streams using the device's native channel count.
+- Surfaced Windows ML catalog execution-provider preparation failures.
+- Ensured VST3 installation stages the required runtime DLLs.
+
+### Performance
+
+- Removed repeated allocation and redundant work from inference, DSP, and
+  SOLA/PSOLA hot paths.
+- Vectorized SOLA/PSOLA offset search and reused input-side inference buffers.
 
 ## [0.2.1] - 2026-06-10
 
@@ -83,7 +115,8 @@ Initial release.
 - One-shot distribution packaging scripts for all four Windows x64 variants.
 - Auto-generated bundled third-party license notices during packaging.
 
-[Unreleased]: https://github.com/shirohata/vc-rs/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/shirohata/vc-rs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/shirohata/vc-rs/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/shirohata/vc-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/shirohata/vc-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/shirohata/vc-rs/releases/tag/v0.1.0

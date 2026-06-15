@@ -1495,6 +1495,8 @@ pub(super) fn load_session(
     // CUDA consumes the selected device ID from the fixed-shape profile.
     // Windows ML consumes the same profile only for TensorRT-RTX shape options;
     // its adapter selection remains owned by Windows ML.
+    #[cfg(not(any(feature = "cuda", all(windows, feature = "windowsml"))))]
+    let _ = tensor_rt_profile;
     #[cfg(feature = "cuda")]
     let gpu_device_id = tensor_rt_profile.map_or(0, |profile| profile.gpu_device_id);
     #[cfg(feature = "cuda")]
