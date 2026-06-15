@@ -525,7 +525,7 @@ impl eframe::App for VcGui {
             ui.separator();
             ui.heading("Engine configuration (Apply to restart)");
             changed |= ui
-                .add(egui::Slider::new(&mut self.settings.chunk_ms, 50..=1000).text("Chunk ms"))
+                .add(egui::Slider::new(&mut self.settings.chunk_ms, 40..=1000).text("Chunk ms"))
                 .changed();
             changed |= ui
                 .add(
