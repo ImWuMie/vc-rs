@@ -152,10 +152,11 @@ Once every variant's ZIP has passed the Pre-Publish Check:
    any non-fast-forward push is rejected before the release is created. The tag
    matches the `v<version>` in the archive names. Use `-Draft` to review the
    release before it goes public. Use `-Remote` or `-ReleaseBranch` only when
-   intentionally publishing somewhere other than `origin/main`.
-3. Trim the release notes to this version's `CHANGELOG.md` section (the script
-   seeds them from the whole file) and confirm the not-code-signed Windows
-   warning is stated, consistent with the user-facing docs.
+   intentionally publishing somewhere other than `origin/main`. The script
+   extracts only this version's `CHANGELOG.md` section for the GitHub Release
+   body and stops before publishing if that section is missing.
+3. Confirm the not-code-signed Windows warning is stated in the release body,
+   consistent with the user-facing docs.
 
 Distributed binaries are currently not code-signed. Keep the user-facing
 documentation explicit about the resulting Windows warning until signing is

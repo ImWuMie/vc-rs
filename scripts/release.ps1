@@ -104,6 +104,27 @@ function Get-WorkspaceVersion {
     throw "Could not read [workspace.package].version from Cargo.toml."
 }
 
+function Get-ChangelogReleaseNotes {
+    param([string]$ChangelogPath, [string]$ReleaseVersion)
+
+    if (-not (Test-Path -LiteralPath $ChangelogPath)) {
+        throw "CHANGELOG.md not found: $ChangelogPath"
+    }
+
+    # Keep-A-Changelog versions are second-level headings. Stop at the next
+    # version heading so GitHub Release notes never include older releases.
+    $escapedVersion = [regex]::Escape($ReleaseVersion)
+    $content = Get-Content -LiteralPath $ChangelogPath -Raw
+    $match = [regex]::Match(
+        $content,
+        "(?ms)^## \[$escapedVersion\][^\r\n]*\r?\n.*?(?=^## \[|\z)"
+    )
+    if (-not $match.Success) {
+        throw "CHANGELOG.md has no release section for version $ReleaseVersion."
+    }
+    return $match.Value.Trim()
+}
+
 function Test-BytesContainText {
     # Look for $needle inside a binary as both narrow (Latin1/ASCII) and wide
     # (UTF-16LE) text — the two ways a path or name ends up embedded in a PE.
@@ -267,6 +288,9 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     throw "The GitHub CLI (gh) is required for -Publish but was not found on PATH."
 }
 
+$changelog = Join-Path $repoRoot 'CHANGELOG.md'
+$releaseNotes = Get-ChangelogReleaseNotes -ChangelogPath $changelog -ReleaseVersion $Version
+
 $worktreeChanges = @(git -C $repoRoot status --porcelain --untracked-files=normal)
 if ($LASTEXITCODE -ne 0) { throw "git status failed (exit $LASTEXITCODE)" }
 if ($worktreeChanges.Count -gt 0) {
@@ -316,22 +340,20 @@ if ($LASTEXITCODE -ne 0) {
 # attached — no separate checksum sidecars.
 $assets = @($zips)
 
-$notesArgs = @()
-$changelog = Join-Path $repoRoot 'CHANGELOG.md'
-if (Test-Path -LiteralPath $changelog) {
-    $notesArgs = @('--notes-file', $changelog)
-    Write-Host "==> Using CHANGELOG.md as release notes (edit the GitHub release to trim to this version's section)" -ForegroundColor Yellow
-} else {
-    $notesArgs = @('--generate-notes')
+$notesFile = [System.IO.Path]::GetTempFileName()
+try {
+    Set-Content -LiteralPath $notesFile -Value $releaseNotes -Encoding utf8NoBOM
+    $ghArgs = @('release', 'create', $Tag, '--title', $Tag, '--notes-file', $notesFile)
+    if ($Draft) { $ghArgs += '--draft' }
+    $ghArgs += $assets
+
+    Write-Host "==> gh release create $Tag with CHANGELOG.md section for $Version" -ForegroundColor Cyan
+    gh @ghArgs
+    if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }
 }
-
-$ghArgs = @('release', 'create', $Tag, '--title', $Tag) + $notesArgs
-if ($Draft) { $ghArgs += '--draft' }
-$ghArgs += $assets
-
-Write-Host "==> gh release create $Tag" -ForegroundColor Cyan
-gh @ghArgs
-if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }
+finally {
+    Remove-Item -LiteralPath $notesFile -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host ''
 Write-Host "== Release $Tag published ==" -ForegroundColor Green
