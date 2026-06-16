@@ -10,6 +10,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use vc_core::model_rvc::GpuPriority;
+use vc_core::validation::{
+    validate_conversion_timing, validate_non_negative_f32, validate_unit_interval,
+    ConversionTiming, ConversionTimingLimits, CONVERSION_TIMING_LIMITS,
+};
 use vc_core::Provider;
 
 /// Search order for the config file:
@@ -17,6 +21,7 @@ use vc_core::Provider;
 /// 2. `<os-config-dir>/vc-rs/vst3.toml` (see [`os_config_dir`])
 /// 3. `vc-rs-vst3.toml` in the host's current working directory
 pub const CONFIG_ENV: &str = "VC_RS_VST3_CONFIG";
+pub const PLUGIN_MIN_EXTRA_CONVERT_MS: u32 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Lenient: unknown/legacy keys (e.g. `pitch_shift`, now a DAW parameter) are
@@ -142,6 +147,32 @@ impl PluginConfig {
         }
     }
 
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let limits = ConversionTimingLimits {
+            min_extra_convert_ms: PLUGIN_MIN_EXTRA_CONVERT_MS,
+            ..CONVERSION_TIMING_LIMITS
+        };
+        validate_conversion_timing(
+            ConversionTiming {
+                chunk_ms: self.chunk_ms,
+                crossfade_ms: self.crossfade_ms,
+                sola_search_ms: self.sola_search_ms,
+                tail_discard_ms: self.rvc_output_tail_discard_ms,
+                extra_convert_ms: self.extra_convert_ms,
+            },
+            limits,
+        )?;
+        validate_non_negative_f32("F0 threshold", self.f0_threshold)?;
+        validate_non_negative_f32("silence threshold", self.silence_threshold)?;
+        validate_non_negative_f32("noise gate attack (ms)", self.noise_gate_attack_ms)?;
+        validate_non_negative_f32("noise gate release (ms)", self.noise_gate_release_ms)?;
+        validate_unit_interval("noise gate floor", self.noise_gate_floor)?;
+        validate_unit_interval("RMS mix rate", self.rms_mix_rate)?;
+        validate_non_negative_f32("target output RMS", self.target_output_rms)?;
+        validate_non_negative_f32("max output gain", self.max_output_gain)?;
+        Ok(())
+    }
+
     /// Locate and parse the config file. Returns the default config when no file
     /// is found so the plugin still loads (in silent mode).
     pub fn discover() -> Self {
@@ -150,10 +181,16 @@ impl PluginConfig {
         };
         match std::fs::read_to_string(&path) {
             Ok(text) => match toml::from_str::<PluginConfig>(&text) {
-                Ok(config) => {
-                    nice_plug::nice_log!("vc-vst3: loaded config from {}", path.display());
-                    config
-                }
+                Ok(config) => match config.validate() {
+                    Ok(()) => {
+                        nice_plug::nice_log!("vc-vst3: loaded config from {}", path.display());
+                        config
+                    }
+                    Err(err) => {
+                        nice_plug::nice_error!("vc-vst3: invalid config {}: {err}", path.display());
+                        Self::default()
+                    }
+                },
                 Err(err) => {
                     nice_plug::nice_error!("vc-vst3: failed to parse {}: {err}", path.display());
                     Self::default()
@@ -281,5 +318,20 @@ mod tests {
         assert_eq!(config.gpu_priority(), GpuPriority::Normal);
         let config: PluginConfig = toml::from_str("gpu_device_id = 2").unwrap();
         assert_eq!(config.gpu_device_id, 2);
+    }
+
+    #[test]
+    fn validates_timing_ranges() {
+        assert!(PluginConfig::default().validate().is_ok());
+        let config: PluginConfig = toml::from_str("chunk_ms = 19").unwrap();
+        assert!(config.validate().is_err());
+        let config: PluginConfig = toml::from_str(&format!(
+            "extra_convert_ms = {}",
+            PLUGIN_MIN_EXTRA_CONVERT_MS - 1
+        ))
+        .unwrap();
+        assert!(config.validate().is_err());
+        let config: PluginConfig = toml::from_str("extra_convert_ms = 3001").unwrap();
+        assert!(config.validate().is_err());
     }
 }

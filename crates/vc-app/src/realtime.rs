@@ -15,6 +15,10 @@ use vc_core::model_rvc::{
     OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
+use vc_core::validation::{
+    validate_conversion_timing, validate_non_negative_f32, validate_unit_interval,
+    ConversionTiming, CONVERSION_TIMING_LIMITS,
+};
 use vc_core::Provider;
 
 use crate::audio::{self, AudioStream, RealtimeAudio};
@@ -130,25 +134,27 @@ impl RealtimeConfig {
         {
             bail!("WASAPI exclusive options require the WASAPI backend");
         }
-        if self.chunk_ms == 0 {
-            bail!("chunk size must be greater than zero");
-        }
-        let rms_mix_rate = self.output_dynamics.rms_mix_rate;
-        if !(0.0..=1.0).contains(&rms_mix_rate) || !rms_mix_rate.is_finite() {
-            bail!("RMS mix rate must be a finite value in 0.0..=1.0");
-        }
-        if !self.noise_gate_shaping.attack_ms.is_finite() || self.noise_gate_shaping.attack_ms < 0.0
-        {
-            bail!("noise gate attack must be a finite, non-negative value (ms)");
-        }
-        if !self.noise_gate_shaping.release_ms.is_finite()
-            || self.noise_gate_shaping.release_ms < 0.0
-        {
-            bail!("noise gate release must be a finite, non-negative value (ms)");
-        }
-        if !(0.0..=1.0).contains(&self.noise_gate_shaping.floor) {
-            bail!("noise gate floor must be in 0.0..=1.0");
-        }
+        validate_conversion_timing(
+            ConversionTiming {
+                chunk_ms: self.chunk_ms,
+                crossfade_ms: self.crossfade_ms,
+                sola_search_ms: self.sola_search_ms,
+                tail_discard_ms: self.rvc_output_tail_discard_ms,
+                extra_convert_ms: self.extra_convert_ms,
+            },
+            CONVERSION_TIMING_LIMITS,
+        )?;
+        validate_unit_interval("RMS mix rate", self.output_dynamics.rms_mix_rate)?;
+        validate_non_negative_f32("F0 threshold", self.f0.f0_threshold)?;
+        validate_non_negative_f32("silence threshold", self.f0.silence_threshold)?;
+        validate_non_negative_f32("noise gate attack (ms)", self.noise_gate_shaping.attack_ms)?;
+        validate_non_negative_f32(
+            "noise gate release (ms)",
+            self.noise_gate_shaping.release_ms,
+        )?;
+        validate_unit_interval("noise gate floor", self.noise_gate_shaping.floor)?;
+        validate_non_negative_f32("target output RMS", self.output_dynamics.target_output_rms)?;
+        validate_non_negative_f32("max output gain", self.output_dynamics.max_output_gain)?;
         if !self.passthrough
             && (self.model.is_none() || self.embedder.is_none() || self.f0_model.is_none())
         {
@@ -1203,6 +1209,45 @@ mod tests {
         }
         .validate()
         .is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_out_of_range_conversion_timing() {
+        assert!(RealtimeConfig {
+            passthrough: true,
+            chunk_ms: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RealtimeConfig {
+            passthrough: true,
+            chunk_ms: CONVERSION_TIMING_LIMITS.min_chunk_ms - 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RealtimeConfig {
+            passthrough: true,
+            chunk_ms: CONVERSION_TIMING_LIMITS.max_chunk_ms + 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RealtimeConfig {
+            passthrough: true,
+            extra_convert_ms: CONVERSION_TIMING_LIMITS.min_extra_convert_ms - 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RealtimeConfig {
+            passthrough: true,
+            extra_convert_ms: CONVERSION_TIMING_LIMITS.max_extra_convert_ms + 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

@@ -15,15 +15,17 @@ use egui::{self, Vec2};
 use nice_plug::prelude::{Editor, ParamSetter};
 use nice_plug_egui::{create_egui_editor, resizable_window::ResizableWindow, widgets};
 use vc_core::gpu::{list_cuda_devices, GpuDevice};
+use vc_core::validation::CONVERSION_TIMING_LIMITS;
 
+use crate::config::PLUGIN_MIN_EXTRA_CONVERT_MS;
 use crate::params::VcRvcParams;
 use crate::plugin_identity;
 use crate::runtime::{PluginStatus, ReloadWaker, MAX_CHUNK_MS, MIN_CHUNK_MS};
 
 /// Granularity for the millisecond sliders.
 const MS_STEP: u32 = 10;
-const MIN_EXTRA_CONVERT_MS: u32 = 0;
-const MAX_EXTRA_CONVERT_MS: u32 = 3000;
+const MIN_EXTRA_CONVERT_MS: u32 = PLUGIN_MIN_EXTRA_CONVERT_MS;
+const MAX_EXTRA_CONVERT_MS: u32 = CONVERSION_TIMING_LIMITS.max_extra_convert_ms;
 const GPU_DEVICE_SELECTOR_AVAILABLE: bool = cfg!(any(feature = "cuda", feature = "tensorrt"));
 
 /// Backend choices offered in the GUI, scoped to the providers this package was

@@ -19,6 +19,7 @@ use vc_core::model_rvc::{
     OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
+use vc_core::validation::CONVERSION_TIMING_LIMITS;
 
 use crate::config::PluginConfig;
 use crate::params::VcRvcParams;
@@ -44,8 +45,8 @@ const OUTPUT_QUEUE_CHUNKS: usize = 4;
 /// Allowed range for the user-tunable chunk size (ms). The ring buffers are
 /// sized for `MAX_CHUNK_MS` up front so chunk changes apply live (on reload)
 /// without reallocating them.
-pub const MIN_CHUNK_MS: u32 = 50;
-pub const MAX_CHUNK_MS: u32 = 1000;
+pub const MIN_CHUNK_MS: u32 = CONVERSION_TIMING_LIMITS.min_chunk_ms;
+pub const MAX_CHUNK_MS: u32 = CONVERSION_TIMING_LIMITS.max_chunk_ms;
 
 /// Lets the editor's Load / Reload submit (a non-realtime UI thread) wake the
 /// current worker even while the host is idle and not calling `process()`, so a
@@ -129,9 +130,21 @@ impl PluginRuntime {
         reload.store(false, Ordering::SeqCst);
         loading.store(false, Ordering::SeqCst);
         let settings0 = params.settings.read().unwrap().clone();
-        let crossfade_ms = settings0.crossfade_ms;
-        let sola_search_ms = settings0.sola_search_ms;
-        let tail_discard_ms = settings0.rvc_output_tail_discard_ms;
+        let initial_timing_settings = if let Err(err) = settings0.validate() {
+            nice_plug::nice_error!("vc-vst3: invalid persisted settings: {err}");
+            if let Ok(mut current) = status.lock() {
+                *current = PluginStatus {
+                    summary: format!("invalid settings: {err}"),
+                    detail: Some(format!("{err:#}")),
+                };
+            }
+            PluginConfig::default()
+        } else {
+            settings0.clone()
+        };
+        let crossfade_ms = initial_timing_settings.crossfade_ms;
+        let sola_search_ms = initial_timing_settings.sola_search_ms;
+        let tail_discard_ms = initial_timing_settings.rvc_output_tail_discard_ms;
         let output_extra_ms = crossfade_ms
             .saturating_add(sola_search_ms)
             .saturating_add(tail_discard_ms);
@@ -150,7 +163,9 @@ impl PluginRuntime {
         // Initial latency: one (clamped) chunk of input buffering plus the
         // smoothing/tail context, in host samples. Updated live when chunk_ms
         // changes; RVC has additional inherent latency this estimate omits.
-        let chunk_ms = settings0.chunk_ms.clamp(MIN_CHUNK_MS, MAX_CHUNK_MS);
+        let chunk_ms = initial_timing_settings
+            .chunk_ms
+            .clamp(MIN_CHUNK_MS, MAX_CHUNK_MS);
         let chunk_samples = chunk_samples_for_rate(sample_rate, chunk_ms);
         let extra_samples = chunk_samples_for_rate(sample_rate, output_extra_ms);
         let latency_samples = (chunk_samples + extra_samples) as u32;
@@ -320,7 +335,11 @@ impl WorkerCtx {
         // happens implicitly. The editor's Load / Reload button is the explicit
         // boundary for model (re)initialization.
         let mut converter = None;
-        self.set_idle_status();
+        if let Err(err) = initial_settings.validate() {
+            self.set_error(format!("invalid settings: {err}"), format!("{err:#}"));
+        } else {
+            self.set_idle_status();
+        }
 
         while self.running.load(Ordering::SeqCst) {
             // The editor prevents another request while this one is loading, so
@@ -330,6 +349,13 @@ impl WorkerCtx {
                 // re-sets dirty and remains visibly staged for the next load.
                 self.dirty.store(false, Ordering::SeqCst);
                 let settings = self.params.settings.read().unwrap().clone();
+                if let Err(err) = settings.validate() {
+                    nice_plug::nice_error!("vc-vst3: invalid settings: {err}");
+                    self.set_error(format!("invalid settings: {err}"), format!("{err:#}"));
+                    self.dirty.store(true, Ordering::SeqCst);
+                    self.loading.store(false, Ordering::SeqCst);
+                    continue;
+                }
                 // chunk_ms may have changed; recompute and re-report latency.
                 chunk_samples = self.chunk_samples(&settings);
                 self.latency

@@ -2,6 +2,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use vc_core::validation::{
+    validate_conversion_timing, validate_finite_f32, validate_non_negative_f32,
+    validate_unit_interval, ConversionTiming, CONVERSION_TIMING_LIMITS,
+};
 pub use vc_core::Provider;
 
 /// Default inference backend for this build. The distribution packages are
@@ -435,6 +439,28 @@ impl RunArgs {
         Ok(())
     }
 
+    pub fn validate_conversion_options(&self) -> Result<(), String> {
+        validate_common_conversion_options(
+            ConversionTiming {
+                chunk_ms: self.chunk_ms,
+                crossfade_ms: self.crossfade_ms,
+                sola_search_ms: self.sola_search_ms,
+                tail_discard_ms: self.rvc_output_tail_discard_ms,
+                extra_convert_ms: self.extra_convert_ms,
+            },
+            CONVERSION_TIMING_LIMITS,
+            self.noise_gate_attack_ms,
+            self.noise_gate_release_ms,
+            self.noise_gate_floor,
+            self.rms_mix_rate,
+            self.f0_threshold,
+            self.silence_threshold,
+            self.target_output_rms,
+            self.max_output_gain,
+        )
+        .and_then(|()| validate_live_conversion_options(self))
+    }
+
     pub fn wasapi_input_exclusive(&self) -> bool {
         self.wasapi_exclusive || self.wasapi_exclusive_input
     }
@@ -452,6 +478,89 @@ impl WavArgs {
             Denoiser::Off
         })
     }
+
+    pub fn validate_conversion_options(&self) -> Result<(), String> {
+        validate_common_conversion_options(
+            ConversionTiming {
+                chunk_ms: self.chunk_ms,
+                crossfade_ms: DEFAULT_CROSSFADE_MS,
+                sola_search_ms: DEFAULT_SOLA_SEARCH_MS,
+                tail_discard_ms: self.rvc_output_tail_discard_ms,
+                extra_convert_ms: self.extra_convert_ms,
+            },
+            CONVERSION_TIMING_LIMITS,
+            self.noise_gate_attack_ms,
+            self.noise_gate_release_ms,
+            self.noise_gate_floor,
+            self.rms_mix_rate,
+            self.f0_threshold,
+            0.0,
+            self.target_output_rms,
+            self.max_output_gain,
+        )
+        .and_then(|()| validate_wav_live_conversion_options(self))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_common_conversion_options(
+    timing: ConversionTiming,
+    limits: vc_core::validation::ConversionTimingLimits,
+    noise_gate_attack_ms: f32,
+    noise_gate_release_ms: f32,
+    noise_gate_floor: f32,
+    rms_mix_rate: f32,
+    f0_threshold: f32,
+    silence_threshold: f32,
+    target_output_rms: f32,
+    max_output_gain: f32,
+) -> Result<(), String> {
+    validate_conversion_timing(timing, limits).map_err(|err| err.to_string())?;
+    validate_non_negative_f32("F0 threshold", f0_threshold).map_err(|err| err.to_string())?;
+    validate_non_negative_f32("silence threshold", silence_threshold)
+        .map_err(|err| err.to_string())?;
+    validate_non_negative_f32("noise gate attack (ms)", noise_gate_attack_ms)
+        .map_err(|err| err.to_string())?;
+    validate_non_negative_f32("noise gate release (ms)", noise_gate_release_ms)
+        .map_err(|err| err.to_string())?;
+    validate_unit_interval("noise gate floor", noise_gate_floor).map_err(|err| err.to_string())?;
+    validate_unit_interval("RMS mix rate", rms_mix_rate).map_err(|err| err.to_string())?;
+    validate_non_negative_f32("target output RMS", target_output_rms)
+        .map_err(|err| err.to_string())?;
+    validate_non_negative_f32("max output gain", max_output_gain).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn validate_live_values(
+    pitch_shift: f32,
+    input_gain: f32,
+    output_gain: f32,
+    noise_gate_threshold: f32,
+) -> Result<(), String> {
+    validate_finite_f32("pitch shift", pitch_shift).map_err(|err| err.to_string())?;
+    validate_non_negative_f32("input gain", input_gain).map_err(|err| err.to_string())?;
+    validate_non_negative_f32("output gain", output_gain).map_err(|err| err.to_string())?;
+    validate_non_negative_f32("noise gate threshold", noise_gate_threshold)
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn validate_live_conversion_options(args: &RunArgs) -> Result<(), String> {
+    validate_live_values(
+        args.pitch_shift,
+        args.input_gain,
+        args.output_gain,
+        args.noise_gate_threshold,
+    )
+}
+
+fn validate_wav_live_conversion_options(args: &WavArgs) -> Result<(), String> {
+    validate_live_values(
+        args.pitch_shift,
+        args.input_gain,
+        args.output_gain,
+        args.noise_gate_threshold,
+    )
 }
 
 #[cfg(test)]
@@ -896,13 +1005,13 @@ mod tests {
             "--output",
             "output.wav",
             "--extra-convert-ms",
-            "0",
+            "20",
         ])
         .unwrap();
         let Command::Wav(args) = cli.command else {
             panic!("expected wav command");
         };
-        assert_eq!(args.extra_convert_ms, 0);
+        assert_eq!(args.extra_convert_ms, 20);
         assert!(Cli::try_parse_from([
             "vc-rs",
             "run",
@@ -911,6 +1020,112 @@ mod tests {
             "4800"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn validates_realtime_conversion_ranges() {
+        let cli =
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--chunk-ms", "19"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.validate_conversion_options().is_err());
+
+        let cli =
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--chunk-ms", "2001"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.validate_conversion_options().is_err());
+
+        let cli =
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--extra-convert-ms", "19"])
+                .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.validate_conversion_options().is_err());
+
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--extra-convert-ms",
+            "3001",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.validate_conversion_options().is_err());
+    }
+
+    #[test]
+    fn validates_wav_conversion_ranges_without_rejecting_default_chunk() {
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-model",
+            "f0.onnx",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+        ])
+        .unwrap();
+        let Command::Wav(args) = cli.command else {
+            panic!("expected wav command");
+        };
+        assert_eq!(args.chunk_ms, DEFAULT_WAV_CHUNK_MS);
+        assert!(args.validate_conversion_options().is_ok());
+
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-model",
+            "f0.onnx",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+            "--extra-convert-ms",
+            "19",
+        ])
+        .unwrap();
+        let Command::Wav(args) = cli.command else {
+            panic!("expected wav command");
+        };
+        assert!(args.validate_conversion_options().is_err());
+
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-model",
+            "f0.onnx",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+            "--chunk-ms",
+            "2001",
+        ])
+        .unwrap();
+        let Command::Wav(args) = cli.command else {
+            panic!("expected wav command");
+        };
+        assert!(args.validate_conversion_options().is_err());
     }
 
     #[test]

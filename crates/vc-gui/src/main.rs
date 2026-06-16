@@ -13,12 +13,14 @@ use vc_app::{
     NoiseGateShaping, OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot,
 };
 use vc_core::gpu::{list_cuda_devices, GpuDevice};
+use vc_core::validation::CONVERSION_TIMING_LIMITS;
 use vc_core::Provider;
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 const TELEMETRY_REFRESH: Duration = Duration::from_millis(250);
 const GUI_CROSSFADE_MS: u32 = 85;
 const GUI_SOLA_SEARCH_MS: u32 = 12;
+const GUI_MIN_EXTRA_CONVERT_MS: u32 = 100;
 const RMS_HEALTHY_MIN: f32 = 0.01;
 const RMS_HEALTHY_MAX: f32 = 0.10;
 const RMS_HIGH_MAX: f32 = 0.25;
@@ -211,6 +213,7 @@ impl GuiSettings {
         self.wasapi_buffer_ms = 0;
         self.crossfade_ms = GUI_CROSSFADE_MS;
         self.sola_search_ms = GUI_SOLA_SEARCH_MS;
+        self.extra_convert_ms = self.extra_convert_ms.max(GUI_MIN_EXTRA_CONVERT_MS);
         if !provider_names().contains(&self.provider.as_str()) {
             self.provider = default_provider_name().to_string();
         }
@@ -242,6 +245,11 @@ impl GuiSettings {
     }
 
     fn realtime(&self) -> Result<RealtimeConfig, String> {
+        if self.extra_convert_ms < GUI_MIN_EXTRA_CONVERT_MS {
+            return Err(format!(
+                "Extra convert ms must be at least {GUI_MIN_EXTRA_CONVERT_MS} ms in the GUI"
+            ));
+        }
         Ok(RealtimeConfig {
             model: path_option(&self.model),
             embedder: path_option(&self.embedder),
@@ -525,12 +533,22 @@ impl eframe::App for VcGui {
             ui.separator();
             ui.heading("Engine configuration (Apply to restart)");
             changed |= ui
-                .add(egui::Slider::new(&mut self.settings.chunk_ms, 40..=1000).text("Chunk ms"))
+                .add(
+                    egui::Slider::new(
+                        &mut self.settings.chunk_ms,
+                        CONVERSION_TIMING_LIMITS.min_chunk_ms
+                            ..=CONVERSION_TIMING_LIMITS.max_chunk_ms,
+                    )
+                    .text("Chunk ms"),
+                )
                 .changed();
             changed |= ui
                 .add(
-                    egui::Slider::new(&mut self.settings.extra_convert_ms, 0..=2000)
-                        .text("Extra convert ms"),
+                    egui::Slider::new(
+                        &mut self.settings.extra_convert_ms,
+                        GUI_MIN_EXTRA_CONVERT_MS..=CONVERSION_TIMING_LIMITS.max_extra_convert_ms,
+                    )
+                    .text("Extra convert ms"),
                 )
                 .changed();
 
@@ -1025,6 +1043,7 @@ passthrough = true
             wasapi_buffer_ms: 1,
             crossfade_ms: 1,
             sola_search_ms: 99,
+            extra_convert_ms: 20,
             ..GuiSettings::default()
         };
 
@@ -1035,6 +1054,18 @@ passthrough = true
         assert_eq!(settings.wasapi_buffer_ms, 0);
         assert_eq!(settings.crossfade_ms, GUI_CROSSFADE_MS);
         assert_eq!(settings.sola_search_ms, GUI_SOLA_SEARCH_MS);
+        assert_eq!(settings.extra_convert_ms, GUI_MIN_EXTRA_CONVERT_MS);
+    }
+
+    #[test]
+    fn gui_realtime_rejects_extra_convert_below_gui_minimum() {
+        let settings = GuiSettings {
+            extra_convert_ms: GUI_MIN_EXTRA_CONVERT_MS - 1,
+            passthrough: true,
+            ..GuiSettings::default()
+        };
+
+        assert!(settings.realtime().is_err());
     }
 
     #[cfg(all(feature = "tensorrt", not(feature = "windowsml")))]

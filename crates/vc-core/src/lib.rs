@@ -22,5 +22,6 @@ pub mod model_rvc;
 #[cfg(feature = "rnnoise")]
 pub mod rnnoise;
 pub mod sola;
+pub mod validation;
 
 pub use provider::Provider;

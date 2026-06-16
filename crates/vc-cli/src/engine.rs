@@ -23,6 +23,8 @@ use crate::join_report::JoinReport;
 
 pub fn run_realtime(args: RunArgs) -> Result<()> {
     args.validate_audio_options().map_err(anyhow::Error::msg)?;
+    args.validate_conversion_options()
+        .map_err(anyhow::Error::msg)?;
     let denoiser_mode: DenoiserMode = args.denoiser_mode().into();
     let live = LiveParams {
         pitch_shift: args.pitch_shift,
@@ -125,6 +127,8 @@ fn smoothing_kind(smoother: Smoother) -> SmoothingKind {
 }
 
 pub fn run_wav(args: WavArgs) -> Result<()> {
+    args.validate_conversion_options()
+        .map_err(anyhow::Error::msg)?;
     let (mut samples, spec) = read_wav_mono(&args.input)?;
     let denoiser_mode = args.denoiser_mode();
     let pipeline_input_gain = if denoiser_mode == Denoiser::Rnnoise {
