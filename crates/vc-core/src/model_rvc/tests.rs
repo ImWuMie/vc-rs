@@ -10,7 +10,8 @@ use super::pitch::{
 };
 use super::shape::{
     aligned_rvc_input_len, keep_tail_in_place, onnx_silence_front_feature_frames,
-    output_len_from_convert_size, tensor_rt_model_input_samples_16k, RVC_SAMPLE_RATE,
+    output_len_from_convert_size, rmvpe_model_input_samples_16k,
+    rmvpe_model_input_samples_for_context_16k, tensor_rt_model_input_samples_16k, RVC_SAMPLE_RATE,
 };
 use super::stream::{RvcStreamState, VOLUME_DECAY};
 use super::tensorrt::{
@@ -112,12 +113,13 @@ fn derives_tensorrt_contentvec_profile_from_default_realtime_chunking() {
         tensor_rt_model_input_samples_16k(960, 48_000, 107, 48_000),
         18_240
     );
+    assert_eq!(rmvpe_model_input_samples_16k(960, 48_000), 4_960);
     let contentvec = TensorRtSessionProfile::single_input(ModelRole::ContentVec, "audio", 18_240);
-    let rmvpe = TensorRtSessionProfile::single_input(ModelRole::Rmvpe, "waveform", 18_240);
+    let rmvpe = TensorRtSessionProfile::single_input(ModelRole::Rmvpe, "waveform", 4_960);
     let rvc = TensorRtSessionProfile::rvc(114, 768);
 
     assert_eq!(contentvec.profile_shapes, "audio:1x18240");
-    assert_eq!(rmvpe.profile_shapes, "waveform:1x18240");
+    assert_eq!(rmvpe.profile_shapes, "waveform:1x4960");
     assert_eq!(
         rvc.profile_shapes,
         "feats:1x114x768,pitch:1x114,pitchf:1x114"
@@ -125,6 +127,28 @@ fn derives_tensorrt_contentvec_profile_from_default_realtime_chunking() {
     assert_eq!(
         tensor_rt_cache_key("feats:1x114x768,pitch:1x114,pitchf:1x114"),
         "feats_1x114x768_pitch_1x114_pitchf_1x114"
+    );
+}
+
+#[test]
+fn rmvpe_input_uses_upstream_rvc_bucket_boundaries() {
+    assert_eq!(rmvpe_model_input_samples_16k(12_960, 48_000), 4_960);
+    assert_eq!(rmvpe_model_input_samples_16k(13_440, 48_000), 10_080);
+    assert_eq!(rmvpe_model_input_samples_16k(28_320, 48_000), 10_080);
+    assert_eq!(rmvpe_model_input_samples_16k(28_800, 48_000), 15_200);
+    assert_eq!(rmvpe_model_input_samples_16k(43_680, 48_000), 15_200);
+    assert_eq!(rmvpe_model_input_samples_16k(44_160, 48_000), 20_320);
+}
+
+#[test]
+fn rmvpe_input_is_capped_to_available_context_without_padding() {
+    assert_eq!(
+        rmvpe_model_input_samples_for_context_16k(13_440, 48_000, 4_480),
+        4_480
+    );
+    assert_eq!(
+        rmvpe_model_input_samples_for_context_16k(13_440, 48_000, 12_000),
+        10_080
     );
 }
 
@@ -425,6 +449,27 @@ fn stream_state_pitch_update_writes_short_rmvpe_to_tail() {
     state.update_pitchf_from_rmvpe_frames(&[10.0, 20.0, 30.0]);
 
     assert_eq!(state.pitchf_buffer, vec![1.0, 2.0, 10.0, 20.0, 30.0]);
+}
+
+#[test]
+fn stream_state_pitch_update_places_rmvpe_tail_window_at_absolute_frame() {
+    let mut state = RvcStreamState::new();
+    state.pitchf_buffer = (0..34).map(|frame| frame as f32).collect();
+
+    state.update_pitchf_from_rmvpe_window(&[100.0, 101.0, 102.0, 103.0], 480);
+
+    assert_eq!(state.pitchf_buffer[2], 2.0);
+    assert_eq!(&state.pitchf_buffer[3..7], &[100.0, 101.0, 102.0, 103.0]);
+}
+
+#[test]
+fn stream_state_pitch_update_drops_center_padded_tail_frame() {
+    let mut state = RvcStreamState::new();
+    state.pitchf_buffer = vec![0.0, 1.0, 2.0];
+
+    state.update_pitchf_from_rmvpe_window(&[10.0, 20.0, 30.0, 40.0], 0);
+
+    assert_eq!(state.pitchf_buffer, vec![10.0, 20.0, 30.0]);
 }
 
 #[test]

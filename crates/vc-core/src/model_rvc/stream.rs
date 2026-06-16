@@ -4,7 +4,7 @@ use crate::dsp;
 
 use super::shape::{
     feature_len_for_samples, keep_tail_in_place, samples_between_rates, tensor_rt_convert_size_16k,
-    Rounding, EMBEDDER_SAMPLE_RATE, RVC_SAMPLE_RATE,
+    Rounding, EMBEDDER_SAMPLE_RATE, RMVPE_FRAME_SAMPLES_16K, RVC_SAMPLE_RATE,
 };
 
 pub(super) const VOLUME_DECAY: f32 = 0.97;
@@ -217,5 +217,25 @@ impl RvcStreamState {
         // tail of f0 instead shifts the pitch contour later in time.
         let dst_start = self.pitchf_buffer.len() - n;
         self.pitchf_buffer[dst_start..].copy_from_slice(&f0[..n]);
+    }
+
+    pub(super) fn update_pitchf_from_rmvpe_window(
+        &mut self,
+        f0: &[f32],
+        window_start_samples_16k: usize,
+    ) {
+        let dst_start = window_start_samples_16k / RMVPE_FRAME_SAMPLES_16K;
+        if dst_start >= self.pitchf_buffer.len() {
+            return;
+        }
+        let n = (self.pitchf_buffer.len() - dst_start).min(f0.len());
+        if n == 0 {
+            return;
+        }
+        // RMVPE emits one center-padded frame past `(samples / hop)` for the
+        // upstream bucket sizes. Copy from the front and let any trailing frame
+        // fall off, matching the full-window WebUI assignment above while
+        // preserving the absolute frame offset of a tail-only RMVPE window.
+        self.pitchf_buffer[dst_start..dst_start + n].copy_from_slice(&f0[..n]);
     }
 }

@@ -272,10 +272,9 @@ pub(super) struct TensorRtWarmupInfo {
     pub(super) contentvec_output_shape: Vec<i64>,
 }
 
-// ContentVec and RMVPE consume the same fixed 16 kHz waveform. Keep this tensor
-// pipeline-owned so both sessions bind one stable CUDA address; per-session
-// waveform tensors would duplicate H2D work and break the point of CUDA Graph
-// input-address capture.
+// ContentVec keeps the full fixed 16 kHz context in a pipeline-owned tensor so
+// CUDA Graph replay can bind one stable device address. RMVPE uses its upstream
+// RVC bucket window and therefore owns a separate input binding.
 #[cfg(feature = "ort")]
 pub(super) struct TensorRtSharedWaveform {
     pub(super) host_waveform: Tensor<f32>,
@@ -298,7 +297,7 @@ impl TensorRtSharedWaveform {
             .context("failed to allocate shared CUDA waveform input")?;
         copy_f32_tensor_to_device(&host_waveform, &mut device_waveform, "shared_waveform")?;
         info!(
-            "GPU shared waveform input allocated shape={} consumers=contentvec,rmvpe host_memory=CUDA_PINNED/CPUInput device_memory=CUDA/Default",
+            "GPU shared waveform input allocated shape={} consumers=contentvec host_memory=CUDA_PINNED/CPUInput device_memory=CUDA/Default",
             format_usize_shape(shape)
         );
         Ok(Self {

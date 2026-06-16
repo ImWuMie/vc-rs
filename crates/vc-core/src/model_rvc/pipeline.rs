@@ -19,7 +19,8 @@ use super::pitch::{
 use super::sessions::{HubertEmbedderSession, RmvpePitchSession, RvcModelSession};
 use super::shape::{
     extra_convert_samples_from_ms, keep_tail_in_place, ms_to_samples,
-    onnx_silence_front_feature_frames, tensor_rt_model_input_samples_16k, RVC_SAMPLE_RATE,
+    onnx_silence_front_feature_frames, rmvpe_model_input_samples_for_context_16k,
+    tensor_rt_model_input_samples_16k, RVC_SAMPLE_RATE,
 };
 use super::stream::RvcStreamState;
 use super::tensorrt::{
@@ -109,6 +110,7 @@ pub struct RvcPipeline {
     output_extra_ms: u32,
     volume_excluded_ms: u32,
     extra_convert_samples: usize,
+    rmvpe_input_samples_16k: usize,
     output_gain: f32,
     volume_envelope: bool,
     rms_mix_rate: f32,
@@ -356,6 +358,17 @@ impl RvcPipeline {
         // The RVC shape and trimming code below use the fixed 48 kHz model domain, so keep the
         // conversion at load time and leave the per-chunk processing path in samples.
         let extra_convert_samples = extra_convert_samples_from_ms(config.extra_convert_ms);
+        let input_samples_16k = tensor_rt_model_input_samples_16k(
+            config.chunk_samples,
+            config.sample_rate,
+            config.output_extra_ms,
+            extra_convert_samples,
+        );
+        let rmvpe_input_samples_16k = rmvpe_model_input_samples_for_context_16k(
+            config.chunk_samples,
+            config.sample_rate,
+            input_samples_16k,
+        );
         report_progress(
             &config,
             LoadProgress::LoadingModel {
@@ -419,6 +432,7 @@ impl RvcPipeline {
             output_extra_ms: config.output_extra_ms,
             volume_excluded_ms: config.volume_excluded_ms,
             extra_convert_samples,
+            rmvpe_input_samples_16k,
             output_gain: config.output_gain,
             volume_envelope: config.output_dynamics.volume_envelope,
             rms_mix_rate: config.output_dynamics.rms_mix_rate,
@@ -480,6 +494,11 @@ impl RvcPipeline {
             config.output_extra_ms,
             extra_convert_samples,
         );
+        let rmvpe_input_samples_16k = rmvpe_model_input_samples_for_context_16k(
+            config.chunk_samples,
+            config.sample_rate,
+            input_samples_16k,
+        );
         let (contentvec_model_cache_key, rmvpe_model_cache_key, rvc_model_cache_key) =
             if provider_needs_fixed_shape_profile(config.provider) {
                 (
@@ -506,11 +525,14 @@ impl RvcPipeline {
         .with_gpu_priority(config.gpu_priority)
         .with_gpu_device_id(gpu_device_id)
         .with_optional_model_cache_key(contentvec_model_cache_key);
-        let rmvpe_profile =
-            TensorRtSessionProfile::single_input(ModelRole::Rmvpe, "waveform", input_samples_16k)
-                .with_gpu_priority(config.gpu_priority)
-                .with_gpu_device_id(gpu_device_id)
-                .with_optional_model_cache_key(rmvpe_model_cache_key);
+        let rmvpe_profile = TensorRtSessionProfile::single_input(
+            ModelRole::Rmvpe,
+            "waveform",
+            rmvpe_input_samples_16k,
+        )
+        .with_gpu_priority(config.gpu_priority)
+        .with_gpu_device_id(gpu_device_id)
+        .with_optional_model_cache_key(rmvpe_model_cache_key);
         #[cfg(feature = "ort")]
         let shared_waveform_shape = [1usize, input_samples_16k];
         #[cfg(feature = "ort")]
@@ -573,8 +595,8 @@ impl RvcPipeline {
                     TensorRtRunMode::PinnedCpu,
                     TensorRtSessionPurpose::Probe,
                 )?;
-                let rmvpe_output_shape =
-                    pitch_probe.warmup_output_shape(input_samples_16k, config.f0.f0_threshold)?;
+                let rmvpe_output_shape = pitch_probe
+                    .warmup_output_shape(rmvpe_input_samples_16k, config.f0.f0_threshold)?;
                 drop(pitch_probe);
 
                 report_progress(
@@ -628,11 +650,7 @@ impl RvcPipeline {
                     tensor_rt_run_mode,
                     TensorRtSessionPurpose::Final,
                 )?;
-                pitch.enable_tensorrt_binding(
-                    &rmvpe_output_shape,
-                    config.f0.f0_threshold,
-                    shared_waveform.as_ref(),
-                )?;
+                pitch.enable_tensorrt_binding(&rmvpe_output_shape, config.f0.f0_threshold, None)?;
 
                 let mut rvc = RvcModelSession::load(
                     config.model,
@@ -712,7 +730,7 @@ impl RvcPipeline {
                 tensor_rt_run_mode,
                 TensorRtSessionPurpose::Final,
             )?;
-            pitch.warmup_output_shape(input_samples_16k, config.f0.f0_threshold)?;
+            pitch.warmup_output_shape(rmvpe_input_samples_16k, config.f0.f0_threshold)?;
 
             (embedder, pitch, rvc)
         } else {
@@ -792,12 +810,8 @@ impl RvcPipeline {
                     TensorRtSessionPurpose::Final,
                 )?;
                 let rmvpe_output_shape =
-                    pitch.warmup_output_shape(input_samples_16k, config.f0.f0_threshold)?;
-                pitch.enable_tensorrt_binding(
-                    &rmvpe_output_shape,
-                    config.f0.f0_threshold,
-                    shared_waveform.as_ref(),
-                )?;
+                    pitch.warmup_output_shape(rmvpe_input_samples_16k, config.f0.f0_threshold)?;
+                pitch.enable_tensorrt_binding(&rmvpe_output_shape, config.f0.f0_threshold, None)?;
 
                 report_progress(
                     &config,
@@ -843,6 +857,7 @@ impl RvcPipeline {
             output_extra_ms: config.output_extra_ms,
             volume_excluded_ms: config.volume_excluded_ms,
             extra_convert_samples,
+            rmvpe_input_samples_16k,
             output_gain: config.output_gain,
             volume_envelope: config.output_dynamics.volume_envelope,
             rms_mix_rate: config.output_dynamics.rms_mix_rate,
@@ -1019,12 +1034,12 @@ impl VoiceModel for RvcPipeline {
         #[cfg(feature = "ort")]
         if let Some(shared_waveform) = self.shared_waveform.as_mut() {
             // Shared CUDA input is charged to embedder_time because the public
-            // metrics do not have a separate transfer bucket. Keep this copy
-            // before both ContentVec and RMVPE runs; CUDA Graph capture depends
-            // on the bound device address staying stable across chunks.
+            // metrics do not have a separate transfer bucket. RMVPE uses a
+            // separate upstream-RVC bucket window, so this stable device address
+            // is now owned by ContentVec only.
             let h2d_us = shared_waveform.copy_from_slice(&self.stream_state.audio_16k_buffer)?;
             debug!(
-                "shared waveform h2d backend={} samples={} consumers=contentvec,rmvpe h2d_us={}",
+                "shared waveform h2d backend={} samples={} consumers=contentvec h2d_us={}",
                 self.embedder.provider.label(),
                 self.stream_state.audio_16k_buffer.len(),
                 h2d_us
@@ -1080,11 +1095,17 @@ impl VoiceModel for RvcPipeline {
         // shift. pitch_shift is applied once in f0_postprocess after smoothing,
         // so clamp/octave/median act on natural F0. pitchf_buffer therefore
         // accumulates raw F0 (see the guardrail above the post-process call).
-        let pitchf_raw =
-            self.pitch
-                .extract(&self.stream_state.audio_16k_buffer, 0.0, self.f0_threshold)?;
+        let audio_16k_len = self.stream_state.audio_16k_buffer.len();
+        let rmvpe_input_samples_16k = self.rmvpe_input_samples_16k.min(audio_16k_len);
+        let rmvpe_window_start_samples = audio_16k_len - rmvpe_input_samples_16k;
+        let rmvpe_audio_16k = &self.stream_state.audio_16k_buffer[rmvpe_window_start_samples..];
+        let pitchf_raw = self
+            .pitch
+            .extract(rmvpe_audio_16k, 0.0, self.f0_threshold)?;
+        let rmvpe_audio_16k_len = rmvpe_audio_16k.len();
+        let pitchf_raw_len = pitchf_raw.len();
         self.stream_state
-            .update_pitchf_from_rmvpe_frames(pitchf_raw);
+            .update_pitchf_from_rmvpe_window(pitchf_raw, rmvpe_window_start_samples);
         let pitch_frames = self.stream_state.pitchf_buffer.len();
         let pitch_time = pitch_start.elapsed();
         // RMVPE's center-padded STFT and ContentVec's convolutional frontend do
@@ -1116,9 +1137,11 @@ impl VoiceModel for RvcPipeline {
         );
         let pitchf = self.pitchf_postprocessed_scratch.as_slice();
         debug!(
-            "pitch update: audio_16k_samples={}, pitchf_raw_len={}, pitchf_buffer_len={}, feature_len={}",
+            "pitch update: audio_16k_samples={}, rmvpe_input_samples={}, rmvpe_window_start_samples={}, pitchf_raw_len={}, pitchf_buffer_len={}, feature_len={}",
             self.stream_state.audio_16k_buffer.len(),
-            pitchf_raw.len(),
+            rmvpe_audio_16k_len,
+            rmvpe_window_start_samples,
+            pitchf_raw_len,
             self.stream_state.pitchf_buffer.len(),
             feature_len,
         );
@@ -1295,6 +1318,7 @@ impl std::fmt::Debug for RvcPipeline {
             .field("output_extra_ms", &self.output_extra_ms)
             .field("volume_excluded_ms", &self.volume_excluded_ms)
             .field("extra_convert_samples", &self.extra_convert_samples)
+            .field("rmvpe_input_samples_16k", &self.rmvpe_input_samples_16k)
             .field("output_gain", &self.output_gain)
             .field("volume_envelope", &self.volume_envelope)
             .field("rms_mix_rate", &self.rms_mix_rate)

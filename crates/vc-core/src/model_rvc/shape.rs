@@ -4,6 +4,9 @@
 pub(super) const EMBEDDER_SAMPLE_RATE: u32 = 16_000;
 pub(super) const RVC_SAMPLE_RATE: u32 = 48_000;
 pub(super) const CONTENTVEC_CONTEXT_ALIGN_SAMPLES: usize = 320;
+pub(super) const RMVPE_FRAME_SAMPLES_16K: usize = 160;
+pub(super) const RMVPE_BUCKET_FRAMES: usize = 32;
+pub(super) const RMVPE_GUARD_FRAMES: usize = 5;
 
 pub(super) fn ms_to_samples(sample_rate: u32, ms: u32) -> usize {
     ((sample_rate as u64 * ms as u64) / 1000) as usize
@@ -117,6 +120,24 @@ pub(super) fn tensor_rt_model_input_samples_16k(
         ms_to_samples(RVC_SAMPLE_RATE, output_extra_ms),
         extra_convert_samples,
     )
+}
+
+pub(super) fn rmvpe_model_input_samples_16k(chunk_samples: usize, sample_rate: u32) -> usize {
+    // Match upstream RVC's RMVPE framing: 10 ms hop at 16 kHz, then mel2hidden
+    // pads hidden frames to 32-frame buckets. The guard frames preserve a small
+    // amount of F0 context without coupling RMVPE to ContentVec's larger window.
+    let chunk_frames = (chunk_samples as u64 * 100).div_ceil(sample_rate as u64) as usize;
+    let required_frames = chunk_frames.saturating_add(RMVPE_GUARD_FRAMES).max(1);
+    let bucket_frames = align_up(required_frames, RMVPE_BUCKET_FRAMES);
+    bucket_frames.saturating_sub(1) * RMVPE_FRAME_SAMPLES_16K
+}
+
+pub(super) fn rmvpe_model_input_samples_for_context_16k(
+    chunk_samples: usize,
+    sample_rate: u32,
+    max_context_samples_16k: usize,
+) -> usize {
+    rmvpe_model_input_samples_16k(chunk_samples, sample_rate).min(max_context_samples_16k)
 }
 
 pub(super) fn tensor_rt_convert_size_16k(
