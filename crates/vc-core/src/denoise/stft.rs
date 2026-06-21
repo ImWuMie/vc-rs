@@ -16,11 +16,6 @@
 //! audio-quality change, not cleanup. `realfft` does not normalize, so the
 //! inverse is scaled by `1 / n_fft` here.
 
-// This whole module is a building block exercised only by its own tests until
-// the ort-backed `gtcrn.rs` frame processor consumes it (a later phase). Remove
-// this allow when `gtcrn.rs` lands and wires the STFT into a `FrameDenoiser`.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use anyhow::Result;
