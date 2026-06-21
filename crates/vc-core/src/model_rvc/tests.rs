@@ -432,26 +432,6 @@ fn pitchf_tail_for_output_matches_10ms_output_frames() {
 }
 
 #[test]
-fn stream_state_updates_pitchf_buffer_like_vcclient() {
-    let mut state = RvcStreamState::new();
-    state.pitchf_buffer = vec![0.0, 1.0, 2.0];
-
-    state.update_pitchf_from_rmvpe_frames(&[10.0, 20.0, 30.0, 40.0, 50.0]);
-
-    assert_eq!(state.pitchf_buffer, vec![10.0, 20.0, 30.0]);
-}
-
-#[test]
-fn stream_state_pitch_update_writes_short_rmvpe_to_tail() {
-    let mut state = RvcStreamState::new();
-    state.pitchf_buffer = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-
-    state.update_pitchf_from_rmvpe_frames(&[10.0, 20.0, 30.0]);
-
-    assert_eq!(state.pitchf_buffer, vec![1.0, 2.0, 10.0, 20.0, 30.0]);
-}
-
-#[test]
 fn stream_state_pitch_update_places_rmvpe_tail_window_at_absolute_frame() {
     let mut state = RvcStreamState::new();
     state.pitchf_buffer = (0..34).map(|frame| frame as f32).collect();

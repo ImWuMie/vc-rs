@@ -206,19 +206,6 @@ impl RvcStreamState {
         })
     }
 
-    pub(super) fn update_pitchf_from_rmvpe_frames(&mut self, f0: &[f32]) {
-        let n = self.pitchf_buffer.len().min(f0.len());
-        if n == 0 {
-            return;
-        }
-        // Match the WebUI pitch cache assignment:
-        // `pitchf[-f0_len:] = f0[:pitchf_len]`. RMVPE usually emits one
-        // center-padded frame beyond the model pitch buffer, and taking the
-        // tail of f0 instead shifts the pitch contour later in time.
-        let dst_start = self.pitchf_buffer.len() - n;
-        self.pitchf_buffer[dst_start..].copy_from_slice(&f0[..n]);
-    }
-
     pub(super) fn update_pitchf_from_rmvpe_window(
         &mut self,
         f0: &[f32],
