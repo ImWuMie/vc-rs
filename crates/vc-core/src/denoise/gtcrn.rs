@@ -78,7 +78,10 @@ impl GtcrnCaches {
 /// interleaved) into `enh`, advancing the caches in place. Implementations do
 /// only the tensor I/O; the STFT and cache bookkeeping stay in
 /// [`GtcrnFrameProcessor`].
-trait InferSession {
+///
+/// `Send` because the whole pipeline (and thus the boxed session) is moved onto
+/// the inference worker thread.
+trait InferSession: Send {
     fn run(&mut self, mix: &[f32], caches: &mut GtcrnCaches, enh: &mut [f32]) -> Result<()>;
 }
 

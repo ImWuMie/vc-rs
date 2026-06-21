@@ -84,6 +84,12 @@ pub(super) struct RvcStreamState {
     pub(super) prev_silence: bool,
     pub(super) sample_rate: u32,
     pub(super) resampler_16k: Option<dsp::StreamingResampleMono>,
+    // GTCRN input denoiser applied to each new 16 kHz increment before it is
+    // appended to the windowed `audio_16k_buffer` (the RVC-path seam). `Some`
+    // only when the pipeline was built with `load_with_gtcrn`. At 16 kHz the
+    // adapter's resamplers are bypass, so only its frame FIFO + fixed delay run.
+    #[cfg(feature = "gtcrn")]
+    pub(super) gtcrn: Option<crate::denoise::GtcrnDenoiser>,
 }
 
 impl RvcStreamState {
@@ -96,6 +102,8 @@ impl RvcStreamState {
             prev_silence: false,
             sample_rate: 0,
             resampler_16k: None,
+            #[cfg(feature = "gtcrn")]
+            gtcrn: None,
         }
     }
 
@@ -118,6 +126,12 @@ impl RvcStreamState {
                 sample_rate as usize,
                 EMBEDDER_SAMPLE_RATE as usize,
             )?);
+            // A device sample-rate change restarts the stream; reset GTCRN's
+            // fixed-delay/cache state so it does not emit pre-restart audio.
+            #[cfg(feature = "gtcrn")]
+            if let Some(gtcrn) = self.gtcrn.as_mut() {
+                gtcrn.reset()?;
+            }
         }
 
         let new_audio_16k_samples = samples_between_rates(
@@ -128,10 +142,21 @@ impl RvcStreamState {
         );
         let new_feature_len = feature_len_for_samples(new_audio_16k_samples, EMBEDDER_SAMPLE_RATE);
         self.audio_buffer.extend_from_slice(new_audio);
+        let new_16k_start = self.audio_16k_buffer.len();
         self.resampler_16k
             .as_mut()
             .ok_or_else(|| anyhow!("16kHz stream resampler is not initialized"))?
             .process_into(new_audio, &mut self.audio_16k_buffer)?;
+        // GTCRN denoises exactly the new 16 kHz increment, in place, BEFORE the
+        // windowing below. Guardrail: process only the increment, never the
+        // re-windowed `audio_16k_buffer`, so its length — and thus
+        // `new_audio_16k_samples` and the ContentVec/F0 window length — stays
+        // unchanged. The fixed delay is internal (adds latency, never shifts the
+        // sample grid). Each sample is denoised exactly once, at append time.
+        #[cfg(feature = "gtcrn")]
+        if let Some(gtcrn) = self.gtcrn.as_mut() {
+            gtcrn.process_in_place(&mut self.audio_16k_buffer[new_16k_start..])?;
+        }
         self.pitchf_buffer
             .extend(std::iter::repeat_n(0.0, new_feature_len));
 

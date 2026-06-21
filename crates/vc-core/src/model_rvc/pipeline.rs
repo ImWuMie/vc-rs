@@ -347,6 +347,26 @@ impl RvcPipeline {
         Ok(pipeline)
     }
 
+    /// Load with GTCRN input denoising at the 16 kHz RVC seam. Unlike RNNoise
+    /// (a device-rate `InputDenoiser`), GTCRN lives in the stream state and
+    /// denoises the new 16 kHz increment inside `generate_input`.
+    #[cfg(feature = "gtcrn")]
+    pub fn load_with_gtcrn(
+        config: RvcPipelineConfig<'_>,
+        gtcrn: crate::denoise::GtcrnConfig<'_>,
+    ) -> Result<Self> {
+        if config.noise_gate_enabled {
+            bail!("GTCRN and the input noise gate are mutually exclusive");
+        }
+        // Build the adapter at 16 kHz so its resamplers are bypass — only the
+        // hop FIFO and fixed delay run on the increment fed by `resampler_16k`.
+        let denoiser =
+            crate::denoise::GtcrnDenoiser::new(gtcrn, super::shape::EMBEDDER_SAMPLE_RATE)?;
+        let mut pipeline = Self::load(config)?;
+        pipeline.stream_state.gtcrn = Some(denoiser);
+        Ok(pipeline)
+    }
+
     pub fn load(config: RvcPipelineConfig<'_>) -> Result<Self> {
         report_progress(&config, LoadProgress::ValidatingConfig);
         if provider_needs_fixed_shape_profile(config.provider) {
@@ -905,6 +925,12 @@ impl RvcPipeline {
         if matches!(self.input_denoiser, InputDenoiser::Rnnoise(_)) {
             return;
         }
+        // GTCRN owns the 16 kHz input-denoise seam in `stream_state`; a live gate
+        // toggle must never build a device-rate gate that would fight it.
+        #[cfg(feature = "gtcrn")]
+        if self.stream_state.gtcrn.is_some() {
+            return;
+        }
         if !enabled {
             self.input_denoiser = InputDenoiser::Off;
             return;
@@ -957,7 +983,17 @@ impl RvcPipeline {
                 floor: self.noise_gate_floor,
             },
         )?;
+        // Preserve the loaded GTCRN denoiser across a context reset, but reset its
+        // fixed-delay/cache state (mirroring the RNNoise reset above) so it does
+        // not emit audio captured before the pause.
+        #[cfg(feature = "gtcrn")]
+        let gtcrn = self.stream_state.gtcrn.take();
         self.stream_state = RvcStreamState::new();
+        #[cfg(feature = "gtcrn")]
+        if let Some(mut gtcrn) = gtcrn {
+            gtcrn.reset()?;
+            self.stream_state.gtcrn = Some(gtcrn);
+        }
         self.input_scratch.clear();
         self.feature_tensor = FeatureTensor::default();
         self.input_reference_scratch.clear();
