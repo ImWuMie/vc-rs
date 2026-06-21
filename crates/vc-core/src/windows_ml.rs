@@ -68,7 +68,7 @@ extern "system" {
 }
 
 struct BootstrapState {
-    _module: Hmodule,
+    _module: Option<Hmodule>,
 }
 
 unsafe impl Send for BootstrapState {}
@@ -321,24 +321,31 @@ fn initialize_inner() -> Result<BootstrapState> {
         .unwrap_or_else(|_| "Microsoft.WindowsAppRuntime.Bootstrap.dll".to_string());
     let wide_path = wide(&bootstrap_path);
     let module = unsafe { LoadLibraryW(wide_path.as_ptr()) };
-    if module.is_null() {
-        bail!(
-            "failed to load {bootstrap_path}; install Windows App SDK Runtime 2.x and place Microsoft.WindowsAppRuntime.Bootstrap.dll beside the executable/plugin, or set {WINDOWS_ML_BOOTSTRAP_ENV}"
+    let module = if module.is_null() {
+        // Store/MSIX packages declare Microsoft.WindowsAppRuntime.2 as a
+        // framework dependency, so the runtime DLLs are already in the package
+        // graph and the unpackaged-app bootstrapper is intentionally absent.
+        // Standalone ZIP/VST3 builds still bundle the bootstrapper and take the
+        // branch below to add the runtime package graph dynamically.
+        warn!(
+            "Windows App SDK bootstrapper {bootstrap_path} was not found; trying packaged Windows App Runtime dependency"
         );
-    }
-
-    let initialize2: MddBootstrapInitialize2 =
-        unsafe { load_symbol(module, b"MddBootstrapInitialize2\0")? };
-    check_hr(
-        unsafe { initialize2(WINDOWS_APP_SDK_2_1, ptr::null(), 0, 0) },
-        "MddBootstrapInitialize2(Windows App SDK Runtime 2.1)",
-    )
-    .context(
-        "failed to initialize Windows App SDK Runtime 2.1; install WindowsAppRuntime.2 2.1 or newer",
-    )?;
+        None
+    } else {
+        let initialize2: MddBootstrapInitialize2 =
+            unsafe { load_symbol(module, b"MddBootstrapInitialize2\0")? };
+        check_hr(
+            unsafe { initialize2(WINDOWS_APP_SDK_2_1, ptr::null(), 0, 0) },
+            "MddBootstrapInitialize2(Windows App SDK Runtime 2.1)",
+        )
+        .context(
+            "failed to initialize Windows App SDK Runtime 2.1; install WindowsAppRuntime.2 2.1 or newer",
+        )?;
+        Some(module)
+    };
 
     let committed = ort::init_from("onnxruntime.dll")
-        .context("failed to load Windows ML ONNX Runtime from Windows App SDK Runtime")?
+        .context("failed to load Windows ML ONNX Runtime from Windows App Runtime")?
         .commit();
     if !committed {
         bail!(

@@ -19,6 +19,21 @@ Do not assemble release archives manually from `target\release` or
 `target\bundled`. The packaging scripts apply release flags, isolate variants,
 populate runtime dependencies, and copy license material.
 
+Microsoft Store submission uses a narrower Windows ML GUI-only MSIX:
+
+```powershell
+pwsh scripts/package-store-msix.ps1 -BuildPackage `
+  -PackageName <Partner-Center-package-identity-name> `
+  -Publisher "CN=<Partner-Center-publisher>"
+```
+
+The script starts from the `app-windowsml` package output, then creates a
+temporary Store staging directory containing only `vc-gui.exe`, the Windows ML
+framework dependency declaration, install notes, generated MSIX assets, and the
+GUI-relevant license files. It packages that stage through `winapp package`. It
+must not ship the CLI, VST3 bundle, TensorRT runtime files, local models, caches,
+logs, or developer-machine state.
+
 ## Package Contents
 
 Packages must not contain:
@@ -178,6 +193,18 @@ Review these known limitations before release:
   unexpected files into a package staging directory.
 - `-SkipBuild` does not prove that the reused binary matches the requested
   backend variant.
+- `package-store-msix.ps1` requires the Windows App Development CLI
+  (`winget install Microsoft.WinAppCli`) and creates an unsigned MSIX unless
+  `-PfxPath` is provided. The default MSIX identity is for local packaging only;
+  Store submission must use the package name and publisher reserved in Partner
+  Center. The `-CreateTestCertificate` path uses `winapp cert generate` and is
+  for local install testing only; it must not be used for Store submission. The
+  `-TrustTestRootCertificate` option is a persistent local trust decision and
+  must only be used with disposable test certificates. The
+  `-TrustTestMachineCertificate` option uses `winapp cert install`, writes
+  machine-level trust, and must only be used on local test machines. Store
+  metadata, privacy/support URLs, code-signing, and Partner Center validation
+  remain release-owner responsibilities.
 
 Do not weaken these safeguards or dismiss these limitations without replacing
 them with an equivalent or stronger automated check.

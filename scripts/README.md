@@ -148,6 +148,100 @@ Flags:
 - `-OutDir <dir>` — where the `.zip` files (and kept folders) land (default `dist\`).
 - `-ContinueOnError` — keep building after a failure and report a summary.
 
+## Build the Microsoft Store GUI MSIX
+
+Store MSIX packaging uses the Windows App Development CLI:
+
+```powershell
+winget install Microsoft.WinAppCli
+```
+
+For Store submission as an MSIX package, use:
+
+```powershell
+pwsh scripts/package-store-msix.ps1 -BuildPackage `
+  -PackageName <Partner-Center-package-identity-name> `
+  -Publisher "CN=<Partner-Center-publisher>"
+# or:
+just store-msix -BuildPackage
+```
+
+This consumes only the `app-windowsml` package output, creates a trimmed staging
+directory under `tmp\store-msix-stage`, then runs `winapp package` to write:
+
+```text
+dist\vc-rs-windowsml-gui-store-v<version>-win-x64.msix
+```
+
+The MSIX is unsigned unless `-PfxPath <cert.pfx>` is supplied. Local installation
+requires a trusted certificate whose subject matches `-Publisher`. For Partner
+Center submission, replace the default `-PackageName` and `-Publisher` values
+with the identity reserved for the Store app.
+
+The Store MSIX intentionally excludes `vc-rs.exe`, VST3 bundles, TensorRT runtime
+files, local models, caches, logs, and development artifacts.
+It declares a Windows App Runtime framework dependency by default:
+`Microsoft.WindowsAppRuntime.2`, minimum version `2.1.0.0`. Store installation
+can resolve that dependency; local sideloading still requires the runtime package
+to be installed or supplied separately.
+
+Useful flags:
+- `-EmitOnly` — validate inputs, prepare `tmp\store-msix-stage`, and print the
+  `winapp package` command without packaging.
+- `-WinApp <path>` — use a specific `winapp.exe`; otherwise PATH/App Execution
+  Alias lookup is used.
+- `-PfxPath <cert.pfx>` / `-PfxPassword <password>` — sign the MSIX for local
+  installation/testing through `winapp package --cert`.
+- `-WindowsAppRuntimeDependencyName`, `-WindowsAppRuntimeDependencyMinVersion`,
+  `-WindowsAppRuntimeDependencyPublisher` — override the Store framework
+  dependency identity.
+- `-NoWindowsAppRuntimeDependency` — omit the framework dependency, only for
+  experiments.
+- `-IncludeWindowsAppRuntimeBootstrap` — also copy the unpackaged-app bootstrap
+  DLL into the MSIX; Store builds normally should not need this.
+- `-CreateTestCertificate` — create a temporary self-signed code-signing
+  certificate under `tmp\store-msix-cert` with `winapp cert generate`, set the
+  MSIX publisher to that certificate subject, and sign the MSIX. Existing test
+  PFX files are reused.
+- `-ForceNewTestCertificate` — replace the existing local test PFX/CER instead
+  of reusing it.
+- `-TrustTestCertificate` — with `-CreateTestCertificate`, import the public
+  certificate into `Cert:\CurrentUser\TrustedPeople`.
+- `-TrustTestRootCertificate` — with `-CreateTestCertificate`, also import the
+  certificate into `Cert:\CurrentUser\Root`. This is required for local MSIX
+  installation with a self-signed certificate and should only be used for
+  disposable local test certificates you generated yourself.
+- `-TrustTestMachineCertificate` — with `-CreateTestCertificate`, also import
+  the certificate into the local machine certificate stores using
+  `winapp cert install`. Run from an elevated PowerShell session; use this when
+  `Add-AppxPackage` still reports `0x800B0109` after the signature validates for
+  the current user.
+
+For a one-command local installable test package:
+
+```powershell
+pwsh scripts/package-store-msix.ps1 `
+  -CreateTestCertificate `
+  -TrustTestCertificate `
+  -TrustTestRootCertificate
+```
+
+If `Get-AuthenticodeSignature` reports `Valid` but `Add-AppxPackage` still fails
+with `0x800B0109`, rebuild from an elevated PowerShell session with machine-level
+trust:
+
+```powershell
+pwsh scripts/package-store-msix.ps1 `
+  -CreateTestCertificate `
+  -TrustTestCertificate `
+  -TrustTestRootCertificate `
+  -TrustTestMachineCertificate
+```
+
+The generated certificate is only for local testing. Do not use it for Store
+submission; Partner Center builds should pass the Store-reserved `-PackageName`
+and `-Publisher`.
+
 ## A/B audio-quality comparison
 
 To check whether a change altered the converted audio, compare two
