@@ -270,7 +270,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
 
 #[cfg(feature = "rnnoise")]
 fn process_rnnoise_finite(samples: &[f32], sample_rate: u32) -> Result<Vec<f32>> {
-    vc_core::rnnoise::RnnoiseDenoiser::process_finite(samples, sample_rate)
+    vc_core::denoise::RnnoiseDenoiser::process_finite(samples, sample_rate)
 }
 
 #[cfg(not(feature = "rnnoise"))]

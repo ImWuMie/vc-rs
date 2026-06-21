@@ -612,7 +612,7 @@ enum PassthroughDenoiser {
     Off,
     Gate(dsp::NoiseGate),
     #[cfg(feature = "rnnoise")]
-    Rnnoise(Box<vc_core::rnnoise::RnnoiseDenoiser>),
+    Rnnoise(Box<vc_core::denoise::RnnoiseDenoiser>),
 }
 
 struct PassthroughProcessor {
@@ -653,7 +653,7 @@ impl PassthroughProcessor {
             DenoiserMode::Rnnoise => {
                 #[cfg(feature = "rnnoise")]
                 {
-                    PassthroughDenoiser::Rnnoise(Box::new(vc_core::rnnoise::RnnoiseDenoiser::new(
+                    PassthroughDenoiser::Rnnoise(Box::new(vc_core::denoise::RnnoiseDenoiser::new(
                         self.input_rate,
                     )?))
                 }

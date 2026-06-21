@@ -40,7 +40,7 @@ enum InputDenoiser {
     Off,
     Gate(dsp::NoiseGate),
     #[cfg(feature = "rnnoise")]
-    Rnnoise(Box<crate::rnnoise::RnnoiseDenoiser>),
+    Rnnoise(Box<crate::denoise::RnnoiseDenoiser>),
 }
 
 impl InputDenoiser {
@@ -66,7 +66,7 @@ impl InputDenoiser {
             )),
             #[cfg(feature = "rnnoise")]
             InputDenoiser::Rnnoise(_) => InputDenoiser::Rnnoise(Box::new(
-                crate::rnnoise::RnnoiseDenoiser::new(sample_rate as u32)?,
+                crate::denoise::RnnoiseDenoiser::new(sample_rate as u32)?,
             )),
         };
         Ok(())
@@ -343,7 +343,7 @@ impl RvcPipeline {
         let sample_rate = config.sample_rate;
         let mut pipeline = Self::load(config)?;
         pipeline.input_denoiser =
-            InputDenoiser::Rnnoise(Box::new(crate::rnnoise::RnnoiseDenoiser::new(sample_rate)?));
+            InputDenoiser::Rnnoise(Box::new(crate::denoise::RnnoiseDenoiser::new(sample_rate)?));
         Ok(pipeline)
     }
 
