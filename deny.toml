@@ -47,7 +47,14 @@ allow = [
     "Ubuntu-font-1.0",
 ]
 # Per-crate license exceptions (crate + the SPDX it's allowed to use) go here.
-exceptions = []
+# audio_thread_priority is MPL-2.0 (weak, file-level copyleft); we pull it only
+# transitively via cpal's `realtime` feature, unmodified, so distributing it as a
+# statically-linked component imposes no obligation on our MIT source — we just
+# carry its notice (THIRD_PARTY_NOTICES.md). Scoped to this one crate rather than
+# opening MPL-2.0 in the global allow-list above.
+exceptions = [
+    { name = "audio_thread_priority", allow = ["MPL-2.0"] },
+]
 
 [bans]
 # Duplicate versions are a warning, not a failure: a single transitive dep often

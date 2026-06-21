@@ -29,6 +29,11 @@
     Where to write the .zip files. Default: <repo>\dist. Forwarded to each
     package.ps1.
 
+.PARAMETER Asio
+    (app targets) Build vc-rs.exe/vc-gui.exe with the opt-in ASIO audio backend.
+    Requires LLVM/libclang and the Steinberg ASIO SDK on this machine (see
+    scripts\README.md). The vst3 targets ignore it.
+
 .PARAMETER RuntimeOnly
     (tensorrt targets) Bundle only the runtime DLLs (no engine builder).
     Forwarded to both tensorrt packages.
@@ -53,12 +58,21 @@
 .EXAMPLE
     # Smallest TensorRT packages (engines built/cached elsewhere):
     pwsh scripts\package-all.ps1 -Targets app-tensorrt,vst3-tensorrt -RuntimeOnly
+
+.EXAMPLE
+    # App packages with the ASIO backend (needs LLVM + Steinberg ASIO SDK):
+    pwsh scripts\package-all.ps1 -Targets app-windowsml -Asio
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('app-windowsml', 'app-tensorrt', 'cli-windowsml', 'cli-tensorrt', 'vst3-windowsml', 'vst3-tensorrt')]
     [string[]]$Targets = @('app-windowsml', 'app-tensorrt', 'vst3-windowsml', 'vst3-tensorrt'),
     [string]$OutDir,
+
+    # app targets: build vc-rs.exe/vc-gui.exe with the opt-in ASIO backend. Needs
+    # LLVM + the Steinberg ASIO SDK (see scripts\README.md). Ignored by the vst3
+    # targets (the plugin uses the DAW's I/O).
+    [switch]$Asio,
 
     # tensorrt targets
     [switch]$RuntimeOnly,
@@ -103,6 +117,8 @@ foreach ($name in $plan.Keys) {
     $pkgArgs = @{ Variant = $spec.Variant; OutDir = $OutDir }
     if ($KeepStage) { $pkgArgs['KeepStage'] = $true }
     if ($CleanStage) { $pkgArgs['CleanStage'] = $true }
+    # ASIO only applies to the app package script; the vst3 script has no such param.
+    if ($Asio -and $spec.Script -eq $appScript) { $pkgArgs['Asio'] = $true }
     if ($spec.Variant -eq 'tensorrt') {
         if ($RuntimeOnly) { $pkgArgs['RuntimeOnly'] = $true }
         if ($PSBoundParameters.ContainsKey('TensorRtBin')) { $pkgArgs['TensorRtBin'] = $TensorRtBin }

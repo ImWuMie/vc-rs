@@ -27,11 +27,48 @@ const INPUT_QUEUE_CHUNKS: usize = 4;
 const OUTPUT_QUEUE_CHUNKS: usize = 4;
 const COMMAND_CAPACITY: usize = 8;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum AudioBackend {
-    #[default]
-    Cpal,
+/// OS audio host / API. Modelled on cpal's `HostId` (the canonical serialized
+/// tokens match: `wasapi`/`asio`/`coreaudio`/`alsa`/`jack`), so the same enum
+/// works across platforms. Every variant is always defined — selecting one that
+/// is unsupported on the running platform or build (e.g. ASIO without the `asio`
+/// feature, or CoreAudio on Windows) errors at open/enumeration time rather than
+/// being conditionally compiled away, which keeps frontend match arms and
+/// value-enums stable across targets.
+///
+/// "Backend" in user-facing surfaces (CLI flags, GUI labels) maps onto these. The
+/// shared-vs-exclusive choice is a separate option (`wasapi_*_exclusive`), not a
+/// host: WASAPI shared routes through cpal, WASAPI exclusive through the bespoke
+/// `wasapi_audio` path until cpal gains exclusive mode. See [`audio::cpal_host`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioHost {
     Wasapi,
+    Asio,
+    CoreAudio,
+    Alsa,
+    Jack,
+}
+
+// Not derivable: the default is platform-conditional (mirrors cpal::default_host),
+// even though on any single target the active cfg branch collapses to one variant
+// — which is what makes clippy think a derive would do.
+#[allow(clippy::derivable_impls)]
+impl Default for AudioHost {
+    fn default() -> Self {
+        // Mirror cpal::default_host() per platform so an unset/migrated value lands
+        // on the native default.
+        #[cfg(windows)]
+        {
+            AudioHost::Wasapi
+        }
+        #[cfg(target_os = "macos")]
+        {
+            AudioHost::CoreAudio
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            AudioHost::Alsa
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -67,7 +104,11 @@ pub struct RealtimeConfig {
     pub provider: Provider,
     pub gpu_priority: GpuPriority,
     pub gpu_device_id: u32,
-    pub audio_backend: AudioBackend,
+    // Host is per direction: input and output are independent streams (and
+    // independent clock domains, already resampled between by the engine), so
+    // e.g. input WASAPI + output ASIO is a valid combination.
+    pub input_host: AudioHost,
+    pub output_host: AudioHost,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub wasapi_input_exclusive: bool,
@@ -100,7 +141,8 @@ impl Default for RealtimeConfig {
             provider: Provider::Cpu,
             gpu_priority: GpuPriority::default(),
             gpu_device_id: 0,
-            audio_backend: AudioBackend::Cpal,
+            input_host: AudioHost::default(),
+            output_host: AudioHost::default(),
             input_device: None,
             output_device: None,
             wasapi_input_exclusive: false,
@@ -129,10 +171,11 @@ impl RealtimeConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if (self.wasapi_input_exclusive || self.wasapi_output_exclusive)
-            && self.audio_backend != AudioBackend::Wasapi
-        {
-            bail!("WASAPI exclusive options require the WASAPI backend");
+        if self.wasapi_input_exclusive && self.input_host != AudioHost::Wasapi {
+            bail!("WASAPI exclusive input requires the WASAPI input host");
+        }
+        if self.wasapi_output_exclusive && self.output_host != AudioHost::Wasapi {
+            bail!("WASAPI exclusive output requires the WASAPI output host");
         }
         validate_conversion_timing(
             ConversionTiming {
@@ -344,7 +387,9 @@ impl Telemetry {
 enum Command {
     Apply(RealtimeConfig),
     Stop,
-    RefreshDevices(AudioBackend),
+    // (input_host, output_host): inputs are enumerated from the input host and
+    // outputs from the output host.
+    RefreshDevices(AudioHost, AudioHost),
     Shutdown,
 }
 
@@ -402,8 +447,8 @@ impl EngineController {
         self.try_command(Command::Stop)
     }
 
-    pub fn refresh_devices(&self, backend: AudioBackend) -> Result<()> {
-        self.try_command(Command::RefreshDevices(backend))
+    pub fn refresh_devices(&self, input_host: AudioHost, output_host: AudioHost) -> Result<()> {
+        self.try_command(Command::RefreshDevices(input_host, output_host))
     }
 
     pub fn set_live_params(&self, params: LiveParams) {
@@ -475,8 +520,8 @@ fn control_loop(
                 drop(session.take());
                 set_status(&status, EngineState::Stopped, "Stopped");
             }
-            Ok(Command::RefreshDevices(backend)) => {
-                let result = device_list(backend);
+            Ok(Command::RefreshDevices(input_host, output_host)) => {
+                let result = device_list(input_host, output_host);
                 if let Ok(mut current) = devices.lock() {
                     *current = result;
                 }
@@ -543,32 +588,24 @@ fn load_progress_message(progress: LoadProgress) -> String {
     }
 }
 
-fn device_list(backend: AudioBackend) -> DeviceList {
-    let result = match backend {
-        AudioBackend::Cpal => audio::cpal_device_names(),
-        AudioBackend::Wasapi => wasapi_device_names(),
-    };
-    match result {
-        Ok((inputs, outputs)) => DeviceList {
-            inputs,
-            outputs,
-            error: None,
-        },
-        Err(err) => DeviceList {
-            error: Some(format!("{err:#}")),
-            ..Default::default()
-        },
+fn device_list(input_host: AudioHost, output_host: AudioHost) -> DeviceList {
+    // Inputs and outputs can come from different hosts, so enumerate each
+    // direction from its own host and surface the first error if either fails.
+    // Enumeration always goes through cpal (it lists every host's devices,
+    // including WASAPI shared — the bespoke WASAPI path is only the exclusive-mode
+    // opener, not a separate device list).
+    let inputs = audio::cpal_input_names(input_host);
+    let outputs = audio::cpal_output_names(output_host);
+    let error = inputs
+        .as_ref()
+        .err()
+        .or(outputs.as_ref().err())
+        .map(|err| format!("{err:#}"));
+    DeviceList {
+        inputs: inputs.unwrap_or_default(),
+        outputs: outputs.unwrap_or_default(),
+        error,
     }
-}
-
-#[cfg(windows)]
-fn wasapi_device_names() -> Result<(Vec<String>, Vec<String>)> {
-    crate::audio::wasapi_audio::device_names()
-}
-
-#[cfg(not(windows))]
-fn wasapi_device_names() -> Result<(Vec<String>, Vec<String>)> {
-    bail!("WASAPI is only available on Windows")
 }
 
 enum PassthroughDenoiser {
@@ -838,7 +875,8 @@ impl RealtimeSession {
         set_process_power_throttling(config.gpu_priority == GpuPriority::High);
         set_status(status, EngineState::Starting, "Opening audio devices");
         let audio = RealtimeAudio::open(
-            config.audio_backend,
+            config.input_host,
+            config.output_host,
             config.wasapi_input_exclusive,
             config.wasapi_output_exclusive,
             config.input_device.as_deref(),
@@ -1027,7 +1065,11 @@ impl RealtimeSession {
             output_stream: Some(output_stream),
             status: EngineStatusSnapshot {
                 state: EngineState::Running,
-                message: format!("Running ({})", audio.backend_label()),
+                message: format!(
+                    "Running (in: {} / out: {})",
+                    audio.input_host_label(),
+                    audio.output_host_label()
+                ),
                 detail: None,
                 input_device: audio.input_name().to_string(),
                 output_device: audio.output_name().to_string(),

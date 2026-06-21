@@ -38,6 +38,8 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
     };
     let wasapi_input_exclusive = args.wasapi_input_exclusive();
     let wasapi_output_exclusive = args.wasapi_output_exclusive();
+    let input_host = args.effective_input_host();
+    let output_host = args.effective_output_host();
     let controller = EngineController::new(live);
     controller.apply_config(RealtimeConfig {
         model: args.model,
@@ -47,7 +49,8 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         provider: args.provider,
         gpu_priority: args.gpu_priority.into(),
         gpu_device_id: args.gpu_device_id,
-        audio_backend: args.audio_backend.into(),
+        input_host,
+        output_host,
         input_device: args.input,
         output_device: args.output,
         wasapi_input_exclusive,

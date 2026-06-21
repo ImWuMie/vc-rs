@@ -14,6 +14,11 @@ windowsml = ["vc-app/windowsml", "vc-core/windowsml"]
 tensorrt = ["vc-app/tensorrt", "vc-core/tensorrt"]
 cuda = ["vc-app/cuda", "vc-core/cuda"]
 rnnoise = ["vc-app/rnnoise", "vc-core/rnnoise"]
+# Opt-in ASIO host (cpal). Requires the Steinberg ASIO SDK + LLVM at build time;
+# see scripts/README.md. Never in `default`.
+asio = ["vc-app/asio"]
+# Opt-in JACK host (cpal). Reserved for future Linux/macOS builds; links libjack.
+jack = ["vc-app/jack"]
 
 [dependencies]
 vc-app = { path = "../vc-app", default-features = false }

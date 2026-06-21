@@ -27,21 +27,54 @@ fn main() -> Result<()> {
     let cli = Cli::parse_args();
     match cli.command {
         Command::Doctor => doctor::run(),
-        Command::Devices(args) => match args.audio_backend {
-            cli::DeviceAudioBackend::All => {
-                vc_app::audio::print_cpal_devices()?;
-                println!();
-                vc_app::audio::print_wasapi_devices()
-            }
-            cli::DeviceAudioBackend::Cpal => vc_app::audio::print_cpal_devices(),
-            cli::DeviceAudioBackend::Wasapi => vc_app::audio::print_wasapi_devices(),
-        },
+        Command::Devices(args) => list_devices(args.audio_backend),
         Command::Inspect(args) => model_rvc::inspect_model(&args.model),
         #[cfg(all(windows, feature = "windowsml"))]
         Command::WindowsMlEps(args) => windows_ml_eps::run(args),
         Command::EngineCache(args) => engine_cache::run(args),
         Command::Run(args) => run_model_command(move || engine::run_realtime(args)),
         Command::Wav(args) => run_model_command(move || engine::run_wav(args)),
+    }
+}
+
+fn list_devices(selection: cli::DeviceHost) -> Result<()> {
+    use vc_app::AudioHost;
+    // Enumeration is uniform through cpal for every host. `All` lists the hosts
+    // relevant to this platform and reports (rather than aborts on) any that are
+    // unavailable, e.g. ASIO without a driver or the `asio` feature.
+    let hosts: &[AudioHost] = match selection {
+        cli::DeviceHost::All => platform_device_hosts(),
+        cli::DeviceHost::Wasapi => &[AudioHost::Wasapi],
+        cli::DeviceHost::Asio => &[AudioHost::Asio],
+        cli::DeviceHost::CoreAudio => &[AudioHost::CoreAudio],
+        cli::DeviceHost::Alsa => &[AudioHost::Alsa],
+        cli::DeviceHost::Jack => &[AudioHost::Jack],
+    };
+    for (index, host) in hosts.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        if let Err(err) = vc_app::audio::print_cpal_devices(*host) {
+            println!("{host:?} devices unavailable: {err:#}");
+        }
+    }
+    Ok(())
+}
+
+// Hosts shown by `devices --audio-backend all` on this platform.
+fn platform_device_hosts() -> &'static [vc_app::AudioHost] {
+    use vc_app::AudioHost;
+    #[cfg(windows)]
+    {
+        &[AudioHost::Wasapi, AudioHost::Asio]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &[AudioHost::CoreAudio]
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        &[AudioHost::Alsa]
     }
 }
 

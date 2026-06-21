@@ -31,6 +31,44 @@ the matched CUDA/cuDNN/TensorRT on PATH and sets `CUDA_PATH`, `TENSORRT_ROOT`,
 `ORT_CUDA_VERSION`. Auto-discovers paths; override with `-CudaPath` /
 `-TensorRtRoot` / `-CuDnnBin`.
 
+## Optional: ASIO audio backend (`--features asio`)
+
+ASIO support is an opt-in feature on `vc-cli`/`vc-gui` and is **not** part of the
+default build, CI, or distribution packages. Compared to a normal build it needs
+just **one** extra tool — LLVM:
+
+- **LLVM/Clang (required)** — `asio-sys` runs `bindgen` over the ASIO SDK headers.
+  Install LLVM (`winget install LLVM.LLVM`) and point bindgen at `libclang.dll`:
+  `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"`.
+
+The other two pieces are already covered:
+
+- **MSVC C++ build tools** — `asio-sys` compiles the SDK's C++ via `cc`; the same
+  toolchain the project already requires (installed by `just setup` / bootstrap),
+  so nothing extra to do.
+- **Steinberg ASIO SDK** — `asio-sys` **auto-downloads** it from steinberg.net at
+  build time when `CPAL_ASIO_DIR` is unset, so a plain build "just works" once LLVM
+  is present. Setting `$env:CPAL_ASIO_DIR` to a local SDK copy is optional but
+  recommended for offline/CI builds, to pin a version, and to make the Steinberg
+  dependency explicit (see licensing note below).
+
+Then build the standalone front-ends with the feature:
+
+```powershell
+cargo build -p vc-cli --features asio
+cargo build -p vc-gui --features asio
+```
+
+> **Licensing:** ASIO is a Steinberg trademark and SDK distributed under
+> Steinberg's own license. This repo never commits or redistributes the SDK — the
+> auto-download fetches it directly from Steinberg. Before shipping an
+> ASIO-enabled build, review Steinberg's terms (pointing `CPAL_ASIO_DIR` at an SDK
+> copy you obtained yourself makes that acceptance deliberate).
+
+ASIO devices/drivers are listed with `vc-rs devices --audio-backend asio`, and
+the backend is selectable per direction (`--input-backend`/`--output-backend`);
+see [`../docs/cli.md`](../docs/cli.md).
+
 ## Verify
 
 ```powershell
@@ -138,6 +176,12 @@ of `dist\` is gitignored.
 Flags:
 - `-Targets app-windowsml,vst3-windowsml` — build only a subset (e.g. the
   Windows ML pair, which needs no GPU toolchain).
+- `-Asio` — build the **app** packages (`vc-rs.exe`/`vc-gui.exe`) with the ASIO
+  audio backend. Needs LLVM + the Steinberg ASIO SDK on this machine (see
+  *Optional: ASIO audio backend* above); the vst3 targets ignore it. e.g.
+  `just package -Targets app-windowsml -Asio` or
+  `just package -Asio`. Off by default so the windowsml package keeps needing no
+  special toolchain.
 - `cli-windowsml` and `cli-tensorrt` remain accepted as legacy aliases for the
   corresponding app targets.
 - `-RuntimeOnly` / `-TensorRtBin <dir>` — forwarded to the tensorrt targets (see

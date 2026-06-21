@@ -69,6 +69,23 @@ TensorRT never share a process:
   engines via TensorRT's builder API (not the ORT TensorRT EP).
 - `vc-core/clap` — derives `clap::ValueEnum` on shared enums (CLI only).
 
+The above are *inference* backends. There is also an opt-in **audio** backend
+feature, orthogonal to the providers:
+
+- `vc-app/asio` (re-exported by `vc-cli/asio`, `vc-gui/asio`) → `cpal/asio` —
+  cpal's ASIO host. **Never in `default`**: `asio-sys` runs `bindgen`, so it needs
+  LLVM/libclang at build time (the ASIO SDK is auto-downloaded, or pinned via
+  `CPAL_ASIO_DIR`), which CI and the distribution builds do not provide. See
+  `scripts/README.md` for setup. `vc-app/jack` → `cpal/jack` is a parallel opt-in
+  for the future Linux/macOS JACK host (links libjack).
+
+Audio host is the `AudioHost` enum (cpal-`HostId`-aligned: Wasapi/Asio/CoreAudio/
+Alsa/Jack), selected **per direction** at runtime (`input_host`/`output_host`).
+Every host except WASAPI exclusive routes through the shared cpal stream path;
+WASAPI exclusive uses the bespoke `wasapi_audio` path. Variants are always defined
+and error at open time when unavailable on the platform/build — keep them
+un-gated so frontend match arms and value-enums stay stable across targets.
+
 Front-end defaults: `vc-app`, `vc-cli`, and `vc-gui` default to
 `["windowsml","tensorrt"]` (one dev binary covers both; the CLI's default
 provider falls back to `cpu`). `vc-vst3` defaults to `["windowsml"]`.

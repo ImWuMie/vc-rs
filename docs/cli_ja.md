@@ -125,10 +125,35 @@ GUI にはない機能です。バッチ処理や、設定変更の決定的な�
 
 その他に `--smoother sola|psola`、`--sola-search-ms`、`--crossfade-ms`、
 `--rvc-output-tail-discard-ms`、`--gpu-priority normal|high`、
-`--gpu-device-id <ID>`（CUDA / ネイティブ TensorRT のみ）、WASAPI 関連
-（`--audio-backend wasapi`、`--wasapi-exclusive*`、`--wasapi-buffer-ms`）など、
-GUI が固定している項目も CLI から指定できます。各オプションの一覧と既定値は
-`--help` で確認してください。
+`--gpu-device-id <ID>`（CUDA / ネイティブ TensorRT のみ）、WASAPI 排他関連
+（`--wasapi-exclusive*`、`--wasapi-buffer-ms`）など、GUI が固定している項目も
+CLI から指定できます。各オプションの一覧と既定値は `--help` で確認してください。
+
+## オーディオバックエンド
+
+`--audio-backend` は入出力両方の OS オーディオホストを選びます（トークンは cpal の
+ホスト名に対応）。既定はプラットフォーム標準（Windows=WASAPI、macOS=CoreAudio、
+Linux=ALSA）です。
+
+- `wasapi`: Windows WASAPI。既定は共有モード。`--wasapi-exclusive*` で排他モード
+  （`--wasapi-buffer-ms` で調整）になり、専用の低レイテンシ経路を通ります。
+- `asio`: ASIO（低レイテンシのオーディオIF）。`--features asio` 付きビルドのみ。
+  ビルド手順は [`scripts/README.md`](../scripts/README.md) を参照。
+- `coreaudio` / `alsa` / `jack`: macOS / Linux 用（将来のクロスプラットフォーム
+  ビルド向け。`jack` は `--features jack` が必要）。実行中のプラットフォーム/ビルドで
+  使えないホストを選ぶとヒント付きでエラーになります。
+
+入力と出力で**別のホスト**を使えます。`--input-backend` / `--output-backend` が
+その方向の `--audio-backend` を上書きします:
+
+```powershell
+# 入力は WASAPI、出力は ASIO のオーディオIFへ。
+.\vc-rs.exe run ... --input-backend wasapi --output-backend asio --output "<ASIO ドライバ>"
+```
+
+ASIO はドライバをグローバルに1つだけロードするため、入出力**両方**を ASIO にする
+場合は同じドライバを指定してください。ASIO のバッファサイズはドライバ自身の
+コントロールパネルで設定し、`--wasapi-buffer-ms` は効きません。
 
 `wav --denoiser rnnoise`はRNNoiseの固定ストリーミング遅延を自動補償し、入力WAVと
 同じサンプル数を維持します。RNNoiseはスタンドアロンCLI/GUI専用で、VST3には

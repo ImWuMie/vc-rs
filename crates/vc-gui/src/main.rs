@@ -9,8 +9,8 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use vc_app::{
-    AudioBackend, DenoiserMode, EngineController, EngineState, F0Config, LiveParams,
-    NoiseGateShaping, OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot,
+    AudioHost, DenoiserMode, EngineController, EngineState, F0Config, LiveParams, NoiseGateShaping,
+    OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot,
 };
 use vc_core::gpu::{list_cuda_devices, GpuDevice};
 use vc_core::validation::CONVERSION_TIMING_LIMITS;
@@ -126,7 +126,13 @@ struct GuiSettings {
     provider: String,
     gpu_priority: String,
     gpu_device_id: u32,
-    audio_backend: String,
+    // Host is per direction (input/output independent); the GUI offers the
+    // platform's host (WASAPI/CoreAudio/ALSA) plus, when built with the `asio`
+    // feature on Windows, ASIO. WASAPI exclusive mode stays CLI-only. Tokens are
+    // cpal HostId names ("wasapi"/"asio"/...). Unknown/legacy keys fall back to the
+    // platform default below.
+    input_host: String,
+    output_host: String,
     input_device: String,
     output_device: String,
     wasapi_input_exclusive: bool,
@@ -168,7 +174,8 @@ impl Default for GuiSettings {
             provider: default_provider_name().to_string(),
             gpu_priority: "high".to_string(),
             gpu_device_id: 0,
-            audio_backend: "cpal".to_string(),
+            input_host: default_host_token().to_string(),
+            output_host: default_host_token().to_string(),
             input_device: String::new(),
             output_device: String::new(),
             wasapi_input_exclusive: false,
@@ -204,10 +211,17 @@ impl Default for GuiSettings {
 
 impl GuiSettings {
     fn normalize_gui_managed_settings(&mut self) {
-        // WASAPI and these smoothing timings remain available to the CLI, but
-        // the GUI intentionally pins them until their safe tuning and failure
-        // behavior are clear enough to expose to general users.
-        self.audio_backend = "cpal".to_string();
+        // WASAPI exclusive mode and these smoothing timings remain available to the
+        // CLI, but the GUI intentionally pins them until their safe tuning and
+        // failure behavior are clear enough to expose to general users. Per-direction
+        // hosts are clamped to what the GUI offers on this platform (e.g. WASAPI,
+        // plus ASIO when built in); WASAPI exclusive mode is never selectable here.
+        if !gui_host_names().contains(&self.input_host.as_str()) {
+            self.input_host = default_host_token().to_string();
+        }
+        if !gui_host_names().contains(&self.output_host.as_str()) {
+            self.output_host = default_host_token().to_string();
+        }
         self.wasapi_input_exclusive = false;
         self.wasapi_output_exclusive = false;
         self.wasapi_buffer_ms = 0;
@@ -258,7 +272,8 @@ impl GuiSettings {
             provider: parse_provider(&self.provider)?,
             gpu_priority: parse_gpu_priority(&self.gpu_priority)?,
             gpu_device_id: self.gpu_device_id,
-            audio_backend: AudioBackend::Cpal,
+            input_host: self.input_host(),
+            output_host: self.output_host(),
             input_device: string_option(&self.input_device),
             output_device: string_option(&self.output_device),
             wasapi_input_exclusive: false,
@@ -298,8 +313,12 @@ impl GuiSettings {
         })
     }
 
-    fn backend(&self) -> AudioBackend {
-        AudioBackend::Cpal
+    fn input_host(&self) -> AudioHost {
+        parse_gui_host(&self.input_host)
+    }
+
+    fn output_host(&self) -> AudioHost {
+        parse_gui_host(&self.output_host)
     }
 }
 
@@ -326,7 +345,7 @@ impl VcGui {
         let (mut settings, ui_error) = load_settings();
         settings.normalize_gui_managed_settings();
         let controller = EngineController::new(settings.live());
-        let _ = controller.refresh_devices(settings.backend());
+        let _ = controller.refresh_devices(settings.input_host(), settings.output_host());
         Self {
             controller,
             settings,
@@ -407,7 +426,11 @@ impl eframe::App for VcGui {
         let telemetry = self.telemetry;
         ui.heading("vc-rs Standalone");
         ui.horizontal(|ui| {
-            ui.label(format!("Status: {:?} - {}", status.state, status.message));
+            ui.label(format!(
+                "Status: {:?} - {}",
+                status.state,
+                friendly_status_message(&status.message)
+            ));
             if status.state == EngineState::Running {
                 ui.label(format!(
                     "{} Hz -> {} Hz",
@@ -512,9 +535,34 @@ impl eframe::App for VcGui {
 
             ui.separator();
             ui.heading("Audio");
-            if ui.button("Refresh devices").clicked() {
-                let _ = self.controller.refresh_devices(self.settings.backend());
+            // Host selectors only matter when more than one host is available on
+            // this platform/build (e.g. WASAPI + ASIO). A changed host re-enumerates
+            // devices for that direction and marks the config dirty (applies on
+            // restart).
+            let mut host_changed = false;
+            if gui_host_names().len() > 1 {
+                backend_combo(
+                    ui,
+                    "Input backend",
+                    &mut self.settings.input_host,
+                    &mut host_changed,
+                );
+                backend_combo(
+                    ui,
+                    "Output backend",
+                    &mut self.settings.output_host,
+                    &mut host_changed,
+                );
+                ui.label(
+                    "ASIO uses one driver for both directions; pick the same device for input and output.",
+                );
             }
+            if ui.button("Refresh devices").clicked() || host_changed {
+                let _ = self
+                    .controller
+                    .refresh_devices(self.settings.input_host(), self.settings.output_host());
+            }
+            changed |= host_changed;
             device_combo(
                 ui,
                 "Input device",
@@ -763,6 +811,20 @@ fn model_path_control(ui: &mut egui::Ui, label: &str, value: &mut String) -> (bo
     (changed, browse_clicked)
 }
 
+fn backend_combo(ui: &mut egui::Ui, label: &str, value: &mut String, changed: &mut bool) {
+    // The stored value stays a canonical cpal HostId token (`wasapi`/`asio`/...)
+    // for config + mapping stability; only the shown text is user-facing.
+    egui::ComboBox::from_label(label)
+        .selected_text(gui_host_label(value))
+        .show_ui(ui, |ui| {
+            for name in gui_host_names() {
+                *changed |= ui
+                    .selectable_value(value, (*name).to_string(), gui_host_label(name))
+                    .changed();
+            }
+        });
+}
+
 fn device_combo(
     ui: &mut egui::Ui,
     label: &str,
@@ -905,6 +967,85 @@ fn denoiser_names() -> &'static [&'static str] {
     &["off", "noise-gate", "rnnoise"]
 }
 
+// Hosts the GUI exposes per direction, as cpal HostId tokens. Platform-gated to
+// what cpal provides on this target; ASIO only appears with the `asio` feature.
+// The bespoke WASAPI *exclusive* mode stays CLI-only (the GUI's "wasapi" is shared).
+fn gui_host_names() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &[
+            "wasapi",
+            #[cfg(feature = "asio")]
+            "asio",
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        &["coreaudio"]
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        &["alsa"]
+    }
+}
+
+// Platform default host token (mirrors AudioHost::default() / cpal::default_host()).
+fn default_host_token() -> &'static str {
+    #[cfg(windows)]
+    {
+        "wasapi"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "coreaudio"
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        "alsa"
+    }
+}
+
+fn parse_gui_host(name: &str) -> AudioHost {
+    match name {
+        "wasapi" => AudioHost::Wasapi,
+        #[cfg(feature = "asio")]
+        "asio" => AudioHost::Asio,
+        "coreaudio" => AudioHost::CoreAudio,
+        "alsa" => AudioHost::Alsa,
+        _ => AudioHost::default(),
+    }
+}
+
+// User-facing label for a host token; plain users do not know cpal HostId names.
+fn gui_host_label(name: &str) -> &'static str {
+    match name {
+        "asio" => "ASIO",
+        "coreaudio" => "Core Audio",
+        "alsa" => "ALSA",
+        "jack" => "JACK",
+        _ => "WASAPI",
+    }
+}
+
+// The engine's running status reads "Running (in: <host> / out: <host>)" with the
+// canonical tokens. Present them with the same names as the selectors. Scoped to
+// the "in:/out:" patterns so other messages are untouched.
+fn friendly_status_message(message: &str) -> String {
+    let mut text = message.to_string();
+    for (raw, friendly) in [
+        ("wasapi", "WASAPI"),
+        ("asio", "ASIO"),
+        ("coreaudio", "Core Audio"),
+        ("alsa", "ALSA"),
+        ("jack", "JACK"),
+    ] {
+        text = text
+            .replace(&format!("in: {raw}"), &format!("in: {friendly}"))
+            .replace(&format!("out: {raw}"), &format!("out: {friendly}"));
+    }
+    text
+}
+
 fn gpu_priority_names() -> &'static [&'static str] {
     &["high", "normal"]
 }
@@ -972,6 +1113,26 @@ mod tests {
     }
 
     #[test]
+    fn status_message_shows_friendly_host_names() {
+        assert_eq!(
+            friendly_status_message("Running (in: wasapi / out: asio)"),
+            "Running (in: WASAPI / out: ASIO)"
+        );
+        // Non-host messages pass through untouched.
+        assert_eq!(
+            friendly_status_message("Opening audio devices"),
+            "Opening audio devices"
+        );
+    }
+
+    #[test]
+    fn gui_host_label_presents_friendly_names() {
+        assert_eq!(gui_host_label("wasapi"), "WASAPI");
+        assert_eq!(gui_host_label("asio"), "ASIO");
+        assert_eq!(gui_host_label("coreaudio"), "Core Audio");
+    }
+
+    #[test]
     fn gui_gpu_priority_parses_and_normalizes() {
         assert_eq!(
             parse_gpu_priority("normal").unwrap(),
@@ -1014,7 +1175,8 @@ mod tests {
     fn gui_realtime_config_forces_safe_audio_and_smoothing_settings() {
         let settings: GuiSettings = toml::from_str(
             r#"
-audio_backend = "wasapi"
+input_host = "wasapi"
+output_host = "wasapi"
 wasapi_input_exclusive = true
 wasapi_output_exclusive = true
 wasapi_buffer_ms = 1
@@ -1026,7 +1188,10 @@ passthrough = true
         .unwrap();
 
         let config = settings.realtime().unwrap();
-        assert_eq!(config.audio_backend, AudioBackend::Cpal);
+        // WASAPI (shared) is a valid GUI host and is kept; the GUI only pins the
+        // unsafe knobs — exclusive mode, buffer ms, and the smoothing timings.
+        assert_eq!(config.input_host, AudioHost::Wasapi);
+        assert_eq!(config.output_host, AudioHost::Wasapi);
         assert!(!config.wasapi_input_exclusive);
         assert!(!config.wasapi_output_exclusive);
         assert_eq!(config.wasapi_buffer_ms, 0);
@@ -1037,7 +1202,9 @@ passthrough = true
     #[test]
     fn normalization_removes_hidden_unsafe_gui_settings() {
         let mut settings = GuiSettings {
-            audio_backend: "wasapi".to_string(),
+            // An unsupported/edited host token clamps to the platform default.
+            input_host: "totally-invalid".to_string(),
+            output_host: "totally-invalid".to_string(),
             wasapi_input_exclusive: true,
             wasapi_output_exclusive: true,
             wasapi_buffer_ms: 1,
@@ -1048,7 +1215,8 @@ passthrough = true
         };
 
         settings.normalize_gui_managed_settings();
-        assert_eq!(settings.audio_backend, "cpal");
+        assert_eq!(settings.input_host, default_host_token());
+        assert_eq!(settings.output_host, default_host_token());
         assert!(!settings.wasapi_input_exclusive);
         assert!(!settings.wasapi_output_exclusive);
         assert_eq!(settings.wasapi_buffer_ms, 0);

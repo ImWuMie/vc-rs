@@ -59,8 +59,15 @@ This downloads `.\assets\content_vec_500.onnx` and `.\assets\rmvpe.onnx`.
 ### List devices
 
 ```powershell
-.\vc-rs.exe devices
+.\vc-rs.exe devices                      # all hosts available on this platform
+.\vc-rs.exe devices --audio-backend wasapi # WASAPI devices only
+.\vc-rs.exe devices --audio-backend asio # ASIO drivers (asio build only)
 ```
+
+`--audio-backend` accepts `all` (default) or a host token
+(`wasapi`/`asio`/`coreaudio`/`alsa`/`jack`). ASIO is only listed on a build made
+with `--features asio` and with an ASIO driver installed; hosts not available on
+the running platform/build are reported as such.
 
 ### Inspect a model
 
@@ -130,9 +137,37 @@ lower `--chunk-ms`** to reduce latency.
 Other options the GUI keeps pinned are also available from the CLI:
 `--smoother sola|psola`, `--sola-search-ms`, `--crossfade-ms`,
 `--rvc-output-tail-discard-ms`, `--gpu-priority normal|high`,
-`--gpu-device-id <ID>` (CUDA/native TensorRT only), and the WASAPI
-controls (`--audio-backend wasapi`, `--wasapi-exclusive*`, `--wasapi-buffer-ms`).
+`--gpu-device-id <ID>` (CUDA/native TensorRT only), and the WASAPI exclusive
+controls (`--wasapi-exclusive*`, `--wasapi-buffer-ms`).
 See `--help` for the full list and defaults.
+
+## Audio backends
+
+`--audio-backend` selects the OS audio host for both directions (tokens match
+cpal's host names); it defaults to the platform's native host (WASAPI on Windows,
+CoreAudio on macOS, ALSA on Linux):
+
+- `wasapi`: Windows WASAPI. Shared mode by default; add `--wasapi-exclusive*` for
+  exclusive mode (with `--wasapi-buffer-ms` tuning), which routes through the
+  bespoke low-latency path.
+- `asio`: ASIO (low-latency audio interfaces). Only on a build made with
+  `--features asio`; see [`scripts/README.md`](../scripts/README.md) for the ASIO
+  SDK + LLVM build setup.
+- `coreaudio` / `alsa` / `jack`: macOS / Linux hosts (for future cross-platform
+  builds; `jack` needs `--features jack`). Selecting a host not available on the
+  running platform/build errors with a hint.
+
+Input and output can use **different** hosts with `--input-backend` /
+`--output-backend`, which override `--audio-backend` for that direction:
+
+```powershell
+# Capture via WASAPI, play out through an ASIO interface.
+.\vc-rs.exe run ... --input-backend wasapi --output-backend asio --output "<ASIO driver>"
+```
+
+ASIO loads a single driver globally, so when **both** directions are ASIO they
+must name the same driver. ASIO buffer size is set in the driver's own control
+panel, not by `--wasapi-buffer-ms`.
 
 `wav --denoiser rnnoise` compensates RNNoise's fixed streaming delay and keeps
 the output WAV at the original sample count. RNNoise is available only in the

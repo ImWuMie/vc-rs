@@ -18,12 +18,26 @@ rnnoise = ["vc-core/rnnoise"]
 # a self-contained, deterministic build for benchmarking and A/B audio comparison
 # (the CPU EP is reproducible run-to-run, unlike the GPU EPs).
 cpu = ["vc-core/ort"]
+# ASIO output/input via cpal's ASIO host. Opt-in and never in `default` because
+# `asio-sys` needs the Steinberg ASIO SDK (CPAL_ASIO_DIR) and LLVM/libclang
+# (bindgen) at build time, which CI and the distribution builds do not provide.
+asio = ["cpal/asio"]
+# JACK host via cpal (mainly Linux; also macOS/Windows with a JACK install).
+# Opt-in: `cpal/jack` links libjack. Off by default; reserved for future
+# Linux/macOS packaging. Selecting the JACK host without this feature errors.
+jack = ["cpal/jack"]
 
 [dependencies]
 vc-core = { path = "../vc-core" }
 anyhow.workspace = true
 tracing.workspace = true
-cpal = "0.18"
+# `realtime` promotes cpal's internal stream callback threads (WASAPI-shared,
+# ASIO, …) to OS real-time priority (Windows: MMCSS "Pro Audio" via
+# audio_thread_priority, else THREAD_PRIORITY_TIME_CRITICAL). Our bespoke WASAPI
+# path and the worker already self-boost; this covers the cpal-driven paths that
+# otherwise run the audio callback at normal priority. Windows-safe: only pulls
+# audio_thread_priority (MMCSS); alsa-sys is target-gated to Linux.
+cpal = { version = "0.18", features = ["realtime"] }
 hound = "3.5"
 rtrb = "0.3"
 thread-priority = "3.0.0"

@@ -34,6 +34,12 @@
     Reuse existing target\release\vc-rs.exe and vc-gui.exe instead of building.
     The stage, populate, and archive steps still run.
 
+.PARAMETER Asio
+    Add the opt-in ASIO audio backend to the app binaries (appends the `asio`
+    feature). Requires LLVM/libclang (LIBCLANG_PATH) and the Steinberg ASIO SDK
+    (CPAL_ASIO_DIR) on the build machine; see scripts\README.md. VST3 is never
+    built with ASIO (it uses the DAW's I/O).
+
 .PARAMETER NoZip
     Stage and populate the package but stop before creating the .zip. The
     populated, ready-to-run dist\<stem>\ folder is left in place.
@@ -92,6 +98,11 @@ param(
     [string]$Variant = 'windowsml',
     [string]$OutDir,
     [switch]$SkipBuild,
+    # Build the app binaries with the opt-in ASIO audio backend (cpal ASIO host).
+    # Requires LLVM/libclang and the Steinberg ASIO SDK on this machine (see
+    # scripts\README.md). Off by default so the windowsml package keeps needing no
+    # special toolchain.
+    [switch]$Asio,
     [switch]$NoZip,
     # Keep the populated, ready-to-run dist\<stem>\ folder beside the .zip. Kept by
     # default for every variant (handy for testing the unpacked package). -CleanStage
@@ -129,10 +140,13 @@ if (-not (Get-Command cargo-about -ErrorAction SilentlyContinue)) {
 
 # Single-provider feature set per variant. `--no-default-features` drops the
 # other backend so the binary stays lean (a tensorrt build sheds ONNX Runtime).
-$buildFeatureArgs = switch ($Variant) {
-    'windowsml' { @('--no-default-features', '--features', 'windowsml,rnnoise') }
-    'tensorrt' { @('--no-default-features', '--features', 'tensorrt,rnnoise') }
+# -Asio appends the (orthogonal) ASIO audio backend to either variant.
+$features = switch ($Variant) {
+    'windowsml' { 'windowsml,rnnoise' }
+    'tensorrt' { 'tensorrt,rnnoise' }
 }
+if ($Asio) { $features += ',asio' }
+$buildFeatureArgs = @('--no-default-features', '--features', $features)
 
 Push-Location $repoRoot
 try {
@@ -243,6 +257,17 @@ the applications find automatically beside themselves — keep these files toget
     }
     else { '' }
 
+    $asioNote = if ($Asio) {
+        @"
+
+This build includes the ASIO audio backend (select it per direction in the GUI,
+or with --audio-backend/--input-backend/--output-backend asio in the CLI). ASIO
+is a trademark and SDK of Steinberg Media Technologies GmbH; this package does not
+redistribute the ASIO SDK.
+"@
+    }
+    else { '' }
+
     $install = @"
 vc-rs — RVC voice conversion standalone app ($Variant build, v$version)
 
@@ -267,7 +292,7 @@ package's MIT license — see download-models.ps1.
 
 Requirements for this ($Variant) build:
 $reqLine
-$trtNote
+$trtNote$asioNote
 See licenses\ for third-party license texts.
 "@
     Set-Content -Path (Join-Path $staging 'INSTALL.txt') -Value $install -Encoding UTF8

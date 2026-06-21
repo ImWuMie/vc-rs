@@ -27,6 +27,11 @@ rnnoise = ["vc-core/rnnoise", "vc-app/rnnoise"]
 # audio comparison workflow (see scripts/compare-audio.ps1). Build with
 # `--no-default-features --features cpu`.
 cpu = ["vc-core/ort", "vc-app/cpu"]
+# Opt-in ASIO host (cpal). Requires the Steinberg ASIO SDK + LLVM at build time;
+# see scripts/README.md. Never in `default`.
+asio = ["vc-app/asio"]
+# Opt-in JACK host (cpal). Reserved for future Linux/macOS builds; links libjack.
+jack = ["vc-app/jack"]
 
 [dependencies]
 # `clap` is always on (the CLI derives `value_enum` from vc-core's `Provider`);

@@ -25,4 +25,10 @@ accepted = [
     "CDLA-Permissive-2.0",
     "OFL-1.1",
     "Ubuntu-font-1.0",
+    # MPL-2.0 is accepted ONLY to emit the required notice for audio_thread_priority
+    # (pulled transitively, unmodified, via cpal's `realtime` feature). cargo-about
+    # has no per-crate accept, so this is global here; the actual policy gate keeps
+    # it crate-scoped in deny.toml `exceptions`. Do not treat this as blanket
+    # approval for new MPL-2.0 deps — add those to deny.toml exceptions first.
+    "MPL-2.0",
 ]

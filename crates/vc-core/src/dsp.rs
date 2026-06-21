@@ -54,6 +54,21 @@ pub fn f32_to_u16_into(input: &[f32], output: &mut [u16]) {
     }
 }
 
+// 32-bit PCM (common on ASIO devices). Scale by 2^31 on decode and by i32::MAX on
+// encode; the f64 multiply avoids f32 mantissa loss at the int32 scale, and the
+// float->int cast saturates (so +1.0 lands on i32::MAX rather than wrapping).
+pub fn i32_to_f32_into(input: &[i32], output: &mut [f32]) {
+    for (dst, &src) in output.iter_mut().zip(input) {
+        *dst = (src as f64 / 2_147_483_648.0) as f32;
+    }
+}
+
+pub fn f32_to_i32_into(input: &[f32], output: &mut [i32]) {
+    for (dst, &src) in output.iter_mut().zip(input) {
+        *dst = (f64::from(src.clamp(-1.0, 1.0)) * 2_147_483_647.0).round() as i32;
+    }
+}
+
 /// Averages interleaved `channels`-channel frames down to mono.
 ///
 /// `output` receives one sample per frame; `input.len()` must be
@@ -684,6 +699,41 @@ mod tests {
         f32_to_u16_into(&input, &mut output);
 
         assert_eq!(output, [1, 1, 16385, 32768, 49152, 65535, 65535]);
+    }
+
+    #[test]
+    fn converts_f32_to_i32_in_place_with_saturating_extremes() {
+        let input = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+        let mut output = [123_i32; 7];
+
+        f32_to_i32_into(&input, &mut output);
+
+        assert_eq!(
+            output,
+            [
+                -2_147_483_647,
+                -2_147_483_647,
+                -1_073_741_824,
+                0,
+                1_073_741_824,
+                2_147_483_647,
+                2_147_483_647,
+            ]
+        );
+    }
+
+    #[test]
+    fn converts_i32_to_f32_in_place() {
+        let input = [i32::MIN, -1_073_741_824, 0, 1_073_741_824, i32::MAX];
+        let mut output = [0.0_f32; 5];
+
+        i32_to_f32_into(&input, &mut output);
+
+        assert_abs_diff_eq!(output[0], -1.0, epsilon = 1e-6);
+        assert_abs_diff_eq!(output[1], -0.5, epsilon = 1e-6);
+        assert_abs_diff_eq!(output[2], 0.0, epsilon = 1e-6);
+        assert_abs_diff_eq!(output[3], 0.5, epsilon = 1e-6);
+        assert_abs_diff_eq!(output[4], 1.0, epsilon = 1e-6);
     }
 
     #[test]

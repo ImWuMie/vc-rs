@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use crate::AudioBackend;
+use crate::AudioHost;
 use vc_core::dsp;
 
 const CPAL_SCRATCH_FALLBACK_SAMPLES: usize = 65_536;
@@ -11,17 +11,49 @@ const CPAL_MAX_SCRATCH_SAMPLES: usize = 65_536;
 #[path = "wasapi_audio.rs"]
 pub(crate) mod wasapi_audio;
 
-pub fn print_cpal_devices() -> Result<()> {
-    let host = cpal::default_host();
+// Maps an `AudioHost` to its cpal `Host`. Each arm is gated by the platform (and
+// feature) that provides that cpal `HostId`; an unavailable selection (e.g. ASIO
+// without the `asio` feature, or CoreAudio on Windows) returns an actionable error
+// instead of failing to compile or panicking. WASAPI *exclusive* mode does not go
+// through here — it uses the bespoke `wasapi_audio` path — but WASAPI *shared* is a
+// normal cpal host.
+fn cpal_host(host: AudioHost) -> Result<cpal::Host> {
+    let id = match host {
+        #[cfg(windows)]
+        AudioHost::Wasapi => cpal::HostId::Wasapi,
+        #[cfg(all(windows, feature = "asio"))]
+        AudioHost::Asio => cpal::HostId::Asio,
+        #[cfg(target_os = "macos")]
+        AudioHost::CoreAudio => cpal::HostId::CoreAudio,
+        #[cfg(target_os = "linux")]
+        AudioHost::Alsa => cpal::HostId::Alsa,
+        #[cfg(feature = "jack")]
+        AudioHost::Jack => cpal::HostId::Jack,
+        other => return Err(host_unavailable_error(other)),
+    };
+    cpal::host_from_id(id).with_context(|| format!("failed to initialize {host:?} host"))
+}
 
-    println!("CPAL input devices:");
-    for device in host.input_devices()? {
+fn host_unavailable_error(host: AudioHost) -> anyhow::Error {
+    if host == AudioHost::Asio {
+        anyhow!("ASIO is unavailable; on Windows rebuild with --features asio")
+    } else {
+        anyhow!("audio host {host:?} is not available on this platform/build")
+    }
+}
+
+pub fn print_cpal_devices(host: AudioHost) -> Result<()> {
+    let cpal_host = cpal_host(host)?;
+    let label = host_label(host, false);
+
+    println!("{label} input devices:");
+    for device in cpal_host.input_devices()? {
         println!("  {}", device_name(&device));
     }
 
     println!();
-    println!("CPAL output devices:");
-    for device in host.output_devices()? {
+    println!("{label} output devices:");
+    for device in cpal_host.output_devices()? {
         println!("  {}", device_name(&device));
     }
 
@@ -39,7 +71,8 @@ pub fn print_wasapi_devices() -> Result<()> {
 }
 
 pub struct RealtimeAudio {
-    backend: AudioBackend,
+    input_host: AudioHost,
+    output_host: AudioHost,
     wasapi_input_exclusive: bool,
     wasapi_output_exclusive: bool,
     input: InputEndpoint,
@@ -69,115 +102,104 @@ enum OutputEndpoint {
 }
 
 impl RealtimeAudio {
+    // Input and output are opened independently so each direction can use a
+    // different host (e.g. input WASAPI + output ASIO). The exception is
+    // ASIO-on-both, which must share one driver (cpal loads a single ASIO driver
+    // globally) and is handled by `open_asio_duplex`.
     pub fn open(
-        backend: AudioBackend,
+        input_host: AudioHost,
+        output_host: AudioHost,
         wasapi_input_exclusive: bool,
         wasapi_output_exclusive: bool,
         input_name: Option<&str>,
         output_name: Option<&str>,
         wasapi_buffer_ms: u32,
     ) -> Result<Self> {
-        if (wasapi_input_exclusive || wasapi_output_exclusive) && backend != AudioBackend::Wasapi {
-            bail!("--wasapi-exclusive* options require --audio-backend wasapi");
+        if wasapi_input_exclusive && input_host != AudioHost::Wasapi {
+            bail!("WASAPI exclusive input requires the WASAPI input host");
+        }
+        if wasapi_output_exclusive && output_host != AudioHost::Wasapi {
+            bail!("WASAPI exclusive output requires the WASAPI output host");
         }
 
-        match backend {
-            AudioBackend::Cpal => Self::open_cpal(input_name, output_name),
-            AudioBackend::Wasapi => Self::open_wasapi(
-                input_name,
-                output_name,
-                wasapi_input_exclusive,
-                wasapi_output_exclusive,
-                wasapi_buffer_ms,
-            ),
+        if input_host == AudioHost::Asio && output_host == AudioHost::Asio {
+            return Self::open_asio_duplex(input_name, output_name);
         }
-    }
 
-    fn open_cpal(input_name: Option<&str>, output_name: Option<&str>) -> Result<Self> {
-        let input_device = input_device(input_name)?;
-        let input_config = default_input_config(&input_device)?;
-        let output_device = output_device(output_name)?;
-        let output_config = default_output_config(&output_device)?;
-        let input_sample_rate = input_config.sample_rate();
-        let output_sample_rate = output_config.sample_rate();
-        let input_name = device_name(&input_device);
-        let output_name = device_name(&output_device);
+        let (input, input_sample_rate, input_name) = open_input_endpoint(
+            input_host,
+            input_name,
+            wasapi_input_exclusive,
+            wasapi_buffer_ms,
+        )?;
+        let (output, output_sample_rate, output_name) = open_output_endpoint(
+            output_host,
+            output_name,
+            wasapi_output_exclusive,
+            wasapi_buffer_ms,
+        )?;
 
         Ok(Self {
-            backend: AudioBackend::Cpal,
+            input_host,
+            output_host,
+            wasapi_input_exclusive,
+            wasapi_output_exclusive,
+            input,
+            output,
+            input_sample_rate,
+            output_sample_rate,
+            input_name,
+            output_name,
+        })
+    }
+
+    // Both directions on ASIO: resolve one driver and share it across the input
+    // and output endpoints. Names (if given) must select the same driver.
+    fn open_asio_duplex(input_name: Option<&str>, output_name: Option<&str>) -> Result<Self> {
+        let host = cpal_host(AudioHost::Asio)?;
+        let device = input_device(&host, input_name.or(output_name))?;
+        let resolved = device_name(&device).to_lowercase();
+        let mismatches =
+            |name: Option<&str>| name.is_some_and(|name| !resolved.contains(&name.to_lowercase()));
+        if mismatches(input_name) || mismatches(output_name) {
+            bail!(
+                "ASIO uses a single driver for both directions; input '{}' and output '{}' must name the same driver",
+                input_name.unwrap_or("<default>"),
+                output_name.unwrap_or("<default>"),
+            );
+        }
+        let input_config = default_input_config(&device)?;
+        let output_config = default_output_config(&device)?;
+        let input_sample_rate = input_config.sample_rate();
+        let output_sample_rate = output_config.sample_rate();
+        let name = device_name(&device);
+
+        Ok(Self {
+            input_host: AudioHost::Asio,
+            output_host: AudioHost::Asio,
             wasapi_input_exclusive: false,
             wasapi_output_exclusive: false,
             input: InputEndpoint::Cpal {
-                device: input_device,
+                device: device.clone(),
                 config: input_config,
             },
             output: OutputEndpoint::Cpal {
-                device: output_device,
+                device,
                 config: output_config,
             },
             input_sample_rate,
             output_sample_rate,
-            input_name,
-            output_name,
+            input_name: name.clone(),
+            output_name: name,
         })
     }
 
-    #[cfg(windows)]
-    fn open_wasapi(
-        input_name: Option<&str>,
-        output_name: Option<&str>,
-        wasapi_input_exclusive: bool,
-        wasapi_output_exclusive: bool,
-        wasapi_buffer_ms: u32,
-    ) -> Result<Self> {
-        let endpoints = wasapi_audio::open_realtime(
-            input_name,
-            output_name,
-            wasapi_input_exclusive,
-            wasapi_output_exclusive,
-            wasapi_buffer_ms,
-        )?;
-        let input_name = endpoints.input.device_name.clone();
-        let output_name = endpoints.output.device_name.clone();
-        let input_sample_rate = endpoints.input_sample_rate;
-        let output_sample_rate = endpoints.output_sample_rate;
-
-        Ok(Self {
-            backend: AudioBackend::Wasapi,
-            wasapi_input_exclusive,
-            wasapi_output_exclusive,
-            input: InputEndpoint::Wasapi(endpoints.input),
-            output: OutputEndpoint::Wasapi(endpoints.output),
-            input_sample_rate,
-            output_sample_rate,
-            input_name,
-            output_name,
-        })
+    pub fn input_host_label(&self) -> &'static str {
+        host_label(self.input_host, self.wasapi_input_exclusive)
     }
 
-    #[cfg(not(windows))]
-    fn open_wasapi(
-        _input_name: Option<&str>,
-        _output_name: Option<&str>,
-        _wasapi_input_exclusive: bool,
-        _wasapi_output_exclusive: bool,
-        _wasapi_buffer_ms: u32,
-    ) -> Result<Self> {
-        bail!("WASAPI audio backend is only available on Windows")
-    }
-
-    pub fn backend_label(&self) -> &'static str {
-        match self.backend {
-            AudioBackend::Cpal => "cpal",
-            AudioBackend::Wasapi => {
-                match (self.wasapi_input_exclusive, self.wasapi_output_exclusive) {
-                    (true, true) => "wasapi-exclusive",
-                    (true, false) => "wasapi-input-exclusive",
-                    (false, true) => "wasapi-output-exclusive",
-                    (false, false) => "wasapi-shared",
-                }
-            }
-        }
+    pub fn output_host_label(&self) -> &'static str {
+        host_label(self.output_host, self.wasapi_output_exclusive)
     }
 
     pub fn input_sample_rate(&self) -> u32 {
@@ -243,25 +265,129 @@ impl AudioStream {
     }
 }
 
-pub fn input_device(name: Option<&str>) -> Result<cpal::Device> {
-    let host = cpal::default_host();
+// Resolves one direction's endpoint for its host. Every host except WASAPI
+// *exclusive* mode goes through the shared cpal stream path (they differ only by
+// which cpal host the device comes from); WASAPI exclusive uses the bespoke path
+// (until cpal gains exclusive mode). Returns the endpoint, its sample rate, and
+// the resolved device name.
+fn open_input_endpoint(
+    host: AudioHost,
+    name: Option<&str>,
+    exclusive: bool,
+    wasapi_buffer_ms: u32,
+) -> Result<(InputEndpoint, u32, String)> {
+    if host == AudioHost::Wasapi && exclusive {
+        return open_wasapi_input(name, wasapi_buffer_ms);
+    }
+    let cpal_host = cpal_host(host)?;
+    let device = input_device(&cpal_host, name)?;
+    let config = default_input_config(&device)?;
+    let sample_rate = config.sample_rate();
+    let label = device_name(&device);
+    Ok((InputEndpoint::Cpal { device, config }, sample_rate, label))
+}
+
+fn open_output_endpoint(
+    host: AudioHost,
+    name: Option<&str>,
+    exclusive: bool,
+    wasapi_buffer_ms: u32,
+) -> Result<(OutputEndpoint, u32, String)> {
+    if host == AudioHost::Wasapi && exclusive {
+        return open_wasapi_output(name, wasapi_buffer_ms);
+    }
+    let cpal_host = cpal_host(host)?;
+    let device = output_device(&cpal_host, name)?;
+    let config = default_output_config(&device)?;
+    let sample_rate = config.sample_rate();
+    let label = device_name(&device);
+    Ok((OutputEndpoint::Cpal { device, config }, sample_rate, label))
+}
+
+// The bespoke WASAPI path serves exclusive mode only (shared WASAPI goes through
+// cpal), so these always request exclusive.
+#[cfg(windows)]
+fn open_wasapi_input(
+    name: Option<&str>,
+    wasapi_buffer_ms: u32,
+) -> Result<(InputEndpoint, u32, String)> {
+    let config = wasapi_audio::open_input(name, true, wasapi_buffer_ms)?;
+    let sample_rate = config.sample_rate;
+    let label = config.device_name.clone();
+    Ok((InputEndpoint::Wasapi(config), sample_rate, label))
+}
+
+#[cfg(not(windows))]
+fn open_wasapi_input(
+    _name: Option<&str>,
+    _wasapi_buffer_ms: u32,
+) -> Result<(InputEndpoint, u32, String)> {
+    bail!("the WASAPI host is only available on Windows")
+}
+
+#[cfg(windows)]
+fn open_wasapi_output(
+    name: Option<&str>,
+    wasapi_buffer_ms: u32,
+) -> Result<(OutputEndpoint, u32, String)> {
+    let config = wasapi_audio::open_output(name, true, wasapi_buffer_ms)?;
+    let sample_rate = config.sample_rate;
+    let label = config.device_name.clone();
+    Ok((OutputEndpoint::Wasapi(config), sample_rate, label))
+}
+
+#[cfg(not(windows))]
+fn open_wasapi_output(
+    _name: Option<&str>,
+    _wasapi_buffer_ms: u32,
+) -> Result<(OutputEndpoint, u32, String)> {
+    bail!("the WASAPI host is only available on Windows")
+}
+
+// Canonical, cpal-aligned token for each host (WASAPI exclusive is annotated).
+// The GUI maps these to friendlier labels; the CLI shows them as-is.
+fn host_label(host: AudioHost, exclusive: bool) -> &'static str {
+    match host {
+        AudioHost::Wasapi => {
+            if exclusive {
+                "wasapi-exclusive"
+            } else {
+                "wasapi"
+            }
+        }
+        AudioHost::Asio => "asio",
+        AudioHost::CoreAudio => "coreaudio",
+        AudioHost::Alsa => "alsa",
+        AudioHost::Jack => "jack",
+    }
+}
+
+pub fn input_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::Device> {
     find_device(host.input_devices()?, name)
         .or_else(|| host.default_input_device())
         .ok_or_else(|| anyhow!("input device not found"))
 }
 
-pub fn output_device(name: Option<&str>) -> Result<cpal::Device> {
-    let host = cpal::default_host();
+pub fn output_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::Device> {
     find_device(host.output_devices()?, name)
         .or_else(|| host.default_output_device())
         .ok_or_else(|| anyhow!("output device not found"))
 }
 
-pub fn cpal_device_names() -> Result<(Vec<String>, Vec<String>)> {
-    let host = cpal::default_host();
-    let inputs = host.input_devices()?.map(|d| device_name(&d)).collect();
-    let outputs = host.output_devices()?.map(|d| device_name(&d)).collect();
-    Ok((inputs, outputs))
+pub fn cpal_input_names(host: AudioHost) -> Result<Vec<String>> {
+    let cpal_host = cpal_host(host)?;
+    Ok(cpal_host
+        .input_devices()?
+        .map(|d| device_name(&d))
+        .collect())
+}
+
+pub fn cpal_output_names(host: AudioHost) -> Result<Vec<String>> {
+    let cpal_host = cpal_host(host)?;
+    Ok(cpal_host
+        .output_devices()?
+        .map(|d| device_name(&d))
+        .collect())
 }
 
 fn find_device<I>(devices: I, name: Option<&str>) -> Option<cpal::Device>
@@ -420,6 +546,25 @@ where
                 None,
             )
         }
+        // 32-bit PCM, common on ASIO drivers.
+        cpal::SampleFormat::I32 => {
+            let mut interleaved = vec![0.0; frames * channels];
+            let mut mono = vec![0.0; frames];
+            device.build_input_stream(
+                stream_config,
+                move |data: &[i32], _| {
+                    for input in data.chunks(frames * channels) {
+                        let converted = &mut interleaved[..input.len()];
+                        dsp::i32_to_f32_into(input, converted);
+                        let mono = &mut mono[..input.len() / channels];
+                        dsp::downmix_to_mono_into(converted, channels, mono);
+                        on_samples(mono);
+                    }
+                },
+                err_fn,
+                None,
+            )
+        }
         sample_format => {
             return Err(anyhow!(
                 "unsupported input sample format: {sample_format:?}"
@@ -496,6 +641,26 @@ where
                         fill(mono);
                         let converted = &mut converted[..frames_in_chunk];
                         dsp::f32_to_u16_into(mono, converted);
+                        dsp::upmix_mono_into(converted, channels, output);
+                    }
+                },
+                err_fn,
+                None,
+            )
+        }
+        // 32-bit PCM, common on ASIO drivers.
+        cpal::SampleFormat::I32 => {
+            let mut mono = vec![0.0; frames];
+            let mut converted = vec![0_i32; frames];
+            device.build_output_stream(
+                stream_config,
+                move |data: &mut [i32], _| {
+                    for output in data.chunks_mut(frames * channels) {
+                        let frames_in_chunk = output.len() / channels;
+                        let mono = &mut mono[..frames_in_chunk];
+                        fill(mono);
+                        let converted = &mut converted[..frames_in_chunk];
+                        dsp::f32_to_i32_into(mono, converted);
                         dsp::upmix_mono_into(converted, channels, output);
                     }
                 },

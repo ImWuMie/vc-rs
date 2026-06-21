@@ -16,8 +16,17 @@ chunk-conversion, smoothing, or output-assembly implementations.
 
 - `vc-core`: shared audio-I/O-agnostic conversion components, including
   `RvcPipeline`, `ChunkConverter`, DSP, and SOLA/PSOLA smoothing.
-- `vc-app`: shared standalone realtime runtime for CLI and GUI, including
-  CPAL/WASAPI device I/O, bounded queues, worker orchestration, and metrics.
+- `vc-app`: shared standalone realtime runtime for CLI and GUI, including device
+  I/O, bounded queues, worker orchestration, and metrics. The audio host is the
+  `AudioHost` enum (cpal-`HostId`-aligned: `Wasapi`/`Asio`/`CoreAudio`/`Alsa`/`Jack`)
+  and is chosen **per direction** (`input_host`/`output_host` in `RealtimeConfig`),
+  so input and output may use different hosts — they are independent streams and
+  clock domains, already resampled between by the engine. Every host except WASAPI
+  *exclusive* goes through the shared cpal stream path (they differ only by which
+  cpal host the device comes from); WASAPI exclusive uses the bespoke `wasapi_audio`
+  path until cpal gains exclusive mode. Hosts unavailable on the running
+  platform/build (e.g. ASIO without the `asio` feature) error at open time. cpal
+  loads a single ASIO driver globally, so ASIO-on-both-directions shares one driver.
 - `vc-cli`: CLI arguments, validation, realtime runtime control, and WAV file
   adaptation to the shared conversion components.
 - `vc-gui`: GUI state and controls that configure the `vc-app` runtime.
@@ -69,6 +78,15 @@ The audio callbacks are intentionally small. They move samples through bounded
 ring buffers and emit silence on underrun; they do not run ONNX inference,
 perform chunk smoothing, write files, or log directly. Anything that can block,
 allocate heavily, or take model-scale CPU/GPU time is kept on the worker side.
+
+The threads carrying those callbacks run at OS real-time priority. The bespoke
+WASAPI path and the worker self-boost via `thread-priority`; the cpal-driven
+paths (WASAPI-shared, ASIO, …) get the same treatment from cpal's `realtime`
+feature (enabled on the `cpal` dependency in `vc-app`), which promotes its
+internal stream threads — Windows MMCSS "Pro Audio", else
+`THREAD_PRIORITY_TIME_CRITICAL`. This pulls `audio_thread_priority` (MPL-2.0),
+allowed crate-scoped in `deny.toml` since it ships unmodified and statically
+linked.
 
 The worker owns chunk accumulation, model inference, output smoothing,
 resampling back to the device rate, and metrics updates. If inference falls

@@ -145,17 +145,27 @@ impl From<GpuPriority> for vc_core::model_rvc::GpuPriority {
     }
 }
 
+// OS audio host, tokens aligned with cpal's HostId. Selecting one unavailable on
+// the current platform/build (e.g. `asio` without `--features asio`, or
+// `coreaudio` on Windows) errors at open/list time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum AudioBackend {
-    Cpal,
+pub enum AudioHost {
     Wasapi,
+    Asio,
+    #[value(name = "coreaudio")]
+    CoreAudio,
+    Alsa,
+    Jack,
 }
 
-impl From<AudioBackend> for vc_app::AudioBackend {
-    fn from(value: AudioBackend) -> Self {
+impl From<AudioHost> for vc_app::AudioHost {
+    fn from(value: AudioHost) -> Self {
         match value {
-            AudioBackend::Cpal => Self::Cpal,
-            AudioBackend::Wasapi => Self::Wasapi,
+            AudioHost::Wasapi => Self::Wasapi,
+            AudioHost::Asio => Self::Asio,
+            AudioHost::CoreAudio => Self::CoreAudio,
+            AudioHost::Alsa => Self::Alsa,
+            AudioHost::Jack => Self::Jack,
         }
     }
 }
@@ -170,16 +180,20 @@ impl From<Smoother> for vc_app::Smoother {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum DeviceAudioBackend {
+pub enum DeviceHost {
     All,
-    Cpal,
     Wasapi,
+    Asio,
+    #[value(name = "coreaudio")]
+    CoreAudio,
+    Alsa,
+    Jack,
 }
 
 #[derive(Debug, Parser)]
 pub struct DevicesArgs {
-    #[arg(long, value_enum, default_value_t = DeviceAudioBackend::Cpal)]
-    pub audio_backend: DeviceAudioBackend,
+    #[arg(long, value_enum, default_value_t = DeviceHost::All)]
+    pub audio_backend: DeviceHost,
 }
 
 #[derive(Debug, Parser)]
@@ -196,8 +210,24 @@ pub struct RunArgs {
     pub input: Option<String>,
     #[arg(long)]
     pub output: Option<String>,
-    #[arg(long, value_enum, default_value_t = AudioBackend::Cpal)]
-    pub audio_backend: AudioBackend,
+    #[arg(
+        long,
+        value_enum,
+        help = "Audio backend for both directions (default: platform default); override per direction with --input-backend/--output-backend"
+    )]
+    pub audio_backend: Option<AudioHost>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Input audio backend; defaults to --audio-backend"
+    )]
+    pub input_backend: Option<AudioHost>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Output audio backend; defaults to --audio-backend"
+    )]
+    pub output_backend: Option<AudioHost>,
     #[arg(long)]
     pub wasapi_exclusive: bool,
     #[arg(long)]
@@ -430,11 +460,39 @@ impl RunArgs {
         })
     }
 
+    // Effective per-direction hosts: --input-backend/--output-backend override the
+    // --audio-backend default, which applies to both directions otherwise; an
+    // entirely unset host falls back to the platform default.
+    pub fn effective_input_host(&self) -> vc_app::AudioHost {
+        self.input_backend
+            .or(self.audio_backend)
+            .map(Into::into)
+            .unwrap_or_default()
+    }
+
+    pub fn effective_output_host(&self) -> vc_app::AudioHost {
+        self.output_backend
+            .or(self.audio_backend)
+            .map(Into::into)
+            .unwrap_or_default()
+    }
+
     pub fn validate_audio_options(&self) -> Result<(), String> {
-        if (self.wasapi_exclusive || self.wasapi_exclusive_input || self.wasapi_exclusive_output)
-            && self.audio_backend != AudioBackend::Wasapi
+        if (self.wasapi_exclusive || self.wasapi_exclusive_input)
+            && self.effective_input_host() != vc_app::AudioHost::Wasapi
         {
-            return Err("--wasapi-exclusive* options require --audio-backend wasapi".to_string());
+            return Err(
+                "--wasapi-exclusive/--wasapi-exclusive-input require the WASAPI input host"
+                    .to_string(),
+            );
+        }
+        if (self.wasapi_exclusive || self.wasapi_exclusive_output)
+            && self.effective_output_host() != vc_app::AudioHost::Wasapi
+        {
+            return Err(
+                "--wasapi-exclusive/--wasapi-exclusive-output require the WASAPI output host"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -568,13 +626,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_defaults_to_cpal_shared_audio() {
+    fn run_defaults_to_platform_host() {
         let cli = Cli::try_parse_from(["vc-rs", "run", "--passthrough"]).unwrap();
         let Command::Run(args) = cli.command else {
             panic!("expected run command");
         };
 
-        assert_eq!(args.audio_backend, AudioBackend::Cpal);
+        // No backend flags → unset, resolving to the platform default host.
+        assert_eq!(args.audio_backend, None);
+        assert_eq!(args.effective_input_host(), vc_app::AudioHost::default());
+        assert_eq!(args.effective_output_host(), vc_app::AudioHost::default());
         assert!(!args.wasapi_exclusive);
         assert!(!args.wasapi_input_exclusive());
         assert!(!args.wasapi_output_exclusive());
@@ -1184,7 +1245,7 @@ mod tests {
             panic!("expected run command");
         };
 
-        assert_eq!(args.audio_backend, AudioBackend::Wasapi);
+        assert_eq!(args.audio_backend, Some(AudioHost::Wasapi));
         assert!(!args.wasapi_exclusive);
         assert!(!args.wasapi_input_exclusive());
         assert!(!args.wasapi_output_exclusive());
@@ -1206,7 +1267,7 @@ mod tests {
             panic!("expected run command");
         };
 
-        assert_eq!(args.audio_backend, AudioBackend::Wasapi);
+        assert_eq!(args.audio_backend, Some(AudioHost::Wasapi));
         assert!(args.wasapi_exclusive);
         assert!(args.wasapi_input_exclusive());
         assert!(args.wasapi_output_exclusive());
@@ -1276,23 +1337,115 @@ mod tests {
             panic!("expected run command");
         };
 
-        assert_eq!(args.audio_backend, AudioBackend::Wasapi);
+        assert_eq!(args.audio_backend, Some(AudioHost::Wasapi));
         assert!(!args.wasapi_input_exclusive());
         assert!(args.wasapi_output_exclusive());
         assert!(args.validate_audio_options().is_ok());
     }
 
     #[test]
-    fn rejects_exclusive_options_without_wasapi_backend() {
-        let cli =
-            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--wasapi-exclusive"]).unwrap();
+    fn rejects_exclusive_options_without_wasapi_host() {
+        // A non-WASAPI input host with --wasapi-exclusive must be rejected.
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--input-backend",
+            "asio",
+            "--wasapi-exclusive",
+        ])
+        .unwrap();
         let Command::Run(args) = cli.command else {
             panic!("expected run command");
         };
 
         assert_eq!(
             args.validate_audio_options().unwrap_err(),
-            "--wasapi-exclusive* options require --audio-backend wasapi"
+            "--wasapi-exclusive/--wasapi-exclusive-input require the WASAPI input host"
+        );
+    }
+
+    #[test]
+    fn parses_asio_backend() {
+        let cli = Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--audio-backend", "asio"])
+            .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.audio_backend, Some(AudioHost::Asio));
+        assert_eq!(args.effective_input_host(), vc_app::AudioHost::Asio);
+        assert_eq!(args.effective_output_host(), vc_app::AudioHost::Asio);
+        assert!(args.validate_audio_options().is_ok());
+    }
+
+    #[test]
+    fn per_direction_hosts_override_audio_backend() {
+        // --audio-backend is the default for both directions; the per-direction
+        // flags override only their side.
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--input-backend",
+            "wasapi",
+            "--output-backend",
+            "asio",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.effective_input_host(), vc_app::AudioHost::Wasapi);
+        assert_eq!(args.effective_output_host(), vc_app::AudioHost::Asio);
+        assert!(args.validate_audio_options().is_ok());
+    }
+
+    #[test]
+    fn audio_backend_seeds_unset_direction() {
+        // Only the input direction is overridden; output falls back to
+        // --audio-backend (asio here).
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--audio-backend",
+            "asio",
+            "--input-backend",
+            "wasapi",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.effective_input_host(), vc_app::AudioHost::Wasapi);
+        assert_eq!(args.effective_output_host(), vc_app::AudioHost::Asio);
+    }
+
+    #[test]
+    fn exclusive_output_requires_wasapi_output_host() {
+        // Input is WASAPI but output is ASIO, so --wasapi-exclusive (both) fails on
+        // the output direction.
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--input-backend",
+            "wasapi",
+            "--output-backend",
+            "asio",
+            "--wasapi-exclusive",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(
+            args.validate_audio_options().unwrap_err(),
+            "--wasapi-exclusive/--wasapi-exclusive-output require the WASAPI output host"
         );
     }
 

@@ -34,13 +34,6 @@ pub struct WasapiStreamConfig {
     buffer_duration_hns: i64,
 }
 
-pub struct WasapiEndpoints {
-    pub input: WasapiStreamConfig,
-    pub output: WasapiStreamConfig,
-    pub input_sample_rate: u32,
-    pub output_sample_rate: u32,
-}
-
 pub struct WasapiStream {
     name: &'static str,
     running: Arc<AtomicBool>,
@@ -100,91 +93,56 @@ pub fn print_devices() -> Result<()> {
     Ok(())
 }
 
-pub fn device_names() -> Result<(Vec<String>, Vec<String>)> {
-    let _com = ComGuard::initialize()?;
-    let enumerator =
-        DeviceEnumerator::new().context("failed to create WASAPI device enumerator")?;
-    Ok((
-        device_names_for_direction(&enumerator, Direction::Capture)?,
-        device_names_for_direction(&enumerator, Direction::Render)?,
-    ))
-}
-
-fn device_names_for_direction(
-    enumerator: &DeviceEnumerator,
-    direction: Direction,
-) -> Result<Vec<String>> {
-    let devices = enumerator
-        .get_device_collection(&direction)
-        .with_context(|| format!("failed to enumerate WASAPI {direction} devices"))?;
-    let mut names = Vec::with_capacity(devices.get_nbr_devices()? as usize);
-    for index in 0..devices.get_nbr_devices()? {
-        names.push(summarize_device(&devices.get_device_at_index(index)?)?.friendly_name);
-    }
-    Ok(names)
-}
-
-pub fn open_realtime(
-    input_name: Option<&str>,
-    output_name: Option<&str>,
-    input_exclusive: bool,
-    output_exclusive: bool,
+// Each direction is resolved independently so a WASAPI endpoint can be paired
+// with a non-WASAPI endpoint on the other side (per-direction backends). The
+// input/output stream threads later create their own COM apartment; this COM
+// guard only covers enumeration/format probing on the calling thread.
+pub fn open_input(
+    name: Option<&str>,
+    exclusive: bool,
     wasapi_buffer_ms: u32,
-) -> Result<WasapiEndpoints> {
+) -> Result<WasapiStreamConfig> {
+    open_direction(name, exclusive, wasapi_buffer_ms, Direction::Capture)
+}
+
+pub fn open_output(
+    name: Option<&str>,
+    exclusive: bool,
+    wasapi_buffer_ms: u32,
+) -> Result<WasapiStreamConfig> {
+    open_direction(name, exclusive, wasapi_buffer_ms, Direction::Render)
+}
+
+fn open_direction(
+    name: Option<&str>,
+    exclusive: bool,
+    wasapi_buffer_ms: u32,
+    direction: Direction,
+) -> Result<WasapiStreamConfig> {
     let _com = ComGuard::initialize()?;
     let enumerator =
         DeviceEnumerator::new().context("failed to create WASAPI device enumerator")?;
 
-    let input_device = find_device(&enumerator, Direction::Capture, input_name)?;
-    let output_device = find_device(&enumerator, Direction::Render, output_name)?;
-    let input_summary = summarize_device(&input_device)?;
-    let output_summary = summarize_device(&output_device)?;
-
-    let input_base_format = device_format(&input_device, Direction::Capture)?;
-    let input_sample_rate = input_base_format.get_samplespersec();
-    if input_sample_rate == 0 {
-        bail!("WASAPI input device reported an invalid sample rate");
+    let device = find_device(&enumerator, direction, name)?;
+    let summary = summarize_device(&device)?;
+    let base_format = device_format(&device, direction)?;
+    let sample_rate = base_format.get_samplespersec();
+    if sample_rate == 0 {
+        bail!("WASAPI {direction} device reported an invalid sample rate");
     }
+    let channels = base_format.get_nchannels().max(1) as usize;
 
-    let input_channels = input_base_format.get_nchannels().max(1) as usize;
-    let output_base_format = device_format(&output_device, Direction::Render)?;
-    let output_sample_rate = output_base_format.get_samplespersec();
-    if output_sample_rate == 0 {
-        bail!("WASAPI output device reported an invalid sample rate");
-    }
-    let output_channels = output_base_format.get_nchannels().max(1) as usize;
-
-    let input = select_stream_config(
-        &input_device,
-        input_summary,
+    select_stream_config(
+        &device,
+        summary,
         StreamConfigSelection {
-            sample_rate: input_sample_rate,
-            channels: input_channels,
-            exclusive: input_exclusive,
+            sample_rate,
+            channels,
+            exclusive,
             wasapi_buffer_ms,
-            direction: Direction::Capture,
+            direction,
         },
-    )?;
-    let output = select_stream_config(
-        &output_device,
-        output_summary,
-        StreamConfigSelection {
-            sample_rate: output_sample_rate,
-            channels: output_channels,
-            exclusive: output_exclusive,
-            wasapi_buffer_ms,
-            direction: Direction::Render,
-        },
-    )?;
-
-    let input_sample_rate = input.sample_rate;
-    let output_sample_rate = output.sample_rate;
-    Ok(WasapiEndpoints {
-        input,
-        output,
-        input_sample_rate,
-        output_sample_rate,
-    })
+    )
 }
 
 pub fn build_input_stream<F>(config: WasapiStreamConfig, on_samples: F) -> Result<WasapiStream>
