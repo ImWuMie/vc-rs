@@ -16,9 +16,18 @@ pub(super) struct RvcStreamInput {
     pub(super) convert_size: usize,
     pub(super) out_size: usize,
     pub(super) volume: f32,
+    // RMS of the new 16 kHz increment (post-input-denoiser), i.e. the same signal
+    // ContentVec/F0 consume. Drives input_rms/silence on the 16 kHz timeline for
+    // every denoiser mode — see the guardrail in `process`.
+    pub(super) input_rms: f32,
 }
 
 impl RvcStreamState {
+    /// Tail of the (post-input-denoiser) 16 kHz rolling signal, resampled to the
+    /// RVC output rate, for the RMS-mix reference. Uses `audio_16k_buffer` — the
+    /// same signal ContentVec/F0 consume — so the level reference matches the
+    /// model's input for every denoiser mode. Callers pass `input_sample_rate =
+    /// EMBEDDER_SAMPLE_RATE`.
     pub(super) fn output_reference_audio<'a>(
         &'a self,
         input_sample_rate: u32,
@@ -27,7 +36,7 @@ impl RvcStreamState {
         scratch: &'a mut Vec<f32>,
     ) -> Result<&'a [f32]> {
         scratch.clear();
-        if self.audio_buffer.is_empty()
+        if self.audio_16k_buffer.is_empty()
             || output_samples == 0
             || input_sample_rate == 0
             || output_sample_rate == 0
@@ -42,8 +51,8 @@ impl RvcStreamState {
             Rounding::Ceil,
         )
         .max(1);
-        let start = self.audio_buffer.len().saturating_sub(input_samples);
-        let input_tail = &self.audio_buffer[start..];
+        let start = self.audio_16k_buffer.len().saturating_sub(input_samples);
+        let input_tail = &self.audio_16k_buffer[start..];
         if input_sample_rate == output_sample_rate && input_tail.len() >= output_samples {
             return Ok(&input_tail[input_tail.len() - output_samples..]);
         }
@@ -157,6 +166,11 @@ impl RvcStreamState {
         if let Some(gtcrn) = self.gtcrn.as_mut() {
             gtcrn.process_in_place(&mut self.audio_16k_buffer[new_16k_start..])?;
         }
+        // input_rms/silence run on the 16 kHz post-input-denoiser signal (the same
+        // one ContentVec/F0 see) for every mode. Measure the raw new increment
+        // here, before the windowing below left-pads the front — so this never
+        // touches the zero pad.
+        let input_rms = dsp::rms(&self.audio_16k_buffer[new_16k_start..]);
         self.pitchf_buffer
             .extend(std::iter::repeat_n(0.0, new_feature_len));
 
@@ -171,12 +185,6 @@ impl RvcStreamState {
             RVC_SAMPLE_RATE,
             EMBEDDER_SAMPLE_RATE,
             Rounding::Floor,
-        );
-        let volume_excluded_input_samples = samples_between_rates(
-            volume_excluded_16k_samples,
-            EMBEDDER_SAMPLE_RATE,
-            sample_rate,
-            Rounding::Ceil,
         );
         let convert_size_16k = tensor_rt_convert_size_16k(
             new_audio.len(),
@@ -210,12 +218,17 @@ impl RvcStreamState {
         keep_tail_in_place(&mut self.audio_16k_buffer, convert_size_16k);
         keep_tail_in_place(&mut self.pitchf_buffer, feature_size);
 
-        let crop_len = new_audio.len() + volume_excluded_input_samples;
-        let crop_end = volume_excluded_input_samples;
-        let volume = if crop_len > crop_end && self.audio_buffer.len() >= crop_len {
-            let end = self.audio_buffer.len().saturating_sub(crop_end);
-            let start = self.audio_buffer.len().saturating_sub(crop_len);
-            dsp::rms(&self.audio_buffer[start..end])
+        // Volume envelope memory on the 16 kHz timeline (same signal as
+        // ContentVec/F0), the new-increment region minus the excluded tail. The
+        // crop is at the back of the buffer, so in steady state it avoids the
+        // front zero pad; at stream start it may dip into the pad exactly as the
+        // former device-rate crop did (parity, not a regression).
+        let crop_len_16k = new_audio_16k_samples + volume_excluded_16k_samples;
+        let crop_end_16k = volume_excluded_16k_samples;
+        let volume = if crop_len_16k > crop_end_16k && self.audio_16k_buffer.len() >= crop_len_16k {
+            let end = self.audio_16k_buffer.len().saturating_sub(crop_end_16k);
+            let start = self.audio_16k_buffer.len().saturating_sub(crop_len_16k);
+            dsp::rms(&self.audio_16k_buffer[start..end])
         } else {
             0.0
         };
@@ -228,6 +241,7 @@ impl RvcStreamState {
             convert_size,
             out_size,
             volume,
+            input_rms,
         })
     }
 

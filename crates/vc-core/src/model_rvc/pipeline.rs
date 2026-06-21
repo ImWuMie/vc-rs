@@ -1047,7 +1047,6 @@ impl VoiceModel for RvcPipeline {
         } else {
             audio
         };
-        let input_rms = dsp::rms(input_audio);
         let output_extra_len = ms_to_samples(RVC_SAMPLE_RATE, self.output_extra_ms);
         let volume_excluded_len = ms_to_samples(RVC_SAMPLE_RATE, self.volume_excluded_ms);
         let stream_input = self.stream_state.generate_input(
@@ -1061,6 +1060,11 @@ impl VoiceModel for RvcPipeline {
         // so its capacity is reused on the next chunk.
         self.input_scratch = input_scratch;
 
+        // input_rms/silence are derived from the new 16 kHz increment (the same
+        // post-input-denoiser signal ContentVec/F0 consume), not the raw
+        // device-rate chunk — for every denoiser mode. This also changes the
+        // `input_rms` reported in ModelOutput to the 16 kHz value (intended).
+        let input_rms = stream_input.input_rms;
         let is_silent = self.silence_threshold > 0.0 && input_rms < self.silence_threshold;
         let output_silent = is_silent && self.stream_state.prev_silence;
         self.stream_state.prev_silence = is_silent;
@@ -1247,8 +1251,11 @@ impl VoiceModel for RvcPipeline {
             // will search over. Use the input buffer tail with the same
             // duration; taking the head would compare against past context
             // added only to stabilize the model.
+            // Reference the 16 kHz rolling signal (resampled 16 kHz -> RVC rate),
+            // the same signal ContentVec/F0 see, so the RMS-mix level matches the
+            // model's input for every denoiser mode.
             let input_reference = self.stream_state.output_reference_audio(
-                sample_rate,
+                super::shape::EMBEDDER_SAMPLE_RATE,
                 RVC_SAMPLE_RATE,
                 out_audio.len(),
                 &mut self.input_reference_scratch,

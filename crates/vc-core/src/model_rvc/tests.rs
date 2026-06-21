@@ -11,7 +11,8 @@ use super::pitch::{
 use super::shape::{
     aligned_rvc_input_len, keep_tail_in_place, onnx_silence_front_feature_frames,
     output_len_from_convert_size, rmvpe_model_input_samples_16k,
-    rmvpe_model_input_samples_for_context_16k, tensor_rt_model_input_samples_16k, RVC_SAMPLE_RATE,
+    rmvpe_model_input_samples_for_context_16k, tensor_rt_model_input_samples_16k,
+    EMBEDDER_SAMPLE_RATE, RVC_SAMPLE_RATE,
 };
 use super::stream::{RvcStreamState, VOLUME_DECAY};
 use super::tensorrt::{
@@ -282,14 +283,19 @@ fn keeps_only_requested_output_tail() {
     assert_eq!(audio, vec![3, 4, 5]);
 }
 
+// The RMS-mix reference now reads the 16 kHz rolling buffer (the signal
+// ContentVec/F0 see), not the device-rate `audio_buffer`. These unit tests keep
+// the matched-rate (16 kHz in == 16 kHz out) tail/pad math by populating
+// `audio_16k_buffer` and passing `EMBEDDER_SAMPLE_RATE` — the assertion values
+// are unchanged; only the buffer the reference is drawn from moved.
 #[test]
 fn output_reference_audio_uses_tail_matching_trimmed_output() {
     let mut state = RvcStreamState::new();
-    state.audio_buffer = (0..8).map(|value| value as f32).collect();
+    state.audio_16k_buffer = (0..8).map(|value| value as f32).collect();
     let mut scratch = Vec::new();
 
     let reference = state
-        .output_reference_audio(RVC_SAMPLE_RATE, RVC_SAMPLE_RATE, 5, &mut scratch)
+        .output_reference_audio(EMBEDDER_SAMPLE_RATE, EMBEDDER_SAMPLE_RATE, 5, &mut scratch)
         .unwrap();
 
     assert_eq!(reference, &[3.0, 4.0, 5.0, 6.0, 7.0]);
@@ -298,11 +304,11 @@ fn output_reference_audio_uses_tail_matching_trimmed_output() {
 #[test]
 fn output_reference_audio_left_pads_when_history_is_short() {
     let mut state = RvcStreamState::new();
-    state.audio_buffer = vec![1.0, 2.0];
+    state.audio_16k_buffer = vec![1.0, 2.0];
     let mut scratch = Vec::new();
 
     let reference = state
-        .output_reference_audio(RVC_SAMPLE_RATE, RVC_SAMPLE_RATE, 4, &mut scratch)
+        .output_reference_audio(EMBEDDER_SAMPLE_RATE, EMBEDDER_SAMPLE_RATE, 4, &mut scratch)
         .unwrap();
 
     assert_eq!(reference, &[0.0, 0.0, 1.0, 2.0]);
