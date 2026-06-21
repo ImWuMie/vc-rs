@@ -68,6 +68,7 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
             ..F0Config::default()
         },
         denoiser_mode,
+        gtcrn_model_dir: args.gtcrn_model,
         noise_gate_shaping: NoiseGateShaping {
             attack_ms: args.noise_gate_attack_ms,
             release_ms: args.noise_gate_release_ms,
@@ -154,7 +155,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
     let gpu_priority: GpuPriority = args.gpu_priority.into();
     set_process_gpu_priority(gpu_priority);
     set_process_power_throttling(gpu_priority == GpuPriority::High);
-    let model = RvcPipeline::load(RvcPipelineConfig {
+    let pipeline_config = RvcPipelineConfig {
         model: &args.model,
         embedder: &args.embedder,
         embedder_output: args.embedder_output.as_deref(),
@@ -192,7 +193,11 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             max_output_gain: args.max_output_gain,
         },
         progress: None,
-    })?;
+    };
+    // GTCRN runs at the 16 kHz seam inside the pipeline (load_with_gtcrn), not as
+    // a device-rate pre-pass like RNNoise. Its ~48 ms fixed delay shifts content
+    // slightly at the clip boundaries; output length still matches the input.
+    let model = load_wav_pipeline(denoiser_mode, args.gtcrn_model.as_deref(), pipeline_config)?;
     let mut converter = ChunkConverter::new(
         model,
         ChunkOutputConfig {
@@ -266,6 +271,32 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Load the WAV-mode pipeline, selecting the GTCRN loader when requested. The
+/// disabled-feature path is a runtime error, not a build error.
+fn load_wav_pipeline(
+    denoiser_mode: Denoiser,
+    gtcrn_model: Option<&std::path::Path>,
+    config: RvcPipelineConfig<'_>,
+) -> Result<RvcPipeline> {
+    if denoiser_mode == Denoiser::Gtcrn {
+        #[cfg(feature = "gtcrn")]
+        {
+            let model_dir = gtcrn_model
+                .ok_or_else(|| anyhow!("GTCRN denoiser requires --gtcrn-model <dir>"))?;
+            return RvcPipeline::load_with_gtcrn(
+                config,
+                vc_core::denoise::GtcrnConfig { model_dir },
+            );
+        }
+        #[cfg(not(feature = "gtcrn"))]
+        {
+            let _ = gtcrn_model;
+            anyhow::bail!("GTCRN support is not enabled in this build");
+        }
+    }
+    RvcPipeline::load(config)
 }
 
 #[cfg(feature = "rnnoise")]

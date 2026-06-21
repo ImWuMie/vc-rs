@@ -117,6 +117,7 @@ pub enum Denoiser {
     Off,
     NoiseGate,
     Rnnoise,
+    Gtcrn,
 }
 
 impl From<Denoiser> for vc_app::DenoiserMode {
@@ -125,6 +126,7 @@ impl From<Denoiser> for vc_app::DenoiserMode {
             Denoiser::Off => Self::Off,
             Denoiser::NoiseGate => Self::NoiseGate,
             Denoiser::Rnnoise => Self::Rnnoise,
+            Denoiser::Gtcrn => Self::Gtcrn,
         }
     }
 }
@@ -274,8 +276,18 @@ pub struct RunArgs {
     pub input_gain: f32,
     #[arg(long, default_value_t = DEFAULT_OUTPUT_GAIN)]
     pub output_gain: f32,
-    #[arg(long, value_enum, help = "Input denoiser: off, noise-gate, or rnnoise")]
+    #[arg(
+        long,
+        value_enum,
+        help = "Input denoiser: off, noise-gate, rnnoise, or gtcrn"
+    )]
     pub denoiser: Option<Denoiser>,
+    #[arg(
+        long = "gtcrn-model",
+        value_name = "DIR",
+        help = "GTCRN model directory holding gtcrn_stream.onnx (required for --denoiser gtcrn)"
+    )]
+    pub gtcrn_model: Option<PathBuf>,
     #[arg(long = "noise-gate", conflicts_with = "denoiser", action = clap::ArgAction::SetTrue, help = "Deprecated alias for --denoiser noise-gate")]
     pub noise_gate: bool,
     #[arg(
@@ -346,8 +358,18 @@ pub struct WavArgs {
     pub input_gain: f32,
     #[arg(long, default_value_t = DEFAULT_OUTPUT_GAIN)]
     pub output_gain: f32,
-    #[arg(long, value_enum, help = "Input denoiser: off, noise-gate, or rnnoise")]
+    #[arg(
+        long,
+        value_enum,
+        help = "Input denoiser: off, noise-gate, rnnoise, or gtcrn"
+    )]
     pub denoiser: Option<Denoiser>,
+    #[arg(
+        long = "gtcrn-model",
+        value_name = "DIR",
+        help = "GTCRN model directory holding gtcrn_stream.onnx (required for --denoiser gtcrn)"
+    )]
+    pub gtcrn_model: Option<PathBuf>,
     #[arg(long = "noise-gate", conflicts_with = "denoiser", action = clap::ArgAction::SetTrue, help = "Deprecated alias for --denoiser noise-gate")]
     pub noise_gate: bool,
     #[arg(

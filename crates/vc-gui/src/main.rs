@@ -151,6 +151,8 @@ struct GuiSettings {
     input_gain: f32,
     output_gain: f32,
     denoiser: String,
+    #[serde(default)]
+    gtcrn_model_dir: String,
     #[serde(skip_serializing)]
     noise_gate_enabled: bool,
     noise_gate_threshold: f32,
@@ -194,6 +196,7 @@ impl Default for GuiSettings {
             input_gain: 1.0,
             output_gain: 1.0,
             denoiser: "off".to_string(),
+            gtcrn_model_dir: String::new(),
             noise_gate_enabled: false,
             noise_gate_threshold: 0.01,
             noise_gate_attack_ms: 5.0,
@@ -295,6 +298,11 @@ impl GuiSettings {
                 ..F0Config::default()
             },
             denoiser_mode: parse_denoiser(&self.denoiser)?,
+            gtcrn_model_dir: if self.gtcrn_model_dir.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(&self.gtcrn_model_dir))
+            },
             noise_gate_shaping: NoiseGateShaping {
                 attack_ms: self.noise_gate_attack_ms,
                 release_ms: self.noise_gate_release_ms,
@@ -662,6 +670,22 @@ impl eframe::App for VcGui {
                     )
                     .changed();
             }
+            // GTCRN model dir is reload-scoped (the denoiser is built at load),
+            // matching the staged-settings convention for model paths.
+            if self.settings.denoiser == "gtcrn" {
+                ui.horizontal(|ui| {
+                    ui.label("GTCRN model dir");
+                    changed |= ui
+                        .text_edit_singleline(&mut self.settings.gtcrn_model_dir)
+                        .changed();
+                    if ui.button("Browse…").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            self.settings.gtcrn_model_dir = dir.to_string_lossy().into_owned();
+                            changed = true;
+                        }
+                    }
+                });
+            }
             if changed {
                 self.changed();
             }
@@ -959,12 +983,13 @@ fn parse_denoiser(value: &str) -> Result<DenoiserMode, String> {
         "off" => Ok(DenoiserMode::Off),
         "noise-gate" => Ok(DenoiserMode::NoiseGate),
         "rnnoise" => Ok(DenoiserMode::Rnnoise),
+        "gtcrn" => Ok(DenoiserMode::Gtcrn),
         _ => Err(format!("Unsupported denoiser: {value}")),
     }
 }
 
 fn denoiser_names() -> &'static [&'static str] {
-    &["off", "noise-gate", "rnnoise"]
+    &["off", "noise-gate", "rnnoise", "gtcrn"]
 }
 
 // Hosts the GUI exposes per direction, as cpal HostId tokens. Platform-gated to

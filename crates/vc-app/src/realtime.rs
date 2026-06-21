@@ -93,6 +93,7 @@ pub enum DenoiserMode {
     Off,
     NoiseGate,
     Rnnoise,
+    Gtcrn,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +123,9 @@ pub struct RealtimeConfig {
     pub extra_convert_ms: u32,
     pub f0: F0Config,
     pub denoiser_mode: DenoiserMode,
+    // GTCRN model directory (holds gtcrn_stream.onnx). Required only when
+    // `denoiser_mode == Gtcrn`; ignored otherwise.
+    pub gtcrn_model_dir: Option<PathBuf>,
     // Denoiser mode and gate attack/release/floor are static (set at load);
     // the gate threshold is live (see `LiveParams`).
     pub noise_gate_shaping: NoiseGateShaping,
@@ -156,6 +160,7 @@ impl Default for RealtimeConfig {
             extra_convert_ms: 100,
             f0: F0Config::default(),
             denoiser_mode: DenoiserMode::Off,
+            gtcrn_model_dir: None,
             noise_gate_shaping: NoiseGateShaping::default(),
             output_dynamics: OutputDynamicsConfig::default(),
             passthrough: false,
@@ -202,6 +207,9 @@ impl RealtimeConfig {
             && (self.model.is_none() || self.embedder.is_none() || self.f0_model.is_none())
         {
             bail!("model, embedder, and F0 model are required");
+        }
+        if self.denoiser_mode == DenoiserMode::Gtcrn && self.gtcrn_model_dir.is_none() {
+            bail!("GTCRN denoiser requires a model directory (gtcrn_model_dir)");
         }
         Ok(())
     }
@@ -613,6 +621,10 @@ enum PassthroughDenoiser {
     Gate(dsp::NoiseGate),
     #[cfg(feature = "rnnoise")]
     Rnnoise(Box<vc_core::denoise::RnnoiseDenoiser>),
+    // Device-rate GTCRN instance, independent of the RVC-path 16 kHz one; its
+    // adapter resamplers engage (device <-> 16 kHz). Boxed like the others.
+    #[cfg(feature = "gtcrn")]
+    Gtcrn(Box<vc_core::denoise::GtcrnDenoiser>),
 }
 
 struct PassthroughProcessor {
@@ -620,6 +632,10 @@ struct PassthroughProcessor {
     shaping: NoiseGateShaping,
     input_rate: u32,
     output_rate: u32,
+    // GTCRN model dir, used only when `mode == Gtcrn` to (re)build the denoiser.
+    // Read only on the `gtcrn`-gated reset arm; inert without that feature.
+    #[cfg_attr(not(feature = "gtcrn"), allow(dead_code))]
+    gtcrn_model_dir: Option<PathBuf>,
     denoiser: PassthroughDenoiser,
     resampler: dsp::StreamingResampleMono,
     input_scratch: Vec<f32>,
@@ -631,6 +647,7 @@ impl PassthroughProcessor {
         shaping: NoiseGateShaping,
         input_rate: u32,
         output_rate: u32,
+        gtcrn_model_dir: Option<PathBuf>,
         live: &LiveParams,
     ) -> Result<Self> {
         let mut processor = Self {
@@ -638,6 +655,7 @@ impl PassthroughProcessor {
             shaping,
             input_rate,
             output_rate,
+            gtcrn_model_dir,
             denoiser: PassthroughDenoiser::Off,
             resampler: dsp::StreamingResampleMono::new(input_rate as usize, output_rate as usize)?,
             input_scratch: Vec::new(),
@@ -662,6 +680,22 @@ impl PassthroughProcessor {
                     bail!("RNNoise support is not enabled in this build")
                 }
             }
+            DenoiserMode::Gtcrn => {
+                #[cfg(feature = "gtcrn")]
+                {
+                    let model_dir = self.gtcrn_model_dir.as_deref().ok_or_else(|| {
+                        anyhow!("GTCRN denoiser requires a model directory (gtcrn_model_dir)")
+                    })?;
+                    PassthroughDenoiser::Gtcrn(Box::new(vc_core::denoise::GtcrnDenoiser::new(
+                        vc_core::denoise::GtcrnConfig { model_dir },
+                        self.input_rate,
+                    )?))
+                }
+                #[cfg(not(feature = "gtcrn"))]
+                {
+                    bail!("GTCRN support is not enabled in this build")
+                }
+            }
             DenoiserMode::Off | DenoiserMode::NoiseGate => PassthroughDenoiser::Off,
         };
         self.update_live_denoiser(live);
@@ -669,7 +703,9 @@ impl PassthroughProcessor {
     }
 
     fn update_live_denoiser(&mut self, live: &LiveParams) {
-        if self.mode == DenoiserMode::Rnnoise {
+        // Stateful denoisers are static load-time choices; a live gate toggle must
+        // never tear them down.
+        if self.mode == DenoiserMode::Rnnoise || self.mode == DenoiserMode::Gtcrn {
             return;
         }
         if !live.noise_gate_enabled {
@@ -708,6 +744,10 @@ impl PassthroughProcessor {
             PassthroughDenoiser::Gate(gate) => gate.process_in_place(&mut self.input_scratch),
             #[cfg(feature = "rnnoise")]
             PassthroughDenoiser::Rnnoise(denoiser) => {
+                denoiser.process_in_place(&mut self.input_scratch)?
+            }
+            #[cfg(feature = "gtcrn")]
+            PassthroughDenoiser::Gtcrn(denoiser) => {
                 denoiser.process_in_place(&mut self.input_scratch)?
             }
         }
@@ -895,6 +935,7 @@ impl RealtimeSession {
             config.noise_gate_shaping,
             input_rate,
             output_rate,
+            config.gtcrn_model_dir.clone(),
             &current_live,
         )?;
         let passthrough_live_switchable = config.has_complete_model_set();
@@ -922,6 +963,22 @@ impl RealtimeSession {
                     #[cfg(not(feature = "rnnoise"))]
                     {
                         bail!("RNNoise support is not enabled in this build")
+                    }
+                }
+                DenoiserMode::Gtcrn => {
+                    #[cfg(feature = "gtcrn")]
+                    {
+                        let model_dir = config.gtcrn_model_dir.as_deref().ok_or_else(|| {
+                            anyhow!("GTCRN denoiser requires a model directory (gtcrn_model_dir)")
+                        })?;
+                        RvcPipeline::load_with_gtcrn(
+                            pipeline_config,
+                            vc_core::denoise::GtcrnConfig { model_dir },
+                        )?
+                    }
+                    #[cfg(not(feature = "gtcrn"))]
+                    {
+                        bail!("GTCRN support is not enabled in this build")
                     }
                 }
             };
@@ -1322,6 +1379,7 @@ mod tests {
             NoiseGateShaping::default(),
             48_000,
             48_000,
+            None,
             &live,
         )
         .unwrap();
@@ -1352,6 +1410,7 @@ mod tests {
             },
             48_000,
             48_000,
+            None,
             &live,
         )
         .unwrap();
@@ -1373,6 +1432,7 @@ mod tests {
             NoiseGateShaping::default(),
             48_000,
             48_000,
+            None,
             &live,
         )
         .unwrap();
