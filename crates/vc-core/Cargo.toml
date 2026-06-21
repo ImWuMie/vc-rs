@@ -37,6 +37,13 @@ windowsml = ["ort", "ort/load-dynamic", "ort/api-24", "ort/directml"]
 # Pure-Rust RNNoise-compatible input denoising. Kept optional so package-scoped
 # VST3 builds do not compile or ship the standalone denoiser.
 rnnoise = ["dep:nnnoiseless"]
+# GTCRN ultra-light (≈48 K params) input denoiser at 16 kHz. We own the
+# STFT/iSTFT (pure-Rust `realfft`, DSP-only — no `ndarray`, no git pin); `ort`
+# runs the streaming graph. Windows ML standalone packages only; never enabled in
+# `vc-vst3` or the native-TensorRT distribution (ORT and native TensorRT never
+# share a process). The `stft`/`gtcrn_model` submodules stay ort-free so their
+# tests run without the Windows ML runtime.
+gtcrn = ["ort", "dep:realfft"]
 
 [dependencies]
 anyhow.workspace = true
@@ -48,6 +55,11 @@ audioadapter-buffers = "3"
 xxhash-rust = { version = "0.8.15", default-features = false, features = ["xxh3"] }
 clap = { version = "4.5", features = ["derive"], optional = true }
 nnnoiseless = { version = "0.5.2", default-features = false, optional = true }
+# STFT/iSTFT for the GTCRN denoiser. Pinned exactly: this is an audio-quality
+# dependency whose FFT planning must not drift under us, and the plan requires a
+# fixed rev cleared via cargo-about/cargo-deny. Pure Rust (wraps `rustfft`), no
+# `ndarray`, no git source.
+realfft = { version = "=3.5.0", optional = true }
 
 [build-dependencies]
 cc = "1"

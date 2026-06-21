@@ -17,9 +17,9 @@ mod provider;
 pub mod windows_ml;
 
 // Input-denoiser family (shared fixed-delay adapter + per-model frame
-// processors). Gated on the union of denoiser features; today only `rnnoise`
-// exists, but GTCRN/DeepFilterNet3 add themselves to this `cfg` when they land.
-#[cfg(feature = "rnnoise")]
+// processors). Gated on the union of denoiser features; DeepFilterNet3 adds
+// itself to this `cfg` when it lands.
+#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
 pub mod denoise;
 pub mod dsp;
 pub mod gpu;

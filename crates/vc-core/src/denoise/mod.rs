@@ -10,6 +10,11 @@
 mod adapter;
 #[cfg(feature = "rnnoise")]
 mod rnnoise;
+// GTCRN's STFT/iSTFT is ort-free DSP so it builds and tests without the Windows
+// ML runtime; the ort-touching frame processor (`gtcrn.rs`) lands in a later
+// phase once the streaming-graph contract is verified against a live model.
+#[cfg(feature = "gtcrn")]
+mod stft;
 
 // `FrameDenoiser` / `FixedDelayAdapter` are crate-internal building blocks; only
 // concrete denoisers are exported. The `allow` keeps them from tripping
