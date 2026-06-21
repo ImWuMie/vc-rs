@@ -140,11 +140,28 @@ switching back discards stale streaming context before conversion resumes.
 Model-free passthrough remains available, but that session cannot switch live
 back to RVC.
 
-Choose `off`, `noise-gate`, or `rnnoise` under **Input denoiser**. RNNoise uses
-an embedded model and needs no additional model download. Passthrough applies
-Input gain, the selected input denoiser, and Output gain. Switching between
-`off` and `noise-gate`, including the gate threshold, is live; switching to
-RNNoise requires **Apply / Start**. RNNoise is not included in VST3.
+Choose `off`, `noise-gate`, `rnnoise`, or `gtcrn` under **Input denoiser**.
+RNNoise uses an embedded model and needs no additional download. Passthrough
+applies Input gain, the selected input denoiser, and Output gain. Switching
+between `off` and `noise-gate`, including the gate threshold, is live; switching
+to RNNoise or GTCRN requires **Apply / Start**. These input denoisers are not
+included in VST3.
+
+Where each denoiser sits:
+
+| Mode | Cost | Quality | Notes |
+| --- | --- | --- | --- |
+| Noise Gate | very low | threshold gate only | embedded |
+| RNNoise | low | modest | embedded, 48 kHz |
+| **GTCRN** | **low** | **good** | **Windows ML packages only, 16 kHz, needs a model** |
+
+GTCRN is an ultra-light (~48K-parameter) speech-enhancement model that runs in
+real time on the CPU with large margin. It ships **only in the Windows ML
+standalone packages** (it needs ONNX Runtime; the native-TensorRT packages and
+VST3 do not include it). Its fixed delay is ~48 ms (the 16 kHz STFT
+reconstruction plus the adapter FIFO). Fetch the model with
+`download-models.ps1 -Gtcrn` into `assets\gtcrn\`, then point the GUI's **GTCRN
+model dir** or the CLI's `--gtcrn-model <dir>` at it.
 
 ## Tuning real-time settings
 

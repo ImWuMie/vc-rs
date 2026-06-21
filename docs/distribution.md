@@ -67,6 +67,13 @@ binary produced for another variant.
 - Standalone packages enable the pure-Rust `rnnoise` feature. VST3 packages
   must not enable or advertise RNNoise; inspect package-scoped dependency and
   license output to catch accidental feature unification.
+- The **Windows ML standalone** package additionally enables `gtcrn` (the 16 kHz
+  GTCRN input denoiser; pulls `realfft`/`rustfft`). The **TensorRT standalone**
+  package must NOT enable it — GTCRN needs ONNX Runtime, which the TensorRT build
+  drops. VST3 (either variant) must not enable or ship `gtcrn`; verify the
+  package-scoped dependency/license output contains no `realfft`/`rustfft` or
+  GTCRN code. GTCRN models are never bundled (fetched via `download-models.ps1
+  -Gtcrn`).
 
 Start packaging from clean per-variant staging directories. Stale sidecar DLLs
 from another package must never survive into a release.

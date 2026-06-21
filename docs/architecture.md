@@ -126,9 +126,9 @@ This lifecycle preserves three invariants:
 
 ```mermaid
 flowchart TD
-    input["Device-rate mono chunk"] --> denoise["Off / Gate / RNNoise"]
+    input["Device-rate mono chunk"] --> denoise["Off / Gate / RNNoise<br/>(device rate)"]
     denoise --> state["Rolling stream state"]
-    state --> resample["Resample/context at 16 kHz"]
+    state --> resample["Resample to 16 kHz<br/>(+ GTCRN denoise, if active)"]
     resample --> embed["Content embedder"]
     resample --> f0["F0 estimator"]
     embed --> feats["Content feature 2x upsampling"]
@@ -143,10 +143,26 @@ flowchart TD
     join --> device["Device-rate output chunk"]
 ```
 
-Standalone RNNoise runs after input gain and before RMS/silence detection,
-ContentVec, and F0 extraction. Its fixed-delay adapter preserves the input sample
-count for every worker call while retaining recurrent and resampler state across
-chunks. VST3 intentionally does not enable or ship this optional core feature.
+Standalone RNNoise (48 kHz) runs at the **device rate**, after input gain and
+before RMS/silence detection, ContentVec, and F0 extraction. Its fixed-delay
+adapter preserves the input sample count for every worker call while retaining
+recurrent and resampler state across chunks.
+
+**GTCRN (16 kHz) is the exception to the device-rate rule.** It denoises the new
+16 kHz increment *inside* `generate_input` — reusing the resample the pipeline
+already does into `audio_16k_buffer`, before that increment is windowed — so the
+realtime hot path pays no extra round-trip resample and the model sees native
+16 kHz. It shares the same fixed-delay `FrameDenoiser` adapter as RNNoise (at
+16 kHz the adapter's resamplers are bypass), preserves the per-call 16 kHz sample
+count, and never shifts the feature/F0 grid. Because the cleaned signal now is the
+one ContentVec/F0 consume, the RVC-path **input RMS, silence detection,
+volume-envelope memory, and RMS-mix reference are all derived from that 16 kHz
+timeline for every denoiser mode** (Off / Gate / RNNoise / GTCRN), not from the
+raw device-rate buffer. The passthrough route keeps a separate device-rate GTCRN
+instance (its resamplers engage). GTCRN ships only in the Windows ML standalone
+packages (it needs ONNX Runtime); VST3 and the native-TensorRT packages do not
+enable or ship it. VST3 intentionally does not enable or ship these optional core
+denoisers.
 
 Conceptually, RVC conversion has three model-facing inputs:
 

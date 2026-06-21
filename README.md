@@ -131,11 +131,27 @@ RVC 音声変換モデル（`.onnx`）は別途自分で用意してください
 破棄して再開します。モデルなしの純パススルーも引き続き利用できますが、その
 セッションでは RVC へライブ切り替えできません。
 
-入力ノイズ抑制は **Input denoiser** から `off` / `noise-gate` / `rnnoise` を選択
-できます。パススルーにも Input gain、選択中の入力ノイズ抑制、Output gain が適用
-されます。RNNoiseは組み込みモデルを使うため、追加モデルは不要です。`off` と
-`noise-gate` の切り替え・しきい値はライブ反映され、RNNoiseへの切り替えは
-**Apply / Start** が必要です。VST3版にはRNNoiseは含まれません。
+入力ノイズ抑制は **Input denoiser** から `off` / `noise-gate` / `rnnoise` /
+`gtcrn` を選択できます。パススルーにも Input gain、選択中の入力ノイズ抑制、
+Output gain が適用されます。RNNoiseは組み込みモデルを使うため追加モデルは不要
+です。`off` と `noise-gate` の切り替え・しきい値はライブ反映され、RNNoise /
+GTCRN への切り替えは **Apply / Start** が必要です。VST3版にはこれらの入力ノイズ
+抑制は含まれません。
+
+入力ノイズ抑制の位置づけ:
+
+| モード | コスト | 品質 | 備考 |
+| --- | --- | --- | --- |
+| Noise Gate | 極小 | しきい値ゲートのみ | 組み込み |
+| RNNoise | 低 | 控えめ | 組み込み・48 kHz |
+| **GTCRN** | **低** | **良好** | **Windows ML 版のみ・16 kHz・要モデル** |
+
+GTCRN は超軽量（約 48K パラメータ）の音声強調モデルで、CPU でもリアルタイムに
+十分間に合います。**Windows ML 版の standalone（CLI/GUI）でのみ**利用でき
+（ONNX Runtime が必要なため。native TensorRT 版・VST3 版には含まれません）、
+固定遅延は約 48 ms（16 kHz の STFT 再構成 + アダプタの FIFO）です。モデルは
+`download-models.ps1 -Gtcrn` で `assets\gtcrn\` に取得し、GUI の **GTCRN model
+dir** または CLI の `--gtcrn-model <dir>` で指定します。
 
 ## リアルタイム設定の調整
 
