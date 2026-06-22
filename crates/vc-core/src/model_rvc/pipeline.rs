@@ -1232,13 +1232,12 @@ impl VoiceModel for RvcPipeline {
         let raw_output_samples = out_audio.len();
         keep_tail_in_place(out_audio, stream_input.out_size);
         pitchf_tail_for_output_into(pitchf, out_audio.len(), RVC_SAMPLE_RATE, out_pitchf);
-        out_audio.iter_mut().for_each(|x| *x = x.clamp(-1.0, 1.0));
-        if self.volume_envelope {
-            let envelope = stream_input.volume.sqrt().clamp(0.0, 1.0);
-            for sample in out_audio.iter_mut() {
-                *sample *= envelope;
-            }
-        }
+        let output_envelope = if self.volume_envelope {
+            stream_input.volume.sqrt().clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        dsp::clamp_scale_in_place(out_audio, output_envelope);
         if self.rms_mix_rate < 1.0 {
             // Captured before apply_rms_mix mutates `out_audio`, but only used
             // in the debug! below; skip the extra RMS pass when debug is off.
@@ -1277,12 +1276,11 @@ impl VoiceModel for RvcPipeline {
         }
         let output_rms_before_gain = dsp::rms(out_audio);
         let applied_output_gain = self.applied_output_gain(output_rms_before_gain);
-        if (applied_output_gain - 1.0).abs() > f32::EPSILON {
-            for sample in out_audio.iter_mut() {
-                *sample = (*sample * applied_output_gain).clamp(-1.0, 1.0);
-            }
-        }
-        let output_rms = dsp::rms(out_audio);
+        let output_rms = if (applied_output_gain - 1.0).abs() > f32::EPSILON {
+            dsp::apply_gain_and_rms(out_audio, applied_output_gain)
+        } else {
+            output_rms_before_gain
+        };
 
         Ok(ModelOutput {
             sample_rate: RVC_SAMPLE_RATE,

@@ -136,6 +136,34 @@ pub fn rms(input: &[f32]) -> f32 {
     (sum / input.len() as f32).sqrt()
 }
 
+#[inline]
+pub fn clamp_scale_in_place(input: &mut [f32], scale: f32) {
+    if (scale - 1.0).abs() <= f32::EPSILON {
+        for sample in input {
+            *sample = sample.clamp(-1.0, 1.0);
+        }
+    } else {
+        for sample in input {
+            *sample = sample.clamp(-1.0, 1.0) * scale;
+        }
+    }
+}
+
+#[inline]
+pub fn apply_gain_and_rms(input: &mut [f32], gain: f32) -> f32 {
+    if input.is_empty() {
+        return 0.0;
+    }
+
+    let mut sum = 0.0;
+    for sample in input.iter_mut() {
+        let scaled = (*sample * gain).clamp(-1.0, 1.0);
+        *sample = scaled;
+        sum += scaled * scaled;
+    }
+    (sum / input.len() as f32).sqrt()
+}
+
 #[derive(Default)]
 pub struct RmsMixScratch {
     input_rms: Vec<f32>,
@@ -834,6 +862,36 @@ mod tests {
     fn computes_rms() {
         assert_abs_diff_eq!(rms(&[1.0, -1.0]), 1.0);
         assert_eq!(rms(&[]), 0.0);
+    }
+
+    #[test]
+    fn clamp_scale_in_place_matches_separate_passes() {
+        let mut combined = [-2.0, -0.5, 0.25, 2.0];
+        let mut separate = combined;
+
+        clamp_scale_in_place(&mut combined, 0.5);
+        separate
+            .iter_mut()
+            .for_each(|sample| *sample = sample.clamp(-1.0, 1.0));
+        for sample in &mut separate {
+            *sample *= 0.5;
+        }
+
+        assert_eq!(combined, separate);
+    }
+
+    #[test]
+    fn apply_gain_and_rms_matches_separate_passes() {
+        let mut combined = [-0.75, -0.25, 0.25, 0.75];
+        let mut separate = combined;
+
+        let combined_rms = apply_gain_and_rms(&mut combined, 2.0);
+        for sample in &mut separate {
+            *sample = (*sample * 2.0).clamp(-1.0, 1.0);
+        }
+
+        assert_eq!(combined, separate);
+        assert_abs_diff_eq!(combined_rms, rms(&separate), epsilon = 1e-6);
     }
 
     #[test]

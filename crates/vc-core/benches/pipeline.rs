@@ -236,6 +236,32 @@ mod dsp_bench {
             black_box(&out);
         });
     }
+
+    #[divan::bench(args = [
+        (CHUNK_48K_100MS, 1.0_f32, 1.0_f32),
+        (CHUNK_48K_100MS, 1.0_f32, 2.0_f32),
+        (CHUNK_48K_100MS, 0.5_f32, 2.0_f32),
+        (CHUNK_48K_250MS, 1.0_f32, 1.0_f32),
+        (CHUNK_48K_250MS, 1.0_f32, 2.0_f32),
+        (CHUNK_48K_250MS, 0.5_f32, 2.0_f32),
+    ])]
+    fn output_level_finalize(bencher: Bencher, (len, envelope, applied_gain): (usize, f32, f32)) {
+        let template = synthetic_signal(len, 48_000);
+        bencher
+            .with_inputs(|| template.clone())
+            .bench_local_values(|mut output| {
+                dsp::clamp_scale_in_place(&mut output, envelope);
+                let output_rms_before_gain = dsp::rms(&output);
+                black_box(output_rms_before_gain);
+                let output_rms = if (applied_gain - 1.0).abs() > f32::EPSILON {
+                    dsp::apply_gain_and_rms(&mut output, applied_gain)
+                } else {
+                    output_rms_before_gain
+                };
+                black_box(output_rms);
+                black_box(output);
+            });
+    }
 }
 
 mod sola_bench {
