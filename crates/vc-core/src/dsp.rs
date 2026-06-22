@@ -76,13 +76,24 @@ pub fn f32_to_i32_into(input: &[f32], output: &mut [i32]) {
 pub fn downmix_to_mono_into(input: &[f32], channels: usize, output: &mut [f32]) {
     debug_assert!(channels >= 1);
     debug_assert_eq!(input.len(), output.len() * channels);
-    if channels == 1 {
-        output.copy_from_slice(input);
-        return;
-    }
-    let scale = 1.0 / channels as f32;
-    for (dst, frame) in output.iter_mut().zip(input.chunks_exact(channels)) {
-        *dst = frame.iter().sum::<f32>() * scale;
+    match channels {
+        1 => output.copy_from_slice(input),
+        2 => {
+            for (dst, frame) in output.iter_mut().zip(input.chunks_exact(2)) {
+                *dst = (frame[0] + frame[1]) * 0.5;
+            }
+        }
+        4 => {
+            for (dst, frame) in output.iter_mut().zip(input.chunks_exact(4)) {
+                *dst = (frame[0] + frame[1] + frame[2] + frame[3]) * 0.25;
+            }
+        }
+        _ => {
+            let scale = 1.0 / channels as f32;
+            for (dst, frame) in output.iter_mut().zip(input.chunks_exact(channels)) {
+                *dst = frame.iter().sum::<f32>() * scale;
+            }
+        }
     }
 }
 
@@ -93,8 +104,27 @@ pub fn downmix_to_mono_into(input: &[f32], channels: usize, output: &mut [f32]) 
 pub fn upmix_mono_into<T: Copy>(mono: &[T], channels: usize, output: &mut [T]) {
     debug_assert!(channels >= 1);
     debug_assert_eq!(output.len(), mono.len() * channels);
-    for (frame, &sample) in output.chunks_exact_mut(channels).zip(mono) {
-        frame.fill(sample);
+    match channels {
+        1 => output.copy_from_slice(mono),
+        2 => {
+            for (frame, &sample) in output.chunks_exact_mut(2).zip(mono) {
+                frame[0] = sample;
+                frame[1] = sample;
+            }
+        }
+        4 => {
+            for (frame, &sample) in output.chunks_exact_mut(4).zip(mono) {
+                frame[0] = sample;
+                frame[1] = sample;
+                frame[2] = sample;
+                frame[3] = sample;
+            }
+        }
+        _ => {
+            for (frame, &sample) in output.chunks_exact_mut(channels).zip(mono) {
+                frame.fill(sample);
+            }
+        }
     }
 }
 
@@ -694,6 +724,17 @@ mod tests {
     }
 
     #[test]
+    fn downmix_averages_four_channel_frames() {
+        let quad = [1.0, 0.0, 0.5, -0.5, -1.0, 1.0, 0.25, -0.25];
+        let mut mono = [9.0; 2];
+
+        downmix_to_mono_into(&quad, 4, &mut mono);
+
+        assert_abs_diff_eq!(mono[0], 0.25, epsilon = 1e-6);
+        assert_abs_diff_eq!(mono[1], 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
     fn downmix_mono_is_copy() {
         let input = [0.25, -0.75];
         let mut output = [0.0; 2];
@@ -711,6 +752,26 @@ mod tests {
         upmix_mono_into(&mono, 2, &mut stereo);
 
         assert_eq!(stereo, [0.25, 0.25, -0.5, -0.5]);
+    }
+
+    #[test]
+    fn upmix_mono_channel_count_copies() {
+        let mono = [0.25, -0.5];
+        let mut output = [9.0; 2];
+
+        upmix_mono_into(&mono, 1, &mut output);
+
+        assert_eq!(output, mono);
+    }
+
+    #[test]
+    fn upmix_duplicates_mono_across_four_channels() {
+        let mono = [0.25, -0.5];
+        let mut quad = [9.0; 8];
+
+        upmix_mono_into(&mono, 4, &mut quad);
+
+        assert_eq!(quad, [0.25, 0.25, 0.25, 0.25, -0.5, -0.5, -0.5, -0.5]);
     }
 
     #[test]

@@ -200,6 +200,42 @@ mod dsp_bench {
             black_box(&out);
         });
     }
+
+    #[divan::bench(args = [
+        (CHUNK_48K_100MS, 2_usize),
+        (CHUNK_48K_100MS, 4_usize),
+        (CHUNK_48K_100MS, 6_usize),
+        (CHUNK_48K_250MS, 2_usize),
+        (CHUNK_48K_250MS, 4_usize),
+        (CHUNK_48K_250MS, 6_usize),
+    ])]
+    fn downmix_to_mono_into(bencher: Bencher, (frames, channels): (usize, usize)) {
+        let input = synthetic_signal(frames * channels, 48_000);
+        let mut out = vec![0.0f32; frames];
+        bencher.bench_local(|| {
+            dsp::downmix_to_mono_into(black_box(&input), channels, &mut out);
+            black_box(&out);
+        });
+    }
+
+    #[divan::bench(args = [
+        (CHUNK_48K_100MS, 1_usize),
+        (CHUNK_48K_100MS, 2_usize),
+        (CHUNK_48K_100MS, 4_usize),
+        (CHUNK_48K_100MS, 6_usize),
+        (CHUNK_48K_250MS, 1_usize),
+        (CHUNK_48K_250MS, 2_usize),
+        (CHUNK_48K_250MS, 4_usize),
+        (CHUNK_48K_250MS, 6_usize),
+    ])]
+    fn upmix_mono_into(bencher: Bencher, (frames, channels): (usize, usize)) {
+        let mono = synthetic_signal(frames, 48_000);
+        let mut out = vec![0.0f32; frames * channels];
+        bencher.bench_local(|| {
+            dsp::upmix_mono_into(black_box(&mono), channels, &mut out);
+            black_box(&out);
+        });
+    }
 }
 
 mod sola_bench {
