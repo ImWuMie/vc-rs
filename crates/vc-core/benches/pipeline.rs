@@ -68,10 +68,17 @@ mod dsp_bench {
     }
 
     // Volume-following mix of the model output toward the input reference RMS;
-    // runs once per chunk. `rms_mix_rate = 0.5` exercises the full envelope path
-    // (0.0/1.0 short-circuit). Scratch is reused, matching the worker.
-    #[divan::bench(args = [CHUNK_48K_100MS, CHUNK_48K_250MS])]
-    fn apply_rms_mix_with_scratch(bencher: Bencher, len: usize) {
+    // runs once per chunk. The rates cover both exact fast paths (0.0/0.5) and
+    // the generic powf path (0.9). Scratch is reused, matching the worker.
+    #[divan::bench(args = [
+        (CHUNK_48K_100MS, 0.0_f32),
+        (CHUNK_48K_100MS, 0.5_f32),
+        (CHUNK_48K_100MS, 0.9_f32),
+        (CHUNK_48K_250MS, 0.0_f32),
+        (CHUNK_48K_250MS, 0.5_f32),
+        (CHUNK_48K_250MS, 0.9_f32),
+    ])]
+    fn apply_rms_mix_with_scratch(bencher: Bencher, (len, rms_mix_rate): (usize, f32)) {
         let reference = synthetic_signal(len, 48_000);
         let mut scratch = RmsMixScratch::default();
         let template = synthetic_signal(len, 48_000);
@@ -82,7 +89,7 @@ mod dsp_bench {
                     black_box(&reference),
                     &mut output,
                     48_000,
-                    0.5,
+                    rms_mix_rate,
                     &mut scratch,
                 );
                 black_box(output);

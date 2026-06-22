@@ -112,6 +112,35 @@ pub struct RmsMixScratch {
     output_rms: Vec<f32>,
 }
 
+#[derive(Clone, Copy)]
+enum RmsMixGainCurve {
+    Linear,
+    SquareRoot,
+    Power(f32),
+}
+
+impl RmsMixGainCurve {
+    #[inline]
+    fn for_exponent(exponent: f32) -> Self {
+        if exponent.to_bits() == 1.0f32.to_bits() {
+            Self::Linear
+        } else if exponent.to_bits() == 0.5f32.to_bits() {
+            Self::SquareRoot
+        } else {
+            Self::Power(exponent)
+        }
+    }
+
+    #[inline]
+    fn gain(self, ratio: f32) -> f32 {
+        match self {
+            Self::Linear => ratio,
+            Self::SquareRoot => ratio.sqrt(),
+            Self::Power(exponent) => ratio.powf(exponent),
+        }
+    }
+}
+
 pub fn compute_rms_envelope(input: &[f32], sample_rate: usize) -> Vec<f32> {
     let mut envelope = Vec::new();
     compute_rms_envelope_into(input, sample_rate, &mut envelope);
@@ -216,6 +245,10 @@ pub fn apply_rms_mix_with_scratch(
     compute_rms_envelope_into(input_reference, sample_rate, &mut scratch.input_rms);
     compute_rms_envelope_into(output, sample_rate, &mut scratch.output_rms);
     let exponent = 1.0 - rms_mix_rate;
+    // Common user settings map to exact exponent values. Keep those off the
+    // slower powf path without approximating nearby rates, which would change
+    // the level curve.
+    let gain_curve = RmsMixGainCurve::for_exponent(exponent);
     let output_len = output.len();
 
     for (index, sample) in output.iter_mut().enumerate() {
@@ -227,7 +260,7 @@ pub fn apply_rms_mix_with_scratch(
         let out_rms = linear_resample_envelope_at(&scratch.output_rms, index, output_len);
         let out_rms = finite_nonnegative(out_rms).max(1e-3);
         let ratio = finite_nonnegative(in_rms) / out_rms;
-        let gain = ratio.powf(exponent);
+        let gain = gain_curve.gain(ratio);
         let mixed = *sample * gain;
         *sample = if mixed.is_finite() { mixed } else { 0.0 };
     }
@@ -804,6 +837,19 @@ mod tests {
 
         for sample in output {
             assert_abs_diff_eq!(sample, 0.5f32.sqrt(), epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn rms_mix_uses_powf_for_non_special_rates() {
+        let input = vec![0.25; 4];
+        let mut output = vec![1.0; 4];
+
+        apply_rms_mix(&input, &mut output, 100, 0.9);
+
+        let expected = 0.25f32.powf(0.1);
+        for sample in output {
+            assert_abs_diff_eq!(sample, expected, epsilon = 1e-6);
         }
     }
 
