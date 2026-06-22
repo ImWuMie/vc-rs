@@ -4015,6 +4015,7 @@ dependencies = [
  "anyhow",
  "approx",
  "cpal",
+ "divan",
  "hound",
  "rtrb",
  "thread-priority",

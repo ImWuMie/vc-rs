@@ -13,8 +13,11 @@
 //! samples (the RVC output domain), and resampling benches use the 48k<->16k
 //! conversions the embedder/F0 front-end performs every chunk.
 
+use std::time::Duration;
+
 use divan::{black_box, Bencher};
 use vc_core::dsp::{self, NoiseGate, RmsMixScratch, StreamingResampleMono};
+use vc_core::model_rvc::{ChunkConverter, ChunkOutputConfig, ModelOutput, VoiceModel};
 use vc_core::sola::SmoothingKind;
 use vc_core::sola::{model_domain_chunk_smoother, prepare_model_output, ChunkSmootherConfig};
 
@@ -327,6 +330,115 @@ mod sola_bench {
             )
             .unwrap();
             black_box(sola_offset);
+        });
+    }
+}
+
+mod model_free_pipeline_bench {
+    use super::*;
+
+    struct MockVoiceModel {
+        audio: Vec<f32>,
+        pitchf: Vec<f32>,
+        output_rms: f32,
+    }
+
+    impl MockVoiceModel {
+        fn new(output_samples: usize) -> Self {
+            let audio = synthetic_signal(output_samples, 48_000);
+            let pitchf = vec![220.0f32; (output_samples / 480).max(1)];
+            let output_rms = dsp::rms(&audio);
+            Self {
+                audio,
+                pitchf,
+                output_rms,
+            }
+        }
+    }
+
+    impl VoiceModel for MockVoiceModel {
+        fn process(
+            &mut self,
+            audio: &[f32],
+            _sample_rate: u32,
+            out_audio: &mut Vec<f32>,
+            out_pitchf: &mut Vec<f32>,
+        ) -> anyhow::Result<ModelOutput> {
+            out_audio.clear();
+            out_audio.extend_from_slice(&self.audio);
+            out_pitchf.clear();
+            out_pitchf.extend_from_slice(&self.pitchf);
+            let input_rms = dsp::rms(audio);
+
+            // The model sessions are intentionally replaced here: this bench
+            // measures the shared chunk conversion and join boundary without
+            // charging ContentVec/RMVPE/RVC generator execution or model loads.
+            Ok(ModelOutput {
+                sample_rate: 48_000,
+                inference_time: Duration::ZERO,
+                embedder_time: Duration::ZERO,
+                pitch_time: Duration::ZERO,
+                rvc_time: Duration::ZERO,
+                input_rms,
+                voiced_ratio: 1.0,
+                raw_output_samples: out_audio.len(),
+                output_rms: self.output_rms,
+                applied_output_gain: 1.0,
+                feature_frames: self.pitchf.len(),
+                pitch_frames: self.pitchf.len(),
+                silent: false,
+                convert_size: out_audio.len(),
+                out_size: out_audio.len(),
+                model_input_samples: audio.len(),
+                volume: input_rms,
+            })
+        }
+    }
+
+    fn output_config(kind: SmoothingKind, output_chunk_samples: usize) -> ChunkOutputConfig {
+        ChunkOutputConfig {
+            kind,
+            output_sample_rate: 48_000,
+            output_chunk_samples,
+            crossfade_ms: 85,
+            sola_search_ms: 12,
+            tail_discard_ms: 10,
+        }
+    }
+
+    fn model_output_samples_for(output_chunk_samples: usize) -> usize {
+        output_chunk_samples + dsp::chunk_samples_for_rate(48_000, 85 + 12 + 10)
+    }
+
+    // Integrated model-free chunk path: fake model output -> ChunkConverter ->
+    // SOLA/PSOLA fixed-size output. This sits above the DSP/SOLA unit benches
+    // while still avoiding all model inference and GPU/runtime dependencies.
+    #[divan::bench(args = [
+        (SmoothingKind::Sola, CHUNK_48K_100MS),
+        (SmoothingKind::Psola, CHUNK_48K_100MS),
+        (SmoothingKind::Sola, CHUNK_48K_250MS),
+        (SmoothingKind::Psola, CHUNK_48K_250MS),
+    ])]
+    fn chunk_converter_process_chunk(
+        bencher: Bencher,
+        (kind, output_chunk_samples): (SmoothingKind, usize),
+    ) {
+        let input = synthetic_signal(output_chunk_samples, 48_000);
+        let model = MockVoiceModel::new(model_output_samples_for(output_chunk_samples));
+        let mut converter = ChunkConverter::new(model, output_config(kind, output_chunk_samples));
+        let mut out = Vec::new();
+
+        // Prime the smoother and reusable Vec capacities so divan reports the
+        // steady-state worker cost instead of startup allocation.
+        converter
+            .process_chunk(&input, 48_000, None, &mut out)
+            .unwrap();
+
+        bencher.bench_local(|| {
+            let stats = converter
+                .process_chunk(black_box(&input), 48_000, None, black_box(&mut out))
+                .unwrap();
+            black_box((stats, converter.last_join_diagnostics(), out.len()));
         });
     }
 }

@@ -48,3 +48,8 @@ wasapi = "0.23"
 
 [dev-dependencies]
 approx = "0.5"
+divan = "0.1"
+
+[[bench]]
+name = "realtime_worker"
+harness = false
