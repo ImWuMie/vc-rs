@@ -22,8 +22,8 @@ use tracing::warn;
 
 use crate::Provider;
 
-#[cfg(feature = "ort")]
 use super::onnx_meta::RvcIoNames;
+#[cfg(feature = "ort")]
 use super::sessions::HubertEmbedderSession;
 use super::shape::onnx_silence_front_feature_frames;
 
