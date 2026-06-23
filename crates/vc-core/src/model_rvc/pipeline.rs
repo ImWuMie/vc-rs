@@ -395,13 +395,17 @@ impl RvcPipeline {
                 role: LoadModelRole::Rvc,
             },
         );
+        // Resolve the generator's I/O names (RVC-WebUI vs Applio export aliases)
+        // before loading, so the ORT bind sites use the names this model exports.
+        let rvc_info = inspect_rvc_model(config.model)?;
         let rvc = RvcModelSession::load(
             config.model,
             config.provider,
             None,
-            None,
+            Some(rvc_info.expected_feat_channels),
             TensorRtRunMode::PinnedCpu,
             TensorRtSessionPurpose::Main,
+            rvc_info.io_names,
         )?;
         let expected_feat_channels = rvc.expected_feat_channels;
         report_progress(
@@ -587,11 +591,14 @@ impl RvcPipeline {
                 )?;
                 drop(embedder_probe);
                 let feature_len = warmup.rvc_feature_len;
-                let rvc_profile =
-                    TensorRtSessionProfile::rvc(feature_len, expected_feat_channels_usize)
-                        .with_gpu_priority(config.gpu_priority)
-                        .with_gpu_device_id(gpu_device_id)
-                        .with_optional_model_cache_key(rvc_model_cache_key.clone());
+                let rvc_profile = TensorRtSessionProfile::rvc(
+                    feature_len,
+                    expected_feat_channels_usize,
+                    &rvc_info.io_names,
+                )
+                .with_gpu_priority(config.gpu_priority)
+                .with_gpu_device_id(gpu_device_id)
+                .with_optional_model_cache_key(rvc_model_cache_key.clone());
                 info!(
                 "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} rvc={}",
                 config.provider.label(),
@@ -632,6 +639,7 @@ impl RvcPipeline {
                     Some(rvc_info.expected_feat_channels),
                     TensorRtRunMode::PinnedCpu,
                     TensorRtSessionPurpose::Probe,
+                    rvc_info.io_names.clone(),
                 )?;
                 let rvc_output_shape = rvc_probe.warmup_output_shape(
                     feature_len,
@@ -679,6 +687,7 @@ impl RvcPipeline {
                     Some(rvc_info.expected_feat_channels),
                     tensor_rt_run_mode,
                     TensorRtSessionPurpose::Final,
+                    rvc_info.io_names.clone(),
                 )?;
                 rvc.enable_tensorrt_binding(&rvc_output_shape, config.speaker_id)?;
                 (embedder, pitch, rvc)
@@ -706,11 +715,14 @@ impl RvcPipeline {
                 None => bail!("native TensorRT embedder is missing its engine"),
             };
             let feature_len = derive_rvc_feature_len(contentvec_frames, extra_convert_samples)?;
-            let rvc_profile =
-                TensorRtSessionProfile::rvc(feature_len, expected_feat_channels_usize)
-                    .with_gpu_priority(config.gpu_priority)
-                    .with_gpu_device_id(gpu_device_id)
-                    .with_optional_model_cache_key(rvc_model_cache_key.clone());
+            let rvc_profile = TensorRtSessionProfile::rvc(
+                feature_len,
+                expected_feat_channels_usize,
+                &rvc_info.io_names,
+            )
+            .with_gpu_priority(config.gpu_priority)
+            .with_gpu_device_id(gpu_device_id)
+            .with_optional_model_cache_key(rvc_model_cache_key.clone());
             info!(
                 "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} rvc={}",
                 config.provider.label(),
@@ -732,6 +744,7 @@ impl RvcPipeline {
                 Some(rvc_info.expected_feat_channels),
                 tensor_rt_run_mode,
                 TensorRtSessionPurpose::Final,
+                rvc_info.io_names.clone(),
             )?;
             // Validates the engine frame/channel counts against the runtime
             // profile; native engines self-report their output shape and use no
@@ -797,11 +810,14 @@ impl RvcPipeline {
                     &warmup.contentvec_output_shape,
                     shared_waveform.as_ref(),
                 )?;
-                let rvc_profile =
-                    TensorRtSessionProfile::rvc(feature_len, expected_feat_channels_usize)
-                        .with_gpu_priority(config.gpu_priority)
-                        .with_gpu_device_id(gpu_device_id)
-                        .with_optional_model_cache_key(rvc_model_cache_key.clone());
+                let rvc_profile = TensorRtSessionProfile::rvc(
+                    feature_len,
+                    expected_feat_channels_usize,
+                    &rvc_info.io_names,
+                )
+                .with_gpu_priority(config.gpu_priority)
+                .with_gpu_device_id(gpu_device_id)
+                .with_optional_model_cache_key(rvc_model_cache_key.clone());
                 info!(
                 "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} rvc={}",
                 config.provider.label(),
@@ -846,6 +862,7 @@ impl RvcPipeline {
                     Some(rvc_info.expected_feat_channels),
                     tensor_rt_run_mode,
                     TensorRtSessionPurpose::Final,
+                    rvc_info.io_names.clone(),
                 )?;
                 let rvc_output_shape = rvc.warmup_output_shape(
                     feature_len,

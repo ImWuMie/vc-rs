@@ -56,6 +56,48 @@ pub(super) struct ModelIo {
     pub(super) metadata: Vec<(String, String)>,
 }
 
+/// The RVC generator's I/O tensor names, resolved to whatever aliases a given
+/// model actually exports. RVC ONNX exporters disagree on names: RVC-WebUI emits
+/// `feats`/`p_len`/`pitchf`, while Applio (and some older RVC export scripts)
+/// emit `phone`/`phone_lengths`/`nsff0`. The tensors carry the same semantics, so
+/// we resolve each role once at load and bind by the resolved name everywhere
+/// downstream (ORT `run`/IoBinding, TensorRT profiles, the native shim).
+#[derive(Debug, Clone)]
+pub(super) struct RvcIoNames {
+    pub(super) feats: String,
+    pub(super) p_len: String,
+    pub(super) pitch: String,
+    pub(super) pitchf: String,
+    pub(super) sid: String,
+    pub(super) audio: String,
+}
+
+// Accepted aliases per role, canonical (RVC-WebUI) name first. Resolution picks
+// the first alias the model actually exposes, so the canonical name keeps
+// precedence when a model happens to expose several.
+const RVC_FEATS_ALIASES: &[&str] = &["feats", "phone"];
+const RVC_P_LEN_ALIASES: &[&str] = &["p_len", "phone_lengths"];
+const RVC_PITCH_ALIASES: &[&str] = &["pitch"];
+const RVC_PITCHF_ALIASES: &[&str] = &["pitchf", "nsff0"];
+const RVC_SID_ALIASES: &[&str] = &["sid", "ds"];
+const RVC_AUDIO_ALIASES: &[&str] = &["audio", "out", "output"];
+
+impl RvcIoNames {
+    /// The canonical RVC-WebUI names, for tests/benchmarks that synthesize a
+    /// profile without a real model to resolve against.
+    #[cfg(test)]
+    pub(super) fn canonical() -> Self {
+        Self {
+            feats: "feats".to_string(),
+            p_len: "p_len".to_string(),
+            pitch: "pitch".to_string(),
+            pitchf: "pitchf".to_string(),
+            sid: "sid".to_string(),
+            audio: "audio".to_string(),
+        }
+    }
+}
+
 impl ModelIo {
     pub(super) fn input(&self, name: &str) -> Option<&TensorInfo> {
         self.inputs.iter().find(|tensor| tensor.name == name)
@@ -100,14 +142,52 @@ impl ModelIo {
         Ok(())
     }
 
-    /// RVC `feats` input channel count (the static last axis).
-    pub(super) fn expected_feat_channels(&self) -> Result<i64> {
+    /// Resolve every RVC generator I/O name to the alias this model exports,
+    /// erroring with the model's actual names when a role cannot be matched.
+    pub(super) fn resolve_rvc_io_names(&self) -> Result<RvcIoNames> {
+        Ok(RvcIoNames {
+            feats: self.resolve_input_alias("feats", RVC_FEATS_ALIASES)?,
+            p_len: self.resolve_input_alias("p_len", RVC_P_LEN_ALIASES)?,
+            pitch: self.resolve_input_alias("pitch", RVC_PITCH_ALIASES)?,
+            pitchf: self.resolve_input_alias("pitchf", RVC_PITCHF_ALIASES)?,
+            sid: self.resolve_input_alias("sid", RVC_SID_ALIASES)?,
+            audio: self.resolve_rvc_output()?,
+        })
+    }
+
+    fn resolve_input_alias(&self, role: &str, aliases: &[&str]) -> Result<String> {
+        for alias in aliases {
+            if self.input(alias).is_some() {
+                return Ok((*alias).to_string());
+            }
+        }
+        let actual: Vec<&str> = self.inputs.iter().map(|t| t.name.as_str()).collect();
+        bail!("RVC model has no '{role}' input (accepted names: {aliases:?}); model inputs are {actual:?}");
+    }
+
+    fn resolve_rvc_output(&self) -> Result<String> {
+        for alias in RVC_AUDIO_ALIASES {
+            if self.output(alias).is_some() {
+                return Ok((*alias).to_string());
+            }
+        }
+        // Exporters occasionally name the lone audio output something bespoke;
+        // a single-output graph is unambiguous, so accept it.
+        if self.outputs.len() == 1 {
+            return Ok(self.outputs[0].name.clone());
+        }
+        let actual: Vec<&str> = self.outputs.iter().map(|t| t.name.as_str()).collect();
+        bail!("RVC model has no audio output (accepted names: {RVC_AUDIO_ALIASES:?}); model outputs are {actual:?}");
+    }
+
+    /// Channel count (static last axis) of the resolved RVC `feats` input.
+    pub(super) fn feat_channels(&self, feats_name: &str) -> Result<i64> {
         let feats = self
-            .input("feats")
-            .ok_or_else(|| anyhow!("RVC model has no 'feats' input"))?;
-        feats
-            .last_dim_channels()
-            .ok_or_else(|| anyhow!("RVC 'feats' input does not expose a static channel count"))
+            .input(feats_name)
+            .ok_or_else(|| anyhow!("RVC model has no '{feats_name}' input"))?;
+        feats.last_dim_channels().ok_or_else(|| {
+            anyhow!("RVC '{feats_name}' input does not expose a static channel count")
+        })
     }
 
     pub(super) fn validate_rvc_metadata(&self) -> Result<()> {
@@ -537,6 +617,69 @@ mod tests {
             .metadata_value("metadata")
             .unwrap()
             .contains(r#""f0": 1"#));
+    }
+
+    fn rvc_io(inputs: &[&str], outputs: &[&str]) -> ModelIo {
+        ModelIo {
+            inputs: inputs
+                .iter()
+                .map(|name| TensorInfo {
+                    name: (*name).to_string(),
+                    elem_type: 1,
+                    dims: vec![1, 0, 768],
+                })
+                .collect(),
+            outputs: outputs
+                .iter()
+                .map(|name| TensorInfo {
+                    name: (*name).to_string(),
+                    elem_type: 1,
+                    dims: vec![1, 0],
+                })
+                .collect(),
+            metadata: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolves_rvc_webui_input_names() {
+        let io = rvc_io(&["feats", "p_len", "pitch", "pitchf", "sid"], &["audio"]);
+        let names = io.resolve_rvc_io_names().unwrap();
+        assert_eq!(names.feats, "feats");
+        assert_eq!(names.p_len, "p_len");
+        assert_eq!(names.pitchf, "pitchf");
+        assert_eq!(names.audio, "audio");
+        assert_eq!(io.feat_channels(&names.feats).unwrap(), 768);
+    }
+
+    #[test]
+    fn resolves_applio_input_name_aliases() {
+        // Applio export: phone/phone_lengths/nsff0 instead of feats/p_len/pitchf.
+        let io = rvc_io(
+            &["phone", "phone_lengths", "pitch", "nsff0", "sid"],
+            &["audio"],
+        );
+        let names = io.resolve_rvc_io_names().unwrap();
+        assert_eq!(names.feats, "phone");
+        assert_eq!(names.p_len, "phone_lengths");
+        assert_eq!(names.pitch, "pitch");
+        assert_eq!(names.pitchf, "nsff0");
+        assert_eq!(names.sid, "sid");
+        assert_eq!(io.feat_channels(&names.feats).unwrap(), 768);
+    }
+
+    #[test]
+    fn resolves_single_bespoke_output_name() {
+        let io = rvc_io(&["phone", "phone_lengths", "pitch", "nsff0", "sid"], &["o"]);
+        assert_eq!(io.resolve_rvc_io_names().unwrap().audio, "o");
+    }
+
+    #[test]
+    fn missing_rvc_input_errors_with_actual_names() {
+        let io = rvc_io(&["phone", "pitch", "nsff0", "sid"], &["audio"]);
+        let err = io.resolve_rvc_io_names().unwrap_err().to_string();
+        assert!(err.contains("p_len"), "{err}");
+        assert!(err.contains("phone"), "{err}");
     }
 
     #[test]

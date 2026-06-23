@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use tracing::info;
 
-use super::onnx_meta::read_model_io;
+use super::onnx_meta::{read_model_io, RvcIoNames};
 
 #[cfg(feature = "ort")]
 use super::sessions::{describe_value_type, load_session};
@@ -126,6 +126,9 @@ fn describe_tensor(tensor: &super::onnx_meta::TensorInfo) -> String {
 
 pub(super) struct RvcModelInfo {
     pub(super) expected_feat_channels: i64,
+    /// Generator I/O names resolved to this model's export convention; threaded
+    /// to every binding site so RVC-WebUI and Applio exports both load.
+    pub(super) io_names: RvcIoNames,
 }
 
 pub(super) fn inspect_contentvec_input_name(
@@ -147,11 +150,22 @@ pub(super) fn inspect_contentvec_input_name(
 
 pub(super) fn inspect_rvc_model(path: &Path) -> Result<RvcModelInfo> {
     let io = read_model_io(path)?;
-    io.require_inputs(&["feats", "p_len", "pitch", "pitchf", "sid"])?;
-    io.require_output("audio")?;
-    let expected_feat_channels = io.expected_feat_channels()?;
+    let io_names = io.resolve_rvc_io_names()?;
+    let expected_feat_channels = io.feat_channels(&io_names.feats)?;
     io.validate_rvc_metadata()?;
+    info!(
+        "inspected RVC model: {} inputs=[{},{},{},{},{}] output={} feat_channels={}",
+        path.display(),
+        io_names.feats,
+        io_names.p_len,
+        io_names.pitch,
+        io_names.pitchf,
+        io_names.sid,
+        io_names.audio,
+        expected_feat_channels
+    );
     Ok(RvcModelInfo {
         expected_feat_channels,
+        io_names,
     })
 }

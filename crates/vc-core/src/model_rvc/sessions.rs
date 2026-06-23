@@ -21,7 +21,7 @@ use crate::Provider;
 
 use super::feature::FeatureTensor;
 use super::native_tensorrt::{NativeContentVecEngine, NativeRmvpeEngine, NativeRvcEngine};
-use super::onnx_meta::read_model_io;
+use super::onnx_meta::{read_model_io, RvcIoNames};
 use super::tensorrt::*;
 
 /// Copies an embedder output (`shape` + `data`) into a reused `FeatureTensor`,
@@ -725,6 +725,7 @@ impl RvcCpuOutputBinding {
         feats_shape: &[usize],
         pitch_shape: &[usize],
         output_shape: &[usize],
+        audio_name: &str,
     ) -> Result<Self> {
         let allocator = Allocator::default();
         let mut output = Tensor::<f32>::new(&allocator, output_shape.to_vec())
@@ -732,7 +733,7 @@ impl RvcCpuOutputBinding {
         let mut binding = session
             .create_binding()
             .context("failed to create CPU RVC output IoBinding")?;
-        bind_output_tensor(&mut binding, "audio", &mut output)
+        bind_output_tensor(&mut binding, audio_name, &mut output)
             .context("failed to bind CPU RVC output 'audio'")?;
         Ok(Self {
             binding,
@@ -760,6 +761,10 @@ pub(super) struct RvcModelSession {
     #[cfg(feature = "ort")]
     cpu_output_binding: Option<RvcCpuOutputBinding>,
     pub(super) expected_feat_channels: i64,
+    /// Generator I/O names for this model's export convention; every ORT/TensorRT
+    /// bind site uses these instead of the canonical literals so Applio-named
+    /// models (`phone`/`nsff0`/...) bind correctly.
+    io_names: RvcIoNames,
 }
 
 impl RvcModelSession {
@@ -770,19 +775,20 @@ impl RvcModelSession {
         expected_feat_channels_override: Option<i64>,
         tensor_rt_run_mode: TensorRtRunMode,
         tensor_rt_session_purpose: TensorRtSessionPurpose,
+        io_names: RvcIoNames,
     ) -> Result<Self> {
         if provider.is_tensorrt() {
             let profile = tensor_rt_profile.as_ref().ok_or_else(|| {
                 anyhow!("native TensorRT RVC requires a fixed-shape TensorRT profile")
             })?;
-            let feats_shape = profile.fixed_input_dims("feats")?;
+            let feats_shape = profile.fixed_input_dims(&io_names.feats)?;
             let channels = feats_shape
                 .get(2)
                 .copied()
                 .ok_or_else(|| anyhow!("native TensorRT RVC feats profile must be rank-3"))?;
             let expected_feat_channels = expected_feat_channels_override
                 .unwrap_or_else(|| i64::try_from(channels).unwrap_or(i64::MAX));
-            let native_rvc = NativeRvcEngine::load(path, profile, channels)?;
+            let native_rvc = NativeRvcEngine::load(path, profile, channels, &io_names)?;
             info!(
                 "loaded native TensorRT RVC model={} frames={} channels={} session_purpose={}",
                 path.display(),
@@ -802,6 +808,7 @@ impl RvcModelSession {
                 #[cfg(feature = "ort")]
                 cpu_output_binding: None,
                 expected_feat_channels,
+                io_names,
             });
         }
         // CPU/CUDA only: validate via the provider-neutral reader, then load the
@@ -809,11 +816,17 @@ impl RvcModelSession {
         #[cfg(feature = "ort")]
         {
             let io = read_model_io(path)?;
-            io.require_inputs(&["feats", "p_len", "pitch", "pitchf", "sid"])?;
-            io.require_output("audio")?;
+            io.require_inputs(&[
+                io_names.feats.as_str(),
+                io_names.p_len.as_str(),
+                io_names.pitch.as_str(),
+                io_names.pitchf.as_str(),
+                io_names.sid.as_str(),
+            ])?;
+            io.require_output(io_names.audio.as_str())?;
             let expected_feat_channels = match expected_feat_channels_override {
                 Some(channels) => channels,
-                None => io.expected_feat_channels()?,
+                None => io.feat_channels(&io_names.feats)?,
             };
             io.validate_rvc_metadata()?;
             let session = load_session(
@@ -834,6 +847,7 @@ impl RvcModelSession {
                 native_rvc: None,
                 cpu_output_binding: None,
                 expected_feat_channels,
+                io_names,
             })
         }
         #[cfg(not(feature = "ort"))]
@@ -885,20 +899,20 @@ impl RvcModelSession {
             validate_tensorrt_input_shape(
                 self.provider,
                 self.tensor_rt_profile.as_ref(),
-                "feats",
+                self.io_names.feats.as_str(),
                 &feats_shape_usize,
             )?;
             let pitch_shape = [1usize, feature_len];
             validate_tensorrt_input_shape(
                 self.provider,
                 self.tensor_rt_profile.as_ref(),
-                "pitch",
+                self.io_names.pitch.as_str(),
                 &pitch_shape,
             )?;
             validate_tensorrt_input_shape(
                 self.provider,
                 self.tensor_rt_profile.as_ref(),
-                "pitchf",
+                self.io_names.pitchf.as_str(),
                 &pitch_shape,
             )?;
             let feats_len = feature_len
@@ -912,16 +926,17 @@ impl RvcModelSession {
             let pitchf = Tensor::from_array((pitch_shape, vec![0.0f32; feature_len]))?;
             let sid = Tensor::from_array(([1usize], vec![speaker_id]))?;
             let run_start = Instant::now();
+            let names = &self.io_names;
             let session = self
                 .session
                 .as_mut()
                 .ok_or_else(|| anyhow!("RVC ORT session is not initialized"))?;
             let outputs = session.run(ort::inputs![
-                "feats" => feats,
-                "p_len" => p_len,
-                "pitch" => pitch,
-                "pitchf" => pitchf,
-                "sid" => sid,
+                names.feats.as_str() => feats,
+                names.p_len.as_str() => p_len,
+                names.pitch.as_str() => pitch,
+                names.pitchf.as_str() => pitchf,
+                names.sid.as_str() => sid,
             ])?;
             debug!(
                 "rvc warmup session.run backend={} feats_shape={} pitch_shape={} elapsed_us={}",
@@ -931,7 +946,7 @@ impl RvcModelSession {
                 run_start.elapsed().as_micros()
             );
             let value = outputs
-                .get("audio")
+                .get(self.io_names.audio.as_str())
                 .ok_or_else(|| anyhow!("RVC output 'audio' not found"))?;
             let (shape, _) = value.try_extract_tensor::<f32>()?;
             Ok(shape.to_vec())
@@ -954,8 +969,8 @@ impl RvcModelSession {
             .tensor_rt_profile
             .as_ref()
             .ok_or_else(|| anyhow!("RVC IoBinding requires a fixed-shape profile"))?;
-        let feats_shape = profile.fixed_input_dims("feats")?;
-        let pitch_shape = profile.fixed_input_dims("pitch")?;
+        let feats_shape = profile.fixed_input_dims(&self.io_names.feats)?;
+        let pitch_shape = profile.fixed_input_dims(&self.io_names.pitch)?;
         let frame_len = pitch_shape
             .get(1)
             .copied()
@@ -973,6 +988,7 @@ impl RvcModelSession {
                     frame_len as i64,
                     speaker_id,
                     profile.gpu_device_id,
+                    &self.io_names,
                 )?)
             }
             TensorRtRunMode::DeviceIo | TensorRtRunMode::CudaGraph => {
@@ -988,6 +1004,7 @@ impl RvcModelSession {
                     frame_len as i64,
                     speaker_id,
                     profile.gpu_device_id,
+                    &self.io_names,
                 )?;
                 binding.warmup_capture(
                     session,
@@ -1029,7 +1046,13 @@ impl RvcModelSession {
             .session
             .as_ref()
             .ok_or_else(|| anyhow!("RVC ORT session is not initialized"))?;
-        let binding = RvcCpuOutputBinding::new(session, feats_shape, pitch_shape, output_shape)?;
+        let binding = RvcCpuOutputBinding::new(
+            session,
+            feats_shape,
+            pitch_shape,
+            output_shape,
+            self.io_names.audio.as_str(),
+        )?;
         info!(
             "CPU output IoBinding enabled model_role={} inputs=feats:{},pitch:{},pitchf:{} output=audio output_shape={}",
             ModelRole::Rvc.label(),
@@ -1059,20 +1082,20 @@ impl RvcModelSession {
         validate_tensorrt_input_shape(
             self.provider,
             self.tensor_rt_profile.as_ref(),
-            "feats",
+            self.io_names.feats.as_str(),
             &feats_shape_usize,
         )?;
         let pitch_shape = [1usize, frame_len];
         validate_tensorrt_input_shape(
             self.provider,
             self.tensor_rt_profile.as_ref(),
-            "pitch",
+            self.io_names.pitch.as_str(),
             &pitch_shape,
         )?;
         validate_tensorrt_input_shape(
             self.provider,
             self.tensor_rt_profile.as_ref(),
-            "pitchf",
+            self.io_names.pitchf.as_str(),
             &pitch_shape,
         )?;
         if let Some(native) = self.native_rvc.as_mut() {
@@ -1149,6 +1172,7 @@ impl RvcModelSession {
         let pitch = TensorRef::from_array_view((*pitch_shape, pitch))?;
         let pitchf = TensorRef::from_array_view((*pitch_shape, pitchf))?;
         let sid = TensorRef::from_array_view(([1usize], sid_value.as_slice()))?;
+        let names = &self.io_names;
         let session = self
             .session
             .as_mut()
@@ -1156,11 +1180,11 @@ impl RvcModelSession {
         let output_shape = {
             let run_start = Instant::now();
             let outputs = session.run(ort::inputs![
-                "feats" => feats,
-                "p_len" => p_len,
-                "pitch" => pitch,
-                "pitchf" => pitchf,
-                "sid" => sid,
+                names.feats.as_str() => feats,
+                names.p_len.as_str() => p_len,
+                names.pitch.as_str() => pitch,
+                names.pitchf.as_str() => pitchf,
+                names.sid.as_str() => sid,
             ])?;
             debug!(
                 "rvc session.run backend={} feats_shape={} pitch_shape={} elapsed_us={}",
@@ -1170,7 +1194,7 @@ impl RvcModelSession {
                 run_start.elapsed().as_micros()
             );
             let value = outputs
-                .get("audio")
+                .get(names.audio.as_str())
                 .ok_or_else(|| anyhow!("RVC output 'audio' not found"))?;
             let (shape, data) = value.try_extract_tensor::<f32>()?;
             let output_shape = i64_shape_to_usize(shape, "rvc output")?;
@@ -1206,6 +1230,7 @@ impl RvcModelSession {
         let pitchf = TensorRef::from_array_view((*pitch_shape, pitchf))?;
         let sid = TensorRef::from_array_view(([1usize], sid_value.as_slice()))?;
         let provider = self.provider;
+        let names = &self.io_names;
         let session = self
             .session
             .as_mut()
@@ -1221,23 +1246,23 @@ impl RvcModelSession {
         let run_result: Result<()> = (|| {
             binding
                 .binding
-                .bind_input("feats", &feats)
+                .bind_input(names.feats.as_str(), &feats)
                 .context("failed to bind CPU RVC input 'feats'")?;
             binding
                 .binding
-                .bind_input("p_len", &p_len)
+                .bind_input(names.p_len.as_str(), &p_len)
                 .context("failed to bind CPU RVC input 'p_len'")?;
             binding
                 .binding
-                .bind_input("pitch", &pitch)
+                .bind_input(names.pitch.as_str(), &pitch)
                 .context("failed to bind CPU RVC input 'pitch'")?;
             binding
                 .binding
-                .bind_input("pitchf", &pitchf)
+                .bind_input(names.pitchf.as_str(), &pitchf)
                 .context("failed to bind CPU RVC input 'pitchf'")?;
             binding
                 .binding
-                .bind_input("sid", &sid)
+                .bind_input(names.sid.as_str(), &sid)
                 .context("failed to bind CPU RVC input 'sid'")?;
             let _outputs = session.run_binding(&binding.binding)?;
             binding
@@ -1296,15 +1321,15 @@ impl RvcModelSession {
                 binding.bind_fixed_scalars_if_changed(frame_len as i64, speaker_id)?;
                 binding
                     .binding
-                    .bind_input("feats", &binding.feats)
+                    .bind_input(binding.names.feats.as_str(), &binding.feats)
                     .context("failed to bind TensorRT RVC input 'feats'")?;
                 binding
                     .binding
-                    .bind_input("pitch", &binding.pitch)
+                    .bind_input(binding.names.pitch.as_str(), &binding.pitch)
                     .context("failed to bind TensorRT RVC input 'pitch'")?;
                 binding
                     .binding
-                    .bind_input("pitchf", &binding.pitchf)
+                    .bind_input(binding.names.pitchf.as_str(), &binding.pitchf)
                     .context("failed to bind TensorRT RVC input 'pitchf'")?;
                 let run_start = Instant::now();
                 let _outputs = session.run_binding(&binding.binding)?;

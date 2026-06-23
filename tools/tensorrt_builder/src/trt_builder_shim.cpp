@@ -137,13 +137,16 @@ std::size_t volume(nvinfer1::Dims const& dims) {
 }
 
 nvinfer1::Dims input_dims_for(char const* name, nvinfer1::Dims dims, int32_t frames, int32_t channels) {
+    // Accept both RVC-WebUI and Applio input names: feats/phone (rank-3 features)
+    // and pitch/pitchf/nsff0 (rank-2 per-frame F0). This is the standalone `run`
+    // diagnostic; the production build path keys dims off the profile string.
     std::string tensor(name);
-    if (tensor == "feats") {
+    if (tensor == "feats" || tensor == "phone") {
         dims.nbDims = 3;
         dims.d[0] = 1;
         dims.d[1] = frames;
         dims.d[2] = channels;
-    } else if (tensor == "pitch" || tensor == "pitchf") {
+    } else if (tensor == "pitch" || tensor == "pitchf" || tensor == "nsff0") {
         dims.nbDims = 2;
         dims.d[0] = 1;
         dims.d[1] = frames;
@@ -257,7 +260,7 @@ bool upload_dummy_input(
     std::string tensor(name);
     if (dtype == nvinfer1::DataType::kINT64) {
         std::vector<int64_t> host(elems, 0);
-        if (tensor == "p_len") {
+        if (tensor == "p_len" || tensor == "phone_lengths") {
             std::fill(host.begin(), host.end(), static_cast<int64_t>(frames));
         } else if (tensor == "pitch") {
             std::fill(host.begin(), host.end(), static_cast<int64_t>(1));

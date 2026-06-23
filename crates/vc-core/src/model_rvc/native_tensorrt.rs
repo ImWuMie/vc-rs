@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Result};
 use tracing::info;
 
 use super::feature::FeatureTensor;
+use super::onnx_meta::RvcIoNames;
 use super::tensorrt::{
     format_usize_shape, tensor_rt_cache_root, TensorRtInputShape, TensorRtSessionProfile,
 };
@@ -52,8 +53,14 @@ mod ffi {
             message: *mut c_char,
             message_len: usize,
         ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
         pub(super) fn vc_rs_trt_rvc_infer(
             native: *mut c_void,
+            feats_name: *const c_char,
+            p_len_name: *const c_char,
+            pitch_name: *const c_char,
+            pitchf_name: *const c_char,
+            sid_name: *const c_char,
             feats: *const f32,
             feats_len: usize,
             pitch: *const i64,
@@ -86,6 +93,20 @@ pub(super) struct NativeRmvpeEngine {
     output_len: NonZeroUsize,
 }
 
+// The model's RVC input tensor names as NUL-terminated C strings, resolved once
+// at load so per-chunk inference passes pointers without re-allocating CStrings.
+// The native engine binds device tensors by name, so these must be the model's
+// actual exported names (Applio: phone/phone_lengths/nsff0/...), not the
+// canonical RVC-WebUI literals the shim previously hard-coded.
+#[cfg(native_tensorrt)]
+struct NativeRvcInputNames {
+    feats: CString,
+    p_len: CString,
+    pitch: CString,
+    pitchf: CString,
+    sid: CString,
+}
+
 #[cfg_attr(not(native_tensorrt), allow(dead_code))]
 pub(super) struct NativeRvcEngine {
     #[cfg(native_tensorrt)]
@@ -93,6 +114,8 @@ pub(super) struct NativeRvcEngine {
     frames: NonZeroUsize,
     channels: NonZeroUsize,
     output_len: NonZeroUsize,
+    #[cfg(native_tensorrt)]
+    input_names: NativeRvcInputNames,
 }
 
 // Native TensorRT handles own CUDA streams, execution contexts, and fixed device
@@ -254,8 +277,9 @@ impl NativeRvcEngine {
         model_path: &Path,
         profile: &TensorRtSessionProfile,
         channels: usize,
+        names: &RvcIoNames,
     ) -> Result<Self> {
-        let pitch_shape = profile.fixed_input_dims("pitch")?;
+        let pitch_shape = profile.fixed_input_dims(&names.pitch)?;
         let frames = pitch_shape
             .get(1)
             .copied()
@@ -263,8 +287,16 @@ impl NativeRvcEngine {
             .ok_or_else(|| anyhow!("RVC pitch profile must be [1, frames] with frames > 0"))?;
         let channels =
             NonZeroUsize::new(channels).ok_or_else(|| anyhow!("RVC channels is zero"))?;
-        let load_profile =
-            profile_with_scalars(profile, &[("p_len", &[1usize]), ("sid", &[1usize])]);
+        // The scalar inputs (p_len/sid) are not part of the shape profile; add
+        // them under the model's resolved names so the builder's optimization
+        // profile and the engine bindings agree.
+        let load_profile = profile_with_scalars(
+            profile,
+            &[
+                (names.p_len.as_str(), &[1usize]),
+                (names.sid.as_str(), &[1usize]),
+            ],
+        );
         let path = ensure_native_engine(model_path, profile, profile.profile_shapes.as_str())?;
         // `handle` is unit in the no-TensorRT stub build; see the equivalent
         // binding in NativeContentVecEngine::load for the cfg rationale.
@@ -272,17 +304,23 @@ impl NativeRvcEngine {
         let handle = load_engine(
             &path,
             load_profile.as_str(),
-            "audio",
+            names.audio.as_str(),
             profile.gpu_priority,
             profile.gpu_device_id,
         )?;
         let output_len = engine_output_len(handle)?;
         info!(
-            "loaded native TensorRT RVC engine model={} engine={} frames={} channels={} output_len={}",
+            "loaded native TensorRT RVC engine model={} engine={} frames={} channels={} inputs=[{},{},{},{},{}] output={} output_len={}",
             model_path.display(),
             path.display(),
             frames.get(),
             channels.get(),
+            names.feats,
+            names.p_len,
+            names.pitch,
+            names.pitchf,
+            names.sid,
+            names.audio,
             output_len.get()
         );
         Ok(Self {
@@ -291,6 +329,8 @@ impl NativeRvcEngine {
             frames,
             channels,
             output_len,
+            #[cfg(native_tensorrt)]
+            input_names: native_rvc_input_names(names)?,
         })
     }
 
@@ -849,6 +889,22 @@ fn infer_rmvpe(
 }
 
 #[cfg(native_tensorrt)]
+fn native_rvc_input_names(names: &RvcIoNames) -> Result<NativeRvcInputNames> {
+    let to_c = |name: &str, role: &str| {
+        CString::new(name).with_context(|| {
+            format!("RVC {role} input name '{name}' contains an interior NUL byte")
+        })
+    };
+    Ok(NativeRvcInputNames {
+        feats: to_c(&names.feats, "feats")?,
+        p_len: to_c(&names.p_len, "p_len")?,
+        pitch: to_c(&names.pitch, "pitch")?,
+        pitchf: to_c(&names.pitchf, "pitchf")?,
+        sid: to_c(&names.sid, "sid")?,
+    })
+}
+
+#[cfg(native_tensorrt)]
 fn infer_rvc(
     engine: &mut NativeRvcEngine,
     feats: &[f32],
@@ -861,6 +917,11 @@ fn infer_rvc(
     let status = unsafe {
         ffi::vc_rs_trt_rvc_infer(
             engine.handle.as_ptr(),
+            engine.input_names.feats.as_ptr(),
+            engine.input_names.p_len.as_ptr(),
+            engine.input_names.pitch.as_ptr(),
+            engine.input_names.pitchf.as_ptr(),
+            engine.input_names.sid.as_ptr(),
             feats.as_ptr(),
             feats.len(),
             pitch.as_ptr(),

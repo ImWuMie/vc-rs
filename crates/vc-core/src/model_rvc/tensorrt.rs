@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::Provider;
 
 #[cfg(feature = "ort")]
+use super::onnx_meta::RvcIoNames;
 use super::sessions::HubertEmbedderSession;
 use super::shape::onnx_silence_front_feature_frames;
 
@@ -113,20 +114,23 @@ impl TensorRtSessionProfile {
         )
     }
 
-    pub(super) fn rvc(frames: usize, channels: usize) -> Self {
+    // Profile/cache and the native builder key the optimization profile by the
+    // model's actual input names, so use the resolved aliases, not the canonical
+    // `feats`/`pitch`/`pitchf` literals (Applio exports name them differently).
+    pub(super) fn rvc(frames: usize, channels: usize, names: &RvcIoNames) -> Self {
         Self::new(
             ModelRole::Rvc,
             vec![
                 TensorRtInputShape {
-                    name: "feats".to_string(),
+                    name: names.feats.clone(),
                     dims: vec![1, frames, channels],
                 },
                 TensorRtInputShape {
-                    name: "pitch".to_string(),
+                    name: names.pitch.clone(),
                     dims: vec![1, frames],
                 },
                 TensorRtInputShape {
-                    name: "pitchf".to_string(),
+                    name: names.pitchf.clone(),
                     dims: vec![1, frames],
                 },
             ],
@@ -471,10 +475,15 @@ pub(super) struct RvcTensorRtPinnedBinding {
     pub(super) output_shape: Vec<usize>,
     pub(super) bound_p_len: i64,
     pub(super) bound_sid: i64,
+    pub(super) names: RvcIoNames,
 }
 
 #[cfg(feature = "ort")]
 impl RvcTensorRtPinnedBinding {
+    // The RVC binding needs each input shape, both fixed scalars, the device id,
+    // and the resolved tensor names; bundling them into a struct would only hide
+    // the IoBinding contract this constructor sets up.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         session: &Session,
         feats_shape: &[usize],
@@ -483,6 +492,7 @@ impl RvcTensorRtPinnedBinding {
         frame_len: i64,
         speaker_id: i64,
         gpu_device_id: u32,
+        names: &RvcIoNames,
     ) -> Result<Self> {
         let input_allocator =
             tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
@@ -506,12 +516,12 @@ impl RvcTensorRtPinnedBinding {
             .create_binding()
             .context("failed to create TensorRT RVC IoBinding")?;
         binding
-            .bind_input("p_len", &p_len)
+            .bind_input(names.p_len.as_str(), &p_len)
             .context("failed to bind TensorRT RVC input 'p_len'")?;
         binding
-            .bind_input("sid", &sid)
+            .bind_input(names.sid.as_str(), &sid)
             .context("failed to bind TensorRT RVC input 'sid'")?;
-        bind_output_tensor(&mut binding, "audio", &mut output)
+        bind_output_tensor(&mut binding, names.audio.as_str(), &mut output)
             .context("failed to bind TensorRT RVC output 'audio'")?;
         Ok(Self {
             binding,
@@ -528,6 +538,7 @@ impl RvcTensorRtPinnedBinding {
             output_shape: output_shape.to_vec(),
             bound_p_len: frame_len,
             bound_sid: speaker_id,
+            names: names.clone(),
         })
     }
 
@@ -539,14 +550,14 @@ impl RvcTensorRtPinnedBinding {
         if self.bound_p_len != frame_len {
             write_scalar_i64_tensor(&mut self.p_len, frame_len, "p_len")?;
             self.binding
-                .bind_input("p_len", &self.p_len)
+                .bind_input(self.names.p_len.as_str(), &self.p_len)
                 .context("failed to re-bind TensorRT RVC input 'p_len'")?;
             self.bound_p_len = frame_len;
         }
         if self.bound_sid != speaker_id {
             write_scalar_i64_tensor(&mut self.sid, speaker_id, "sid")?;
             self.binding
-                .bind_input("sid", &self.sid)
+                .bind_input(self.names.sid.as_str(), &self.sid)
                 .context("failed to re-bind TensorRT RVC input 'sid'")?;
             self.bound_sid = speaker_id;
         }
@@ -881,6 +892,9 @@ pub(super) struct RvcTensorRtGraphBinding {
 
 #[cfg(feature = "ort")]
 impl RvcTensorRtGraphBinding {
+    // See RvcTensorRtPinnedBinding::new: the inputs mirror the RVC IoBinding
+    // contract (shapes + fixed scalars + device id + resolved names).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         session: &Session,
         feats_shape: &[usize],
@@ -889,6 +903,7 @@ impl RvcTensorRtGraphBinding {
         frame_len: i64,
         speaker_id: i64,
         gpu_device_id: u32,
+        names: &RvcIoNames,
     ) -> Result<Self> {
         let host_input_allocator =
             tensor_rt_pinned_allocator(session, MemoryType::CPUInput, gpu_device_id)?;
@@ -933,21 +948,21 @@ impl RvcTensorRtGraphBinding {
             .create_binding()
             .context("failed to create RVC CUDA device IoBinding")?;
         binding
-            .bind_input("feats", &device_feats)
+            .bind_input(names.feats.as_str(), &device_feats)
             .context("failed to bind TensorRT RVC CUDA input 'feats'")?;
         binding
-            .bind_input("pitch", &device_pitch)
+            .bind_input(names.pitch.as_str(), &device_pitch)
             .context("failed to bind TensorRT RVC CUDA input 'pitch'")?;
         binding
-            .bind_input("pitchf", &device_pitchf)
+            .bind_input(names.pitchf.as_str(), &device_pitchf)
             .context("failed to bind TensorRT RVC CUDA input 'pitchf'")?;
         binding
-            .bind_input("p_len", &device_p_len)
+            .bind_input(names.p_len.as_str(), &device_p_len)
             .context("failed to bind TensorRT RVC CUDA input 'p_len'")?;
         binding
-            .bind_input("sid", &device_sid)
+            .bind_input(names.sid.as_str(), &device_sid)
             .context("failed to bind TensorRT RVC CUDA input 'sid'")?;
-        bind_output_tensor(&mut binding, "audio", &mut device_output)
+        bind_output_tensor(&mut binding, names.audio.as_str(), &mut device_output)
             .context("failed to bind TensorRT RVC CUDA output 'audio'")?;
         Ok(Self {
             binding,

@@ -612,6 +612,11 @@ extern "C" int vc_rs_trt_rmvpe_infer(
 
 extern "C" int vc_rs_trt_rvc_infer(
     NativeEngine* native,
+    char const* feats_name,
+    char const* p_len_name,
+    char const* pitch_name,
+    char const* pitchf_name,
+    char const* sid_name,
     float const* feats,
     std::size_t feats_len,
     int64_t const* pitch,
@@ -632,20 +637,28 @@ extern "C" int vc_rs_trt_rvc_infer(
         msg.append("null argument passed to TensorRT RVC infer\n");
         return 2;
     }
+    if (feats_name == nullptr || p_len_name == nullptr || pitch_name == nullptr
+        || pitchf_name == nullptr || sid_name == nullptr) {
+        msg.append("null input-name passed to TensorRT RVC infer\n");
+        return 2;
+    }
+    // Bind by the model's resolved tensor names: RVC-WebUI and Applio exports
+    // disagree (feats/p_len/pitchf vs phone/phone_lengths/nsff0), so the caller
+    // passes whichever names this engine actually exposes.
     int64_t p_len = static_cast<int64_t>(pitch_len);
-    if (!copy_to_device(*native, "feats", feats, feats_len * sizeof(float), msg)) {
+    if (!copy_to_device(*native, feats_name, feats, feats_len * sizeof(float), msg)) {
         return 1;
     }
-    if (!copy_to_device(*native, "p_len", &p_len, sizeof(int64_t), msg)) {
+    if (!copy_to_device(*native, p_len_name, &p_len, sizeof(int64_t), msg)) {
         return 1;
     }
-    if (!copy_to_device(*native, "pitch", pitch, pitch_len * sizeof(int64_t), msg)) {
+    if (!copy_to_device(*native, pitch_name, pitch, pitch_len * sizeof(int64_t), msg)) {
         return 1;
     }
-    if (!copy_to_device(*native, "pitchf", pitchf, pitchf_len * sizeof(float), msg)) {
+    if (!copy_to_device(*native, pitchf_name, pitchf, pitchf_len * sizeof(float), msg)) {
         return 1;
     }
-    if (!copy_to_device(*native, "sid", &speaker_id, sizeof(int64_t), msg)) {
+    if (!copy_to_device(*native, sid_name, &speaker_id, sizeof(int64_t), msg)) {
         return 1;
     }
     return enqueue_and_copy(*native, output, output_len, msg) ? 0 : 1;
