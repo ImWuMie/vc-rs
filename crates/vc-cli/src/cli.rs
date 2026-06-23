@@ -340,6 +340,13 @@ pub struct WavArgs {
     pub chunk_ms: u32,
     #[arg(long, value_enum, default_value_t = Smoother::Sola)]
     pub smoother: Smoother,
+    // Exposed so `--join-report` can sweep the SOLA/crossfade window offline;
+    // mirrors the realtime command's flags. The 3/4-of-chunk cap in
+    // `sola::model_domain_crossfade_samples` still applies on top of this.
+    #[arg(long, default_value_t = DEFAULT_CROSSFADE_MS)]
+    pub crossfade_ms: u32,
+    #[arg(long, default_value_t = DEFAULT_SOLA_SEARCH_MS)]
+    pub sola_search_ms: u32,
     #[arg(long, default_value_t = DEFAULT_RVC_OUTPUT_TAIL_DISCARD_MS)]
     pub rvc_output_tail_discard_ms: u32,
     #[arg(long, value_enum, default_value_t = default_provider())]
@@ -563,8 +570,8 @@ impl WavArgs {
         validate_common_conversion_options(
             ConversionTiming {
                 chunk_ms: self.chunk_ms,
-                crossfade_ms: DEFAULT_CROSSFADE_MS,
-                sola_search_ms: DEFAULT_SOLA_SEARCH_MS,
+                crossfade_ms: self.crossfade_ms,
+                sola_search_ms: self.sola_search_ms,
                 tail_discard_ms: self.rvc_output_tail_discard_ms,
                 extra_convert_ms: self.extra_convert_ms,
             },
@@ -1103,6 +1110,58 @@ mod tests {
             "4800"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn wav_crossfade_and_sola_search_default_and_parse() {
+        // Defaults match the shared constants when the flags are omitted.
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-model",
+            "f0.onnx",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+        ])
+        .unwrap();
+        let Command::Wav(args) = cli.command else {
+            panic!("expected wav command");
+        };
+        assert_eq!(args.crossfade_ms, DEFAULT_CROSSFADE_MS);
+        assert_eq!(args.sola_search_ms, DEFAULT_SOLA_SEARCH_MS);
+
+        // Both flags are sweepable on the wav command (used by --join-report).
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-model",
+            "f0.onnx",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+            "--crossfade-ms",
+            "40",
+            "--sola-search-ms",
+            "16",
+        ])
+        .unwrap();
+        let Command::Wav(args) = cli.command else {
+            panic!("expected wav command");
+        };
+        assert_eq!(args.crossfade_ms, 40);
+        assert_eq!(args.sola_search_ms, 16);
+        assert!(args.validate_conversion_options().is_ok());
     }
 
     #[test]

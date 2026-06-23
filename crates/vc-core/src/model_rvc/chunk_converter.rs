@@ -66,14 +66,25 @@ impl<M: VoiceModel> ChunkConverter<M> {
             .map(|(_, smoother)| smoother.last_diagnostics())
     }
 
-    /// The configured crossfade window in model-domain samples, or `None` before
-    /// the first chunk builds the smoother. Diagnostics: comparing this against a
-    /// chunk's `crossfade_len` shows when the output chunk was shorter than the
-    /// crossfade window (the join then can't use the full overlap).
+    /// The crossfade window the joiner actually applies, in model-domain samples,
+    /// or `None` before the first chunk builds the smoother. This is *after* the
+    /// 3/4-of-chunk cap in [`sola::model_domain_crossfade_samples`]; compare it
+    /// with [`Self::join_requested_crossfade_samples`] to see the cap's effect.
     pub fn join_crossfade_samples(&self) -> Option<usize> {
         self.smoother
             .as_ref()
             .map(|(_, smoother)| smoother.crossfade_samples())
+    }
+
+    /// The configured (pre-cap) crossfade window in model-domain samples — what
+    /// `crossfade_ms` asks for before the 3/4-of-chunk cap. `None` before the
+    /// first chunk builds the smoother. Diagnostics: comparing a chunk's
+    /// `crossfade_len` against this shows when the cap (short chunk) or the
+    /// per-chunk runtime clamp shortened the overlap.
+    pub fn join_requested_crossfade_samples(&self) -> Option<usize> {
+        self.smoother
+            .as_ref()
+            .map(|(rate, _)| sola::ms_to_samples(*rate, self.output.crossfade_ms))
     }
 
     /// Discards output-joining history without rebuilding the owned model.

@@ -16,9 +16,7 @@ use vc_core::model_rvc::{
 };
 use vc_core::sola::SmoothingKind;
 
-use crate::cli::{
-    Denoiser, RunArgs, Smoother, WavArgs, DEFAULT_CROSSFADE_MS, DEFAULT_SOLA_SEARCH_MS,
-};
+use crate::cli::{Denoiser, RunArgs, Smoother, WavArgs};
 use crate::join_report::JoinReport;
 
 pub fn run_realtime(args: RunArgs) -> Result<()> {
@@ -145,8 +143,11 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         args.input_gain
     };
     let chunk_samples = dsp::chunk_samples_for_rate(spec.sample_rate, args.chunk_ms);
-    let output_extra_ms = DEFAULT_CROSSFADE_MS
-        .saturating_add(DEFAULT_SOLA_SEARCH_MS)
+    // Must cover the SOLA window the joiner actually uses, so the model emits
+    // enough extra audio to feed `crossfade_ms` + `sola_search_ms` + tail.
+    let output_extra_ms = args
+        .crossfade_ms
+        .saturating_add(args.sola_search_ms)
         .saturating_add(args.rvc_output_tail_discard_ms);
     // WAV mode builds the pipeline directly (realtime goes via vc-app, which
     // applies these on session start); set the process GPU priority and power
@@ -182,7 +183,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             floor: args.noise_gate_floor,
         },
         output_extra_ms,
-        volume_excluded_ms: DEFAULT_CROSSFADE_MS,
+        volume_excluded_ms: args.crossfade_ms,
         extra_convert_ms: args.extra_convert_ms,
         output_gain: args.output_gain,
         output_dynamics: OutputDynamicsConfig {
@@ -204,8 +205,8 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             kind: smoothing_kind(args.smoother),
             output_sample_rate: spec.sample_rate,
             output_chunk_samples: chunk_samples,
-            crossfade_ms: DEFAULT_CROSSFADE_MS,
-            sola_search_ms: DEFAULT_SOLA_SEARCH_MS,
+            crossfade_ms: args.crossfade_ms,
+            sola_search_ms: args.sola_search_ms,
             tail_discard_ms: args.rvc_output_tail_discard_ms,
         },
     );
@@ -241,7 +242,9 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             // Record after appending so the seam against the previous chunk is in
             // `output`. Diagnostics are read back from the converter's smoother.
             let diag = converter.last_join_diagnostics().unwrap_or_default();
-            let crossfade_target = converter.join_crossfade_samples().unwrap_or(0);
+            // Pre-cap target so `crossfade_capped` reflects the 3/4-of-chunk cap
+            // (the low-latency case), not just the per-chunk runtime clamp.
+            let crossfade_target = converter.join_requested_crossfade_samples().unwrap_or(0);
             report.record(chunks, &output, chunk_samples, diag, crossfade_target);
         }
         chunks += 1;
