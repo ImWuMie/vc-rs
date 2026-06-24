@@ -144,12 +144,12 @@ GTCRN への切り替えは **Apply / Start** が必要です。VST3版にはこ
 | --- | --- | --- | --- |
 | Noise Gate | 極小 | しきい値ゲートのみ | 組み込み |
 | RNNoise | 低 | 控えめ | 組み込み・48 kHz |
-| **GTCRN** | **低** | **良好** | **Windows ML 版のみ・16 kHz・要モデル** |
+| **GTCRN** | **低** | **良好** | **standalone 版のみ・16 kHz・要モデル** |
 
 GTCRN は超軽量（約 48K パラメータ）の音声強調モデルで、CPU でもリアルタイムに
-十分間に合います。**Windows ML 版の standalone（CLI/GUI）でのみ**利用でき
-（ONNX Runtime が必要なため。native TensorRT 版・VST3 版には含まれません）、
-固定遅延は約 48 ms（16 kHz の STFT 再構成 + アダプタの FIFO）です。モデルは
+十分間に合います。**standalone（CLI/GUI）版**で利用でき、Windows ML 版では
+ONNX Runtime CPU、TensorRT 版では native TensorRT で実行します。VST3 版には
+含まれません。固定遅延は約 48 ms（16 kHz の STFT 再構成 + アダプタの FIFO）です。モデルは
 `download-models.ps1 -Gtcrn` で `assets\gtcrn\` に取得し、GUI の **GTCRN model
 dir** または CLI の `--gtcrn-model <dir>` で指定します。
 

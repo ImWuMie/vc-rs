@@ -288,9 +288,14 @@ fn load_wav_pipeline(
         {
             let model_dir = gtcrn_model
                 .ok_or_else(|| anyhow!("GTCRN denoiser requires --gtcrn-model <dir>"))?;
+            let backend = vc_core::denoise::GtcrnBackend::for_provider(
+                config.provider,
+                config.gpu_priority,
+                config.gpu_device_id,
+            );
             return RvcPipeline::load_with_gtcrn(
                 config,
-                vc_core::denoise::GtcrnConfig { model_dir },
+                vc_core::denoise::GtcrnConfig { model_dir, backend },
             );
         }
         #[cfg(not(feature = "gtcrn"))]

@@ -636,6 +636,8 @@ struct PassthroughProcessor {
     // Read only on the `gtcrn`-gated reset arm; inert without that feature.
     #[cfg_attr(not(feature = "gtcrn"), allow(dead_code))]
     gtcrn_model_dir: Option<PathBuf>,
+    #[cfg(feature = "gtcrn")]
+    gtcrn_backend: vc_core::denoise::GtcrnBackend,
     denoiser: PassthroughDenoiser,
     resampler: dsp::StreamingResampleMono,
     input_scratch: Vec<f32>,
@@ -648,6 +650,7 @@ impl PassthroughProcessor {
         input_rate: u32,
         output_rate: u32,
         gtcrn_model_dir: Option<PathBuf>,
+        #[cfg(feature = "gtcrn")] gtcrn_backend: vc_core::denoise::GtcrnBackend,
         live: &LiveParams,
     ) -> Result<Self> {
         let mut processor = Self {
@@ -656,6 +659,8 @@ impl PassthroughProcessor {
             input_rate,
             output_rate,
             gtcrn_model_dir,
+            #[cfg(feature = "gtcrn")]
+            gtcrn_backend,
             denoiser: PassthroughDenoiser::Off,
             resampler: dsp::StreamingResampleMono::new(input_rate as usize, output_rate as usize)?,
             input_scratch: Vec::new(),
@@ -687,7 +692,10 @@ impl PassthroughProcessor {
                         anyhow!("GTCRN denoiser requires a model directory (gtcrn_model_dir)")
                     })?;
                     PassthroughDenoiser::Gtcrn(Box::new(vc_core::denoise::GtcrnDenoiser::new(
-                        vc_core::denoise::GtcrnConfig { model_dir },
+                        vc_core::denoise::GtcrnConfig {
+                            model_dir,
+                            backend: self.gtcrn_backend,
+                        },
                         self.input_rate,
                     )?))
                 }
@@ -928,6 +936,12 @@ impl RealtimeSession {
         let input_chunk = dsp::chunk_samples_for_rate(input_rate, config.chunk_ms);
         let output_chunk = dsp::chunk_samples_for_rate(output_rate, config.chunk_ms);
         let current_live = live.load();
+        #[cfg(feature = "gtcrn")]
+        let gtcrn_backend = vc_core::denoise::GtcrnBackend::for_provider(
+            config.provider,
+            config.gpu_priority,
+            config.gpu_device_id,
+        );
         let debug_input = Arc::new(Mutex::new(Vec::new()));
         let debug_output = Arc::new(Mutex::new(Vec::new()));
         let passthrough_processor = PassthroughProcessor::new(
@@ -936,6 +950,8 @@ impl RealtimeSession {
             input_rate,
             output_rate,
             config.gtcrn_model_dir.clone(),
+            #[cfg(feature = "gtcrn")]
+            gtcrn_backend,
             &current_live,
         )?;
         let passthrough_live_switchable = config.has_complete_model_set();
@@ -973,7 +989,10 @@ impl RealtimeSession {
                         })?;
                         RvcPipeline::load_with_gtcrn(
                             pipeline_config,
-                            vc_core::denoise::GtcrnConfig { model_dir },
+                            vc_core::denoise::GtcrnConfig {
+                                model_dir,
+                                backend: gtcrn_backend,
+                            },
                         )?
                     }
                     #[cfg(not(feature = "gtcrn"))]
@@ -1380,6 +1399,8 @@ mod tests {
             48_000,
             48_000,
             None,
+            #[cfg(feature = "gtcrn")]
+            vc_core::denoise::GtcrnBackend::OrtCpu,
             &live,
         )
         .unwrap();
@@ -1411,6 +1432,8 @@ mod tests {
             48_000,
             48_000,
             None,
+            #[cfg(feature = "gtcrn")]
+            vc_core::denoise::GtcrnBackend::OrtCpu,
             &live,
         )
         .unwrap();
@@ -1433,6 +1456,8 @@ mod tests {
             48_000,
             48_000,
             None,
+            #[cfg(feature = "gtcrn")]
+            vc_core::denoise::GtcrnBackend::OrtCpu,
             &live,
         )
         .unwrap();

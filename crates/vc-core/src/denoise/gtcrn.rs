@@ -17,14 +17,20 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "ort")]
+use anyhow::{anyhow, Context};
+use anyhow::{bail, Result};
+#[cfg(feature = "ort")]
 use ort::ep;
+#[cfg(feature = "ort")]
 use ort::session::Session;
+#[cfg(feature = "ort")]
 use ort::value::TensorRef;
 use realfft::num_complex::Complex;
 
 use super::adapter::{FixedDelayAdapter, FrameDenoiser};
 use super::stft::{StftStreamer, GTCRN_BINS, GTCRN_HOP, GTCRN_RECON_DELAY_FRAMES};
+use crate::model_rvc::GpuPriority;
 
 // Streaming-graph tensor names and fixed shapes (Phase 0).
 const MIX_NAME: &str = "mix";
@@ -87,10 +93,12 @@ trait InferSession: Send {
 
 /// ONNX Runtime implementation of [`InferSession`] (CPU EP — GTCRN is tiny, and
 /// CPU keeps it off the GPU that RVC inference uses).
+#[cfg(feature = "ort")]
 struct OrtInferSession {
     session: Session,
 }
 
+#[cfg(feature = "ort")]
 impl OrtInferSession {
     fn new(path: &Path) -> Result<Self> {
         // Windows ML loads ORT dynamically from the Windows App SDK Runtime; the
@@ -111,6 +119,7 @@ impl OrtInferSession {
     }
 }
 
+#[cfg(feature = "ort")]
 impl InferSession for OrtInferSession {
     fn run(&mut self, mix: &[f32], caches: &mut GtcrnCaches, enh: &mut [f32]) -> Result<()> {
         // Zero-copy views into the caller's buffers; released when `outputs` is
@@ -133,6 +142,51 @@ impl InferSession for OrtInferSession {
             .inter
             .copy_from_slice(outputs[INTER_OUT].try_extract_tensor::<f32>()?.1);
         Ok(())
+    }
+}
+
+struct NativeTensorRtInferSession {
+    engine: crate::model_rvc::native_tensorrt::NativeGtcrnEngine,
+}
+
+impl NativeTensorRtInferSession {
+    fn new(path: &Path, gpu_priority: GpuPriority, gpu_device_id: u32) -> Result<Self> {
+        Ok(Self {
+            engine: crate::model_rvc::native_tensorrt::NativeGtcrnEngine::load(
+                path,
+                gpu_priority,
+                gpu_device_id,
+            )?,
+        })
+    }
+}
+
+impl InferSession for NativeTensorRtInferSession {
+    fn run(&mut self, mix: &[f32], caches: &mut GtcrnCaches, enh: &mut [f32]) -> Result<()> {
+        self.engine.infer(
+            mix,
+            &mut caches.conv,
+            &mut caches.tra,
+            &mut caches.inter,
+            enh,
+        )
+    }
+}
+
+impl GtcrnBackend {
+    pub fn for_provider(
+        provider: crate::Provider,
+        gpu_priority: GpuPriority,
+        gpu_device_id: u32,
+    ) -> Self {
+        if provider.is_tensorrt() {
+            Self::NativeTensorRt {
+                gpu_priority,
+                gpu_device_id,
+            }
+        } else {
+            Self::OrtCpu
+        }
     }
 }
 
@@ -159,8 +213,26 @@ impl GtcrnFrameProcessor {
         }
     }
 
-    fn from_onnx(path: &Path) -> Result<Self> {
-        Ok(Self::with_session(Box::new(OrtInferSession::new(path)?)))
+    fn from_onnx(path: &Path, backend: GtcrnBackend) -> Result<Self> {
+        match backend {
+            GtcrnBackend::OrtCpu => {
+                #[cfg(feature = "ort")]
+                {
+                    Ok(Self::with_session(Box::new(OrtInferSession::new(path)?)))
+                }
+                #[cfg(not(feature = "ort"))]
+                {
+                    let _ = path;
+                    bail!("GTCRN ORT backend is unavailable in this build")
+                }
+            }
+            GtcrnBackend::NativeTensorRt {
+                gpu_priority,
+                gpu_device_id,
+            } => Ok(Self::with_session(Box::new(
+                NativeTensorRtInferSession::new(path, gpu_priority, gpu_device_id)?,
+            ))),
+        }
     }
 }
 
@@ -200,10 +272,23 @@ impl FrameDenoiser for GtcrnFrameProcessor {
     }
 }
 
+/// Inference backend for the GTCRN streaming graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GtcrnBackend {
+    /// Run the tiny graph through ONNX Runtime's CPU execution provider.
+    OrtCpu,
+    /// Run the graph through the repository's native TensorRT engine path.
+    NativeTensorRt {
+        gpu_priority: GpuPriority,
+        gpu_device_id: u32,
+    },
+}
+
 /// Minimal GTCRN model config (no DFN-style attenuation knobs — keep it minimal).
 pub struct GtcrnConfig<'a> {
     /// Directory holding `gtcrn_stream.onnx` (or the upstream `gtcrn.onnx`).
     pub model_dir: &'a Path,
+    pub backend: GtcrnBackend,
 }
 
 /// Fixed-delay GTCRN input denoiser. Thin wrapper over the shared
@@ -215,7 +300,7 @@ pub struct GtcrnDenoiser {
 impl GtcrnDenoiser {
     pub fn new(config: GtcrnConfig<'_>, sample_rate: u32) -> Result<Self> {
         let model = resolve_model_file(config.model_dir)?;
-        let processor = GtcrnFrameProcessor::from_onnx(&model)?;
+        let processor = GtcrnFrameProcessor::from_onnx(&model, config.backend)?;
         Ok(Self {
             inner: FixedDelayAdapter::new(processor, sample_rate)?,
         })
@@ -250,6 +335,10 @@ fn resolve_model_file(dir: &Path) -> Result<PathBuf> {
     );
 }
 
+pub(crate) fn model_file_for_cache_probe(dir: &Path) -> Result<PathBuf> {
+    resolve_model_file(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,12 +369,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ort")]
     fn loads_and_preserves_length() {
         let Some(dir) = model_dir() else {
             eprintln!("skip loads_and_preserves_length: VC_RS_GTCRN_MODEL unset");
             return;
         };
-        let mut denoiser = GtcrnDenoiser::new(GtcrnConfig { model_dir: &dir }, 16_000).unwrap();
+        let mut denoiser = GtcrnDenoiser::new(ort_config(&dir), 16_000).unwrap();
         for len in [1usize, 200, 256, 777, 4096] {
             let mut buf = tone(len);
             denoiser.process_in_place(&mut buf).unwrap();
@@ -295,6 +385,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ort")]
     fn cache_continuity_across_chunk_partitions() {
         let Some(dir) = model_dir() else {
             eprintln!("skip cache_continuity_across_chunk_partitions: VC_RS_GTCRN_MODEL unset");
@@ -303,13 +394,12 @@ mod tests {
         let input = tone(16_000);
 
         let mut whole = input.clone();
-        GtcrnDenoiser::new(GtcrnConfig { model_dir: &dir }, 16_000)
+        GtcrnDenoiser::new(ort_config(&dir), 16_000)
             .unwrap()
             .process_in_place(&mut whole)
             .unwrap();
 
-        let mut split_denoiser =
-            GtcrnDenoiser::new(GtcrnConfig { model_dir: &dir }, 16_000).unwrap();
+        let mut split_denoiser = GtcrnDenoiser::new(ort_config(&dir), 16_000).unwrap();
         let mut split = Vec::with_capacity(input.len());
         for chunk in input.chunks(777) {
             let mut out = chunk.to_vec();
@@ -328,13 +418,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ort")]
     fn reset_repeats_startup() {
         let Some(dir) = model_dir() else {
             eprintln!("skip reset_repeats_startup: VC_RS_GTCRN_MODEL unset");
             return;
         };
         let input = tone(8_000);
-        let mut denoiser = GtcrnDenoiser::new(GtcrnConfig { model_dir: &dir }, 16_000).unwrap();
+        let mut denoiser = GtcrnDenoiser::new(ort_config(&dir), 16_000).unwrap();
 
         let mut first = input.clone();
         denoiser.process_in_place(&mut first).unwrap();
@@ -343,5 +434,122 @@ mod tests {
         denoiser.process_in_place(&mut second).unwrap();
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    #[cfg(native_tensorrt)]
+    fn native_tensorrt_loads_and_preserves_length() {
+        let Some(dir) = model_dir() else {
+            eprintln!("skip native_tensorrt_loads_and_preserves_length: VC_RS_GTCRN_MODEL unset");
+            return;
+        };
+        let mut denoiser = GtcrnDenoiser::new(native_config(&dir), 16_000).unwrap();
+        for len in [1usize, 200, 256, 777, 4096] {
+            let mut buf = tone(len);
+            denoiser.process_in_place(&mut buf).unwrap();
+            assert_eq!(buf.len(), len);
+            assert!(buf.iter().all(|x| x.is_finite()));
+        }
+    }
+
+    #[test]
+    #[cfg(native_tensorrt)]
+    fn native_tensorrt_cache_continuity_across_chunk_partitions() {
+        let Some(dir) = model_dir() else {
+            eprintln!(
+                "skip native_tensorrt_cache_continuity_across_chunk_partitions: VC_RS_GTCRN_MODEL unset"
+            );
+            return;
+        };
+        let input = tone(16_000);
+
+        let mut whole = input.clone();
+        GtcrnDenoiser::new(native_config(&dir), 16_000)
+            .unwrap()
+            .process_in_place(&mut whole)
+            .unwrap();
+
+        let mut split_denoiser = GtcrnDenoiser::new(native_config(&dir), 16_000).unwrap();
+        let mut split = Vec::with_capacity(input.len());
+        for chunk in input.chunks(777) {
+            let mut out = chunk.to_vec();
+            split_denoiser.process_in_place(&mut out).unwrap();
+            split.extend_from_slice(&out);
+        }
+
+        let max_err = whole
+            .iter()
+            .zip(&split)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-4, "whole vs split max error {max_err}");
+    }
+
+    #[test]
+    #[cfg(native_tensorrt)]
+    fn native_tensorrt_reset_repeats_startup() {
+        let Some(dir) = model_dir() else {
+            eprintln!("skip native_tensorrt_reset_repeats_startup: VC_RS_GTCRN_MODEL unset");
+            return;
+        };
+        let input = tone(8_000);
+        let mut denoiser = GtcrnDenoiser::new(native_config(&dir), 16_000).unwrap();
+
+        let mut first = input.clone();
+        denoiser.process_in_place(&mut first).unwrap();
+        denoiser.reset().unwrap();
+        let mut second = input.clone();
+        denoiser.process_in_place(&mut second).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    #[cfg(all(feature = "ort", native_tensorrt))]
+    fn native_tensorrt_matches_ort_within_tolerance() {
+        let Some(dir) = model_dir() else {
+            eprintln!("skip native_tensorrt_matches_ort_within_tolerance: VC_RS_GTCRN_MODEL unset");
+            return;
+        };
+        let input = tone(4096);
+        let mut ort = input.clone();
+        let mut native = input.clone();
+
+        GtcrnDenoiser::new(ort_config(&dir), 16_000)
+            .unwrap()
+            .process_in_place(&mut ort)
+            .unwrap();
+        GtcrnDenoiser::new(native_config(&dir), 16_000)
+            .unwrap()
+            .process_in_place(&mut native)
+            .unwrap();
+
+        let max_err = ort
+            .iter()
+            .zip(&native)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // TensorRT tactic selection can move the tiny recurrent graph by ~1e-2
+        // at sample peaks; keep this as a backend-sanity bound, not bit parity.
+        assert!(max_err < 2e-2, "ORT vs native TensorRT max error {max_err}");
+    }
+
+    #[cfg(feature = "ort")]
+    fn ort_config(dir: &Path) -> GtcrnConfig<'_> {
+        GtcrnConfig {
+            model_dir: dir,
+            backend: GtcrnBackend::OrtCpu,
+        }
+    }
+
+    #[cfg(native_tensorrt)]
+    fn native_config(dir: &Path) -> GtcrnConfig<'_> {
+        GtcrnConfig {
+            model_dir: dir,
+            backend: GtcrnBackend::NativeTensorRt {
+                gpu_priority: GpuPriority::default(),
+                gpu_device_id: 0,
+            },
+        }
     }
 }

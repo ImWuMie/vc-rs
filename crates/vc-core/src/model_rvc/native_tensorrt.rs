@@ -14,7 +14,8 @@ use tracing::info;
 use super::feature::FeatureTensor;
 use super::onnx_meta::RvcIoNames;
 use super::tensorrt::{
-    format_usize_shape, tensor_rt_cache_root, TensorRtInputShape, TensorRtSessionProfile,
+    format_usize_shape, tensor_rt_cache_root, tensor_rt_model_cache_key, ModelRole,
+    TensorRtInputShape, TensorRtSessionProfile,
 };
 
 #[cfg(native_tensorrt)]
@@ -79,6 +80,22 @@ mod ffi {
             message: *mut c_char,
             message_len: usize,
         ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn vc_rs_trt_gtcrn_infer(
+            native: *mut c_void,
+            mix: *const f32,
+            mix_len: usize,
+            conv: *mut f32,
+            conv_len: usize,
+            tra: *mut f32,
+            tra_len: usize,
+            inter: *mut f32,
+            inter_len: usize,
+            enh: *mut f32,
+            enh_len: usize,
+            message: *mut c_char,
+            message_len: usize,
+        ) -> c_int;
     }
 }
 
@@ -97,6 +114,17 @@ pub(super) struct NativeRmvpeEngine {
     handle: std::ptr::NonNull<c_void>,
     waveform_len: NonZeroUsize,
     output_len: NonZeroUsize,
+}
+
+#[cfg_attr(not(native_tensorrt), allow(dead_code))]
+pub(crate) struct NativeGtcrnEngine {
+    #[cfg(native_tensorrt)]
+    handle: std::ptr::NonNull<c_void>,
+    mix_len: NonZeroUsize,
+    conv_len: NonZeroUsize,
+    tra_len: NonZeroUsize,
+    inter_len: NonZeroUsize,
+    enh_len: NonZeroUsize,
 }
 
 // The model's RVC input tensor names as NUL-terminated C strings, resolved once
@@ -144,6 +172,7 @@ pub(super) struct NativeRvcEngine {
 unsafe impl Send for NativeContentVecEngine {}
 unsafe impl Send for NativeRmvpeEngine {}
 unsafe impl Send for NativeRvcEngine {}
+unsafe impl Send for NativeGtcrnEngine {}
 
 impl NativeContentVecEngine {
     pub(super) fn load(
@@ -292,6 +321,91 @@ impl NativeRmvpeEngine {
     }
 }
 
+impl NativeGtcrnEngine {
+    pub(crate) fn load(
+        model_path: &Path,
+        gpu_priority: super::GpuPriority,
+        gpu_device_id: u32,
+    ) -> Result<Self> {
+        let profile = native_gtcrn_profile(model_path, gpu_priority, gpu_device_id)?;
+        let mix_len = shape_volume(profile.fixed_input_dims("mix")?, "GTCRN mix input")?;
+        let conv_len = shape_volume(profile.fixed_input_dims("conv_cache")?, "GTCRN conv cache")?;
+        let tra_len = shape_volume(profile.fixed_input_dims("tra_cache")?, "GTCRN tra cache")?;
+        let inter_len = shape_volume(
+            profile.fixed_input_dims("inter_cache")?,
+            "GTCRN inter cache",
+        )?;
+        let path = ensure_native_engine(model_path, &profile, profile.profile_shapes.as_str())?;
+        #[cfg_attr(not(native_tensorrt), allow(clippy::let_unit_value))]
+        let handle = load_engine(
+            &path,
+            profile.profile_shapes.as_str(),
+            "enh",
+            profile.gpu_priority,
+            profile.gpu_device_id,
+        )?;
+        let enh_len = engine_output_len(handle)?;
+        if enh_len != mix_len {
+            bail!(
+                "native TensorRT GTCRN enh output length {} does not match mix length {}",
+                enh_len.get(),
+                mix_len.get()
+            );
+        }
+        info!(
+            "loaded native TensorRT GTCRN engine model={} engine={} profile={} output_len={}",
+            model_path.display(),
+            path.display(),
+            profile.profile_shapes,
+            enh_len.get()
+        );
+        Ok(Self {
+            #[cfg(native_tensorrt)]
+            handle,
+            mix_len,
+            conv_len,
+            tra_len,
+            inter_len,
+            enh_len,
+        })
+    }
+
+    pub(crate) fn infer(
+        &mut self,
+        mix: &[f32],
+        conv: &mut [f32],
+        tra: &mut [f32],
+        inter: &mut [f32],
+        enh: &mut [f32],
+    ) -> Result<()> {
+        if mix.len() != self.mix_len.get() {
+            bail!(
+                "native TensorRT GTCRN mix length mismatch: got {}, expected {}",
+                mix.len(),
+                self.mix_len.get()
+            );
+        }
+        if conv.len() != self.conv_len.get()
+            || tra.len() != self.tra_len.get()
+            || inter.len() != self.inter_len.get()
+            || enh.len() != self.enh_len.get()
+        {
+            bail!(
+                "native TensorRT GTCRN buffer length mismatch: conv={}/{} tra={}/{} inter={}/{} enh={}/{}",
+                conv.len(),
+                self.conv_len.get(),
+                tra.len(),
+                self.tra_len.get(),
+                inter.len(),
+                self.inter_len.get(),
+                enh.len(),
+                self.enh_len.get()
+            );
+        }
+        infer_gtcrn(self, mix, conv, tra, inter, enh)
+    }
+}
+
 impl NativeRvcEngine {
     pub(super) fn load(
         model_path: &Path,
@@ -417,6 +531,52 @@ impl Drop for NativeRvcEngine {
     }
 }
 
+#[cfg(native_tensorrt)]
+impl Drop for NativeGtcrnEngine {
+    fn drop(&mut self) {
+        unsafe { ffi::vc_rs_trt_engine_destroy(self.handle.as_ptr()) };
+    }
+}
+
+pub(crate) fn native_gtcrn_engine_is_cached(model_path: &Path, gpu_device_id: u32) -> bool {
+    native_gtcrn_profile(model_path, super::GpuPriority::default(), gpu_device_id)
+        .ok()
+        .and_then(|profile| native_engine_path(&profile).ok())
+        .and_then(|path| path.metadata().ok())
+        .is_some_and(|metadata| metadata.len() > 0)
+}
+
+fn native_gtcrn_profile(
+    model_path: &Path,
+    gpu_priority: super::GpuPriority,
+    gpu_device_id: u32,
+) -> Result<TensorRtSessionProfile> {
+    Ok(TensorRtSessionProfile::new(
+        ModelRole::Gtcrn,
+        vec![
+            TensorRtInputShape {
+                name: "mix".to_string(),
+                dims: vec![1, 257, 1, 2],
+            },
+            TensorRtInputShape {
+                name: "conv_cache".to_string(),
+                dims: vec![2, 1, 16, 16, 33],
+            },
+            TensorRtInputShape {
+                name: "tra_cache".to_string(),
+                dims: vec![2, 3, 1, 1, 16],
+            },
+            TensorRtInputShape {
+                name: "inter_cache".to_string(),
+                dims: vec![2, 1, 33, 16],
+            },
+        ],
+    )
+    .with_optional_model_cache_key(Some(tensor_rt_model_cache_key(model_path)?))
+    .with_gpu_priority(gpu_priority)
+    .with_gpu_device_id(gpu_device_id))
+}
+
 fn native_engine_path(profile: &TensorRtSessionProfile) -> Result<PathBuf> {
     Ok(profile
         .cache_dir_from_root(&tensor_rt_cache_root()?)?
@@ -483,7 +643,12 @@ fn build_engine(
     profile_shapes: &str,
     gpu_device_id: u32,
 ) -> Result<()> {
-    let tmp_engine = engine_path.with_extension(format!("engine.tmp-{}", std::process::id()));
+    let tmp_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp_engine =
+        engine_path.with_extension(format!("engine.tmp-{}-{tmp_suffix}", std::process::id()));
     let _ = std::fs::remove_file(&tmp_engine);
 
     // Persistent timing cache shared by every engine build (all model roles and
@@ -1021,6 +1186,51 @@ fn infer_rvc(
     _speaker_id: i64,
 ) -> Result<Vec<f32>> {
     bail!("native TensorRT RVC inference is unavailable in this binary")
+}
+
+#[cfg(native_tensorrt)]
+fn infer_gtcrn(
+    engine: &mut NativeGtcrnEngine,
+    mix: &[f32],
+    conv: &mut [f32],
+    tra: &mut [f32],
+    inter: &mut [f32],
+    enh: &mut [f32],
+) -> Result<()> {
+    let mut message = MessageBuffer::new();
+    let status = unsafe {
+        ffi::vc_rs_trt_gtcrn_infer(
+            engine.handle.as_ptr(),
+            mix.as_ptr(),
+            mix.len(),
+            conv.as_mut_ptr(),
+            conv.len(),
+            tra.as_mut_ptr(),
+            tra.len(),
+            inter.as_mut_ptr(),
+            inter.len(),
+            enh.as_mut_ptr(),
+            enh.len(),
+            message.as_mut_ptr(),
+            message.len(),
+        )
+    };
+    if status != 0 {
+        bail!("native TensorRT GTCRN inference failed: {}", message.text());
+    }
+    Ok(())
+}
+
+#[cfg(not(native_tensorrt))]
+fn infer_gtcrn(
+    _engine: &mut NativeGtcrnEngine,
+    _mix: &[f32],
+    _conv: &mut [f32],
+    _tra: &mut [f32],
+    _inter: &mut [f32],
+    _enh: &mut [f32],
+) -> Result<()> {
+    bail!("native TensorRT GTCRN inference is unavailable in this binary")
 }
 
 #[cfg(native_tensorrt)]

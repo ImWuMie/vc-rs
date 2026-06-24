@@ -182,6 +182,7 @@ pub(super) enum ModelRole {
     ContentVec,
     Rmvpe,
     Rvc,
+    Gtcrn,
     Inspect,
 }
 
@@ -191,6 +192,7 @@ impl ModelRole {
             ModelRole::ContentVec => "contentvec",
             ModelRole::Rmvpe => "rmvpe",
             ModelRole::Rvc => "rvc",
+            ModelRole::Gtcrn => "gtcrn",
             ModelRole::Inspect => "inspect",
         }
     }
@@ -1152,6 +1154,27 @@ pub(super) fn tensor_rt_benchmark_profile(role: ModelRole) -> Result<TensorRtSes
                 TensorRtInputShape {
                     name: "pitchf".to_string(),
                     dims: RVC_PITCH_DIMS.to_vec(),
+                },
+            ],
+        )),
+        ModelRole::Gtcrn => Ok(TensorRtSessionProfile::new(
+            role,
+            vec![
+                TensorRtInputShape {
+                    name: "mix".to_string(),
+                    dims: vec![1, 257, 1, 2],
+                },
+                TensorRtInputShape {
+                    name: "conv_cache".to_string(),
+                    dims: vec![2, 1, 16, 16, 33],
+                },
+                TensorRtInputShape {
+                    name: "tra_cache".to_string(),
+                    dims: vec![2, 3, 1, 1, 16],
+                },
+                TensorRtInputShape {
+                    name: "inter_cache".to_string(),
+                    dims: vec![2, 1, 33, 16],
                 },
             ],
         )),

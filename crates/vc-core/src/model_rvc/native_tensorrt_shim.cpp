@@ -290,26 +290,35 @@ bool copy_to_device(NativeEngine& native, char const* name, void const* src, std
     return true;
 }
 
-bool copy_output_to_host(NativeEngine& native, float* dst, std::size_t output_len, Message& msg) {
-    int32_t index = tensor_index(native, native.output_name.c_str());
+bool copy_named_output_to_host(NativeEngine& native, char const* name, float* dst, std::size_t output_len, Message& msg) {
+    int32_t index = tensor_index(native, name);
     if (index < 0) {
-        msg.append("engine is missing output tensor %s\n", native.output_name.c_str());
+        msg.append("engine is missing output tensor %s\n", name);
         return false;
     }
-    if (output_len != native.output_len) {
-        msg.append("TensorRT output length mismatch: got %zu, expected %zu\n", output_len, native.output_len);
+    if (native.engine->getTensorDataType(name) != nvinfer1::DataType::kFLOAT) {
+        msg.append("engine output %s must be FP32\n", name);
+        return false;
+    }
+    auto& buffer = native.buffers[static_cast<std::size_t>(index)];
+    if (output_len * sizeof(float) != buffer.bytes) {
+        msg.append("TensorRT output %s length mismatch: got %zu floats, expected %zu bytes\n", name, output_len, buffer.bytes);
         return false;
     }
     // The device->host copy into the pinned buffer was issued on the stream and
     // synchronized by the caller; hand the bytes back to the caller's buffer.
-    std::memcpy(dst, native.buffers[static_cast<std::size_t>(index)].host, output_len * sizeof(float));
+    std::memcpy(dst, buffer.host, output_len * sizeof(float));
     return true;
+}
+
+bool copy_output_to_host(NativeEngine& native, float* dst, std::size_t output_len, Message& msg) {
+    return copy_named_output_to_host(native, native.output_name.c_str(), dst, output_len, msg);
 }
 
 // Issue the full inference sequence on the stream: H2D copies of every input
 // from its pinned staging buffer, the TensorRT enqueue, then the D2H copy of the
-// output into its pinned buffer. Used both to capture the CUDA graph and as the
-// fallback path when graph capture is unavailable.
+// outputs into their pinned buffers. Used both to capture the CUDA graph and as
+// the fallback path when graph capture is unavailable.
 bool record_io(NativeEngine& native, Message& msg) {
     int32_t const out_index = tensor_index(native, native.output_name.c_str());
     if (out_index < 0) {
@@ -317,7 +326,8 @@ bool record_io(NativeEngine& native, Message& msg) {
         return false;
     }
     for (std::size_t i = 0; i < native.buffers.size(); ++i) {
-        if (static_cast<int32_t>(i) == out_index) {
+        char const* name = native.engine->getIOTensorName(static_cast<int32_t>(i));
+        if (native.engine->getTensorIOMode(name) != nvinfer1::TensorIOMode::kINPUT) {
             continue;
         }
         auto& buffer = native.buffers[i];
@@ -332,11 +342,20 @@ bool record_io(NativeEngine& native, Message& msg) {
         msg.append("TensorRT enqueueV3 failed\n");
         return false;
     }
-    auto& out = native.buffers[static_cast<std::size_t>(out_index)];
-    return cuda_ok(
-        cudaMemcpyAsync(out.host, out.ptr, native.output_len * sizeof(float), cudaMemcpyDeviceToHost, native.stream),
-        msg,
-        "cudaMemcpyAsync output");
+    for (std::size_t i = 0; i < native.buffers.size(); ++i) {
+        char const* name = native.engine->getIOTensorName(static_cast<int32_t>(i));
+        if (native.engine->getTensorIOMode(name) != nvinfer1::TensorIOMode::kOUTPUT) {
+            continue;
+        }
+        auto& out = native.buffers[i];
+        if (!cuda_ok(
+                cudaMemcpyAsync(out.host, out.ptr, out.bytes, cudaMemcpyDeviceToHost, native.stream),
+                msg,
+                "cudaMemcpyAsync output")) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool enqueue_and_copy(NativeEngine& native, float* output, std::size_t output_len, Message& msg) {
@@ -678,6 +697,60 @@ extern "C" int vc_rs_trt_rvc_infer(
         return 1;
     }
     return enqueue_and_copy(*native, output, output_len, msg) ? 0 : 1;
+}
+
+extern "C" int vc_rs_trt_gtcrn_infer(
+    NativeEngine* native,
+    float const* mix,
+    std::size_t mix_len,
+    float* conv,
+    std::size_t conv_len,
+    float* tra,
+    std::size_t tra_len,
+    float* inter,
+    std::size_t inter_len,
+    float* enh,
+    std::size_t enh_len,
+    char* message,
+    std::size_t message_len
+) {
+    Message msg{message, message_len};
+    if (message_len > 0) {
+        message[0] = '\0';
+    }
+    if (native == nullptr || mix == nullptr || conv == nullptr || tra == nullptr
+        || inter == nullptr || enh == nullptr) {
+        msg.append("null argument passed to TensorRT GTCRN infer\n");
+        return 2;
+    }
+    // The cache tensors are both inputs and outputs at the Rust boundary. The
+    // input side is staged before enqueue; after synchronization the same caller
+    // buffers are overwritten with the *_out tensors for the next streaming hop.
+    if (!copy_to_device(*native, "mix", mix, mix_len * sizeof(float), msg)) {
+        return 1;
+    }
+    if (!copy_to_device(*native, "conv_cache", conv, conv_len * sizeof(float), msg)) {
+        return 1;
+    }
+    if (!copy_to_device(*native, "tra_cache", tra, tra_len * sizeof(float), msg)) {
+        return 1;
+    }
+    if (!copy_to_device(*native, "inter_cache", inter, inter_len * sizeof(float), msg)) {
+        return 1;
+    }
+    if (!enqueue_and_copy(*native, enh, enh_len, msg)) {
+        return 1;
+    }
+    if (!copy_named_output_to_host(*native, "conv_cache_out", conv, conv_len, msg)) {
+        return 1;
+    }
+    if (!copy_named_output_to_host(*native, "tra_cache_out", tra, tra_len, msg)) {
+        return 1;
+    }
+    if (!copy_named_output_to_host(*native, "inter_cache_out", inter, inter_len, msg)) {
+        return 1;
+    }
+    return 0;
 }
 
 // --- Delay-load resolution from this module's own directory (Windows/MSVC) ----

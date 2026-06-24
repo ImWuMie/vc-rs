@@ -117,8 +117,10 @@ GUI にはない機能です。バッチ処理や、設定変更の決定的な�
   オクターブ上、`-12.0` で 1 オクターブ下。
 - `--input-gain 1.0` / `--output-gain 1.0`: 入力・出力にかけるゲイン
   （デフォルト: 1.0）。小さすぎる場合に上げます。上げすぎるとクリップします。
-- `--denoiser off|noise-gate|rnnoise`: 排他的な入力ノイズ抑制方式。RNNoiseは
-  組み込みモデルを使います。旧`--noise-gate`は互換aliasです。
+- `--denoiser off|noise-gate|rnnoise|gtcrn`: 排他的な入力ノイズ抑制方式。
+  RNNoiseは組み込みモデルを使います。GTCRN は `gtcrn_stream.onnx` を含む
+  ディレクトリを `--gtcrn-model <dir>` で指定します（`download-models.ps1
+  -Gtcrn` で取得）。旧`--noise-gate`は互換aliasです。
 - `--silence-threshold 0.0001`: 無音とみなすしきい値。
 - `--rms-mix-rate <0.0-1.0>`: 0.0 に近いほど入力音量の起伏を反映、1.0 に近いほど
   モデル出力の音量を保持（デフォルト: 0.0）。
@@ -155,9 +157,10 @@ ASIO はドライバをグローバルに1つだけロードするため、入�
 場合は同じドライバを指定してください。ASIO のバッファサイズはドライバ自身の
 コントロールパネルで設定し、`--wasapi-buffer-ms` は効きません。
 
-`wav --denoiser rnnoise`はRNNoiseの固定ストリーミング遅延を自動補償し、入力WAVと
-同じサンプル数を維持します。RNNoiseはスタンドアロンCLI/GUI専用で、VST3には
-含まれません。
+`wav --denoiser rnnoise` と `wav --denoiser gtcrn` は各デノイザの固定
+ストリーミング遅延を自動補償し、入力WAVと同じサンプル数を維持します。
+RNNoise と GTCRN はスタンドアロンCLI/GUI専用で、VST3には含まれません。
+GTCRN は Windows ML 版では ORT CPU、TensorRT 版では native TensorRT で実行します。
 
 ## Windows ML の実行プロバイダ（windowsml 版）
 

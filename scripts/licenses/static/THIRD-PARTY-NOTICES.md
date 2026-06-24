@@ -23,6 +23,9 @@ The TensorRT build runs the GPU path through native TensorRT and contains **no
 ONNX Runtime** (`onnxruntime.LICENSE.txt` does not apply to this package). It
 ships the NVIDIA TensorRT runtime DLLs so it can run engines without a separate
 TensorRT install.
+Standalone TensorRT packages also include GTCRN input denoising through native
+TensorRT; its Rust DSP/FFT dependencies (`realfft`/`rustfft` and transitive
+crates) are covered by the generated third-party license file in the archive.
 
 | Component | DLLs | License |
 |---|---|---|

@@ -127,8 +127,10 @@ lower `--chunk-ms`** to reduce latency.
   up, `-12.0` one octave down.
 - `--input-gain 1.0` / `--output-gain 1.0`: input/output gain (default: 1.0).
   Raise when too quiet; raising too far clips.
-- `--denoiser off|noise-gate|rnnoise`: exclusive input denoiser selection.
-  RNNoise uses an embedded model. The old `--noise-gate` flag remains as an alias.
+- `--denoiser off|noise-gate|rnnoise|gtcrn`: exclusive input denoiser selection.
+  RNNoise uses an embedded model. GTCRN requires `--gtcrn-model <dir>` pointing
+  at a directory containing `gtcrn_stream.onnx` (download with
+  `download-models.ps1 -Gtcrn`). The old `--noise-gate` flag remains as an alias.
 - `--silence-threshold 0.0001`: threshold below which input is treated as
   silence.
 - `--rms-mix-rate <0.0-1.0>`: closer to 0.0 follows the input's loudness
@@ -169,9 +171,11 @@ ASIO loads a single driver globally, so when **both** directions are ASIO they
 must name the same driver. ASIO buffer size is set in the driver's own control
 panel, not by `--wasapi-buffer-ms`.
 
-`wav --denoiser rnnoise` compensates RNNoise's fixed streaming delay and keeps
-the output WAV at the original sample count. RNNoise is available only in the
-standalone CLI/GUI packages, not VST3.
+`wav --denoiser rnnoise` and `wav --denoiser gtcrn` compensate the denoiser's
+fixed streaming delay and keep the output WAV at the original sample count.
+RNNoise and GTCRN are available only in the standalone CLI/GUI packages, not
+VST3. GTCRN uses ORT CPU in Windows ML packages and native TensorRT in TensorRT
+packages.
 
 ## Windows ML execution providers (windowsml package)
 

@@ -153,12 +153,12 @@ Where each denoiser sits:
 | --- | --- | --- | --- |
 | Noise Gate | very low | threshold gate only | embedded |
 | RNNoise | low | modest | embedded, 48 kHz |
-| **GTCRN** | **low** | **good** | **Windows ML packages only, 16 kHz, needs a model** |
+| **GTCRN** | **low** | **good** | **standalone packages only, 16 kHz, needs a model** |
 
 GTCRN is an ultra-light (~48K-parameter) speech-enhancement model that runs in
-real time on the CPU with large margin. It ships **only in the Windows ML
-standalone packages** (it needs ONNX Runtime; the native-TensorRT packages and
-VST3 do not include it). Its fixed delay is ~48 ms (the 16 kHz STFT
+real time with large margin. It ships in the **standalone CLI/GUI packages**:
+Windows ML runs the tiny graph on ORT CPU, while TensorRT runs it through native
+TensorRT. VST3 does not include it. Its fixed delay is ~48 ms (the 16 kHz STFT
 reconstruction plus the adapter FIFO). Fetch the model with
 `download-models.ps1 -Gtcrn` into `assets\gtcrn\`, then point the GUI's **GTCRN
 model dir** or the CLI's `--gtcrn-model <dir>` at it.

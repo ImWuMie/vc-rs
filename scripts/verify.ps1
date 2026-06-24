@@ -69,9 +69,9 @@ try {
     Invoke-Step "cargo test --workspace" { cargo test --workspace }
 
     # --- Standalone package feature set ------------------------------------
-    # The windowsml standalone also ships GTCRN (needs ONNX Runtime); the
-    # tensorrt standalone does not. Mirror the shipped feature set here.
-    $standaloneFeatures = if ($Variant -eq 'windowsml') { "$Variant,rnnoise,gtcrn" } else { "$Variant,rnnoise" }
+    # Both standalone variants ship GTCRN. Windows ML uses ORT CPU for GTCRN;
+    # TensorRT stays ORT-free and runs GTCRN through the native shim.
+    $standaloneFeatures = "$Variant,rnnoise,gtcrn"
     Invoke-Step "cargo check standalone ($standaloneFeatures)" {
         cargo check -p vc-cli -p vc-gui --no-default-features --features $standaloneFeatures
     }

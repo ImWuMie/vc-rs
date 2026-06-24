@@ -140,12 +140,12 @@ if (-not (Get-Command cargo-about -ErrorAction SilentlyContinue)) {
 
 # Single-provider feature set per variant. `--no-default-features` drops the
 # other backend so the binary stays lean (a tensorrt build sheds ONNX Runtime).
-# GTCRN ships only in the windowsml variant: it needs ONNX Runtime, which the
-# tensorrt build deliberately drops (ORT and native TensorRT never share a
-# distribution process). -Asio appends the (orthogonal) ASIO audio backend.
+# GTCRN ships in both standalone variants: Windows ML uses ORT CPU for the tiny
+# graph, while TensorRT stays ORT-free and runs GTCRN through the native shim.
+# -Asio appends the (orthogonal) ASIO audio backend.
 $features = switch ($Variant) {
     'windowsml' { 'windowsml,rnnoise,gtcrn' }
-    'tensorrt' { 'tensorrt,rnnoise' }
+    'tensorrt' { 'tensorrt,rnnoise,gtcrn' }
 }
 if ($Asio) { $features += ',asio' }
 $buildFeatureArgs = @('--no-default-features', '--features', $features)

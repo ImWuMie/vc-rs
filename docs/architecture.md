@@ -159,10 +159,10 @@ one ContentVec/F0 consume, the RVC-path **input RMS, silence detection,
 volume-envelope memory, and RMS-mix reference are all derived from that 16 kHz
 timeline for every denoiser mode** (Off / Gate / RNNoise / GTCRN), not from the
 raw device-rate buffer. The passthrough route keeps a separate device-rate GTCRN
-instance (its resamplers engage). GTCRN ships only in the Windows ML standalone
-packages (it needs ONNX Runtime); VST3 and the native-TensorRT packages do not
-enable or ship it. VST3 intentionally does not enable or ship these optional core
-denoisers.
+instance (its resamplers engage). GTCRN ships in standalone packages: Windows ML
+uses ORT CPU for the tiny graph, while TensorRT uses a native TensorRT engine so
+the TensorRT package remains ORT-free. VST3 intentionally does not enable or ship
+these optional core denoisers.
 
 Conceptually, RVC conversion has three model-facing inputs:
 

@@ -12,6 +12,8 @@ use super::f0_postprocess::{F0PostprocessConfig, F0Postprocessor};
 use super::feature::FeatureTensor;
 use super::inspect::{inspect_contentvec_input_name, inspect_rvc_model};
 use super::native_tensorrt::native_engine_is_cached;
+#[cfg(feature = "gtcrn")]
+use super::native_tensorrt::native_gtcrn_engine_is_cached;
 use super::pitch::{
     align_pitchf_to_features_into, center_crop_pitchf_to_features_into, coarse_pitch_into,
     pitchf_tail_for_output_into, voiced_ratio,
@@ -288,6 +290,7 @@ pub enum LoadModelRole {
     ContentVec,
     Rmvpe,
     Rvc,
+    Gtcrn,
 }
 
 impl LoadModelRole {
@@ -296,6 +299,7 @@ impl LoadModelRole {
             Self::ContentVec => "ContentVec",
             Self::Rmvpe => "RMVPE",
             Self::Rvc => "RVC",
+            Self::Gtcrn => "GTCRN",
         }
     }
 }
@@ -357,6 +361,23 @@ impl RvcPipeline {
     ) -> Result<Self> {
         if config.noise_gate_enabled {
             bail!("GTCRN and the input noise gate are mutually exclusive");
+        }
+        if let crate::denoise::GtcrnBackend::NativeTensorRt { gpu_device_id, .. } = gtcrn.backend {
+            let model = crate::denoise::model_file_for_cache_probe(gtcrn.model_dir)?;
+            if !native_gtcrn_engine_is_cached(&model, gpu_device_id) {
+                report_progress(
+                    &config,
+                    LoadProgress::BuildingEngine {
+                        role: LoadModelRole::Gtcrn,
+                    },
+                );
+            }
+            report_progress(
+                &config,
+                LoadProgress::LoadingModel {
+                    role: LoadModelRole::Gtcrn,
+                },
+            );
         }
         // Build the adapter at 16 kHz so its resamplers are bypass — only the
         // hop FIFO and fixed delay run on the increment fed by `resampler_16k`.

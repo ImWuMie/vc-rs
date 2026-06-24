@@ -28,4 +28,6 @@ pub(crate) use adapter::{FixedDelayAdapter, FrameDenoiser};
 pub use rnnoise::RnnoiseDenoiser;
 
 #[cfg(feature = "gtcrn")]
-pub use gtcrn::{GtcrnConfig, GtcrnDenoiser};
+pub(crate) use gtcrn::model_file_for_cache_probe;
+#[cfg(feature = "gtcrn")]
+pub use gtcrn::{GtcrnBackend, GtcrnConfig, GtcrnDenoiser};

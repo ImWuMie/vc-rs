@@ -38,12 +38,11 @@ windowsml = ["ort", "ort/load-dynamic", "ort/api-24", "ort/directml"]
 # VST3 builds do not compile or ship the standalone denoiser.
 rnnoise = ["dep:nnnoiseless"]
 # GTCRN ultra-light (≈48 K params) input denoiser at 16 kHz. We own the
-# STFT/iSTFT (pure-Rust `realfft`, DSP-only — no `ndarray`, no git pin); `ort`
-# runs the streaming graph. Windows ML standalone packages only; never enabled in
-# `vc-vst3` or the native-TensorRT distribution (ORT and native TensorRT never
-# share a process). The `stft`/`gtcrn_model` submodules stay ort-free so their
-# tests run without the Windows ML runtime.
-gtcrn = ["ort", "dep:realfft"]
+# STFT/iSTFT (pure-Rust `realfft`, DSP-only — no `ndarray`, no git pin); the
+# streaming graph is backend-swappable: ORT CPU when the `ort` feature is present,
+# native TensorRT when `tensorrt` is present. VST3 deliberately does not expose
+# this feature.
+gtcrn = ["dep:realfft"]
 
 [dependencies]
 anyhow.workspace = true

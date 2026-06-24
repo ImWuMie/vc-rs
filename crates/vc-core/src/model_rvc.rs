@@ -4,7 +4,7 @@ mod chunk_converter;
 mod f0_postprocess;
 mod feature;
 mod inspect;
-mod native_tensorrt;
+pub(crate) mod native_tensorrt;
 mod noise;
 mod onnx_meta;
 mod pipeline;
