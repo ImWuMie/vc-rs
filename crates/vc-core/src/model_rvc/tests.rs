@@ -10,8 +10,8 @@ use super::pitch::{
     align_pitchf_to_features, center_crop_pitchf_to_features, pitchf_tail_for_output,
 };
 use super::shape::{
-    aligned_rvc_input_len, keep_tail_in_place, onnx_silence_front_feature_frames,
-    output_len_from_convert_size, rmvpe_model_input_samples_16k,
+    aligned_rvc_input_len, extra_convert_samples_from_ms, keep_tail_in_place,
+    onnx_silence_front_feature_frames, output_len_from_convert_size, rmvpe_model_input_samples_16k,
     rmvpe_model_input_samples_for_context_16k, tensor_rt_model_input_samples_16k,
     EMBEDDER_SAMPLE_RATE, RVC_SAMPLE_RATE,
 };
@@ -112,7 +112,7 @@ fn tensorrt_profiles_match_validated_shapes() {
 #[test]
 fn derives_tensorrt_contentvec_profile_from_default_realtime_chunking() {
     assert_eq!(
-        tensor_rt_model_input_samples_16k(960, 48_000, 107, 48_000),
+        tensor_rt_model_input_samples_16k(960, 48_000, 107, 48_000, 48_000),
         18_240
     );
     assert_eq!(rmvpe_model_input_samples_16k(960, 48_000), 4_960);
@@ -291,7 +291,7 @@ fn keeps_only_requested_output_tail() {
 // are unchanged; only the buffer the reference is drawn from moved.
 #[test]
 fn output_reference_audio_uses_tail_matching_trimmed_output() {
-    let mut state = RvcStreamState::new();
+    let mut state = RvcStreamState::new(48_000);
     state.audio_16k_buffer = (0..8).map(|value| value as f32).collect();
     let mut scratch = Vec::new();
 
@@ -304,7 +304,7 @@ fn output_reference_audio_uses_tail_matching_trimmed_output() {
 
 #[test]
 fn output_reference_audio_left_pads_when_history_is_short() {
-    let mut state = RvcStreamState::new();
+    let mut state = RvcStreamState::new(48_000);
     state.audio_16k_buffer = vec![1.0, 2.0];
     let mut scratch = Vec::new();
 
@@ -338,7 +338,7 @@ fn derives_output_len_like_reference_pipeline() {
 
 #[test]
 fn stream_state_aligns_convert_size_to_16k_hop_samples() {
-    let mut state = RvcStreamState::new();
+    let mut state = RvcStreamState::new(48_000);
     let input = vec![0.0; 24_000];
     let out = state
         .generate_input(&input, 48_000, 1_536, 1_536, 4_096)
@@ -348,7 +348,7 @@ fn stream_state_aligns_convert_size_to_16k_hop_samples() {
 
 #[test]
 fn stream_state_derives_out_size_from_extra_convert_size() {
-    let mut state = RvcStreamState::new();
+    let mut state = RvcStreamState::new(48_000);
     let input = vec![0.0; 24_000];
     let out = state
         .generate_input(&input, 48_000, 1_536, 1_536, 4_096)
@@ -358,7 +358,7 @@ fn stream_state_derives_out_size_from_extra_convert_size() {
 
 #[test]
 fn stream_state_zero_pads_initial_buffer() {
-    let mut state = RvcStreamState::new();
+    let mut state = RvcStreamState::new(48_000);
     let out = state
         .generate_input(&[1.0, 2.0, 3.0, 4.0], 48_000, 0, 0, 4_096)
         .unwrap();
@@ -374,7 +374,7 @@ fn stream_state_zero_pads_initial_buffer() {
 
 #[test]
 fn stream_state_keeps_16k_history_for_embedder() {
-    let mut state = RvcStreamState::new();
+    let mut state = RvcStreamState::new(48_000);
     let input = vec![0.25; 4_800];
 
     state.generate_input(&input, 48_000, 0, 0, 0).unwrap();
@@ -389,7 +389,7 @@ fn stream_state_keeps_16k_history_for_embedder() {
 
 #[test]
 fn stream_state_volume_excludes_crossfade_not_sola_search() {
-    let mut state = RvcStreamState::new();
+    let mut state = RvcStreamState::new(48_000);
     let mut input = vec![1.0; 80];
     input.extend(std::iter::repeat_n(0.0, 80));
 
@@ -400,7 +400,7 @@ fn stream_state_volume_excludes_crossfade_not_sola_search() {
 
 #[test]
 fn stream_state_volume_keeps_decay_from_previous_chunk() {
-    let mut state = RvcStreamState::new();
+    let mut state = RvcStreamState::new(48_000);
     let loud = vec![1.0; 160];
     let quiet = vec![0.0; 160];
 
@@ -440,7 +440,7 @@ fn pitchf_tail_for_output_matches_10ms_output_frames() {
 
 #[test]
 fn stream_state_pitch_update_places_rmvpe_tail_window_at_absolute_frame() {
-    let mut state = RvcStreamState::new();
+    let mut state = RvcStreamState::new(48_000);
     state.pitchf_buffer = (0..34).map(|frame| frame as f32).collect();
 
     state.update_pitchf_from_rmvpe_window(&[100.0, 101.0, 102.0, 103.0], 480);
@@ -451,7 +451,7 @@ fn stream_state_pitch_update_places_rmvpe_tail_window_at_absolute_frame() {
 
 #[test]
 fn stream_state_pitch_update_drops_center_padded_tail_frame() {
-    let mut state = RvcStreamState::new();
+    let mut state = RvcStreamState::new(48_000);
     state.pitchf_buffer = vec![0.0, 1.0, 2.0];
 
     state.update_pitchf_from_rmvpe_window(&[10.0, 20.0, 30.0, 40.0], 0);
@@ -461,7 +461,65 @@ fn stream_state_pitch_update_drops_center_padded_tail_frame() {
 
 #[test]
 fn derives_vcclient_onnx_silence_front_feature_offset() {
-    assert_eq!(onnx_silence_front_feature_frames(4096), 6);
+    assert_eq!(onnx_silence_front_feature_frames(4096, 48_000), 6);
+}
+
+#[test]
+fn extra_convert_samples_scale_with_model_sample_rate() {
+    // The same convert-context duration is fewer samples at a lower model rate.
+    assert_eq!(extra_convert_samples_from_ms(100, 48_000), 4_800);
+    assert_eq!(extra_convert_samples_from_ms(100, 32_000), 3_200);
+}
+
+#[test]
+fn out_size_tracks_model_sample_rate() {
+    // Identical device-rate input through a 48 kHz vs a 32 kHz model: the
+    // ContentVec/F0 window lives in the 16 kHz domain (independent of the model's
+    // output rate), so `convert_size` matches; `out_size` is in the model's
+    // output-rate domain, so the 32 kHz window is 32/48 of the 48 kHz one.
+    let chunk = vec![0.1f32; 4_800]; // 100 ms at the 48 kHz device rate
+    let device_rate = 48_000;
+
+    let mut s48 = RvcStreamState::new(48_000);
+    let in48 = s48
+        .generate_input(
+            &chunk,
+            device_rate,
+            0,
+            0,
+            extra_convert_samples_from_ms(100, 48_000),
+        )
+        .unwrap();
+
+    let mut s32 = RvcStreamState::new(32_000);
+    let in32 = s32
+        .generate_input(
+            &chunk,
+            device_rate,
+            0,
+            0,
+            extra_convert_samples_from_ms(100, 32_000),
+        )
+        .unwrap();
+
+    assert_eq!(
+        in48.convert_size, in32.convert_size,
+        "device-rate convert window is independent of the model output rate"
+    );
+    assert!(
+        in32.out_size < in48.out_size,
+        "32 kHz output window must be shorter: 32k={} 48k={}",
+        in32.out_size,
+        in48.out_size
+    );
+    let expected = in48.out_size * 32_000 / 48_000;
+    assert!(
+        (in32.out_size as i64 - expected as i64).abs() <= 1,
+        "32k out_size {} not ~32/48 of 48k out_size {} (expected {})",
+        in32.out_size,
+        in48.out_size,
+        expected
+    );
 }
 #[test]
 fn gpu_priority_defaults_to_high() {

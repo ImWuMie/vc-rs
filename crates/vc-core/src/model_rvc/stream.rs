@@ -4,7 +4,7 @@ use crate::dsp;
 
 use super::shape::{
     feature_len_for_samples, keep_tail_in_place, samples_between_rates, tensor_rt_convert_size_16k,
-    Rounding, EMBEDDER_SAMPLE_RATE, RMVPE_FRAME_SAMPLES_16K, RVC_SAMPLE_RATE,
+    Rounding, EMBEDDER_SAMPLE_RATE, RMVPE_FRAME_SAMPLES_16K,
 };
 
 pub(super) const VOLUME_DECAY: f32 = 0.97;
@@ -92,6 +92,10 @@ pub(super) struct RvcStreamState {
     pub(super) prev_vol: f32,
     pub(super) prev_silence: bool,
     pub(super) sample_rate: u32,
+    /// The RVC model's native output rate (from metadata `samplingRate`, default
+    /// `RVC_SAMPLE_RATE`). Fixed per model — distinct from `sample_rate`, which is
+    /// the device/input rate. Sizes `out_size` and the RVC-domain conversions.
+    pub(super) rvc_sample_rate: u32,
     pub(super) resampler_16k: Option<dsp::StreamingResampleMono>,
     // GTCRN input denoiser applied to each new 16 kHz increment before it is
     // appended to the windowed `audio_16k_buffer` (the RVC-path seam). `Some`
@@ -102,7 +106,7 @@ pub(super) struct RvcStreamState {
 }
 
 impl RvcStreamState {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(rvc_sample_rate: u32) -> Self {
         Self {
             audio_buffer: Vec::new(),
             audio_16k_buffer: Vec::new(),
@@ -110,6 +114,7 @@ impl RvcStreamState {
             prev_vol: 0.0,
             prev_silence: false,
             sample_rate: 0,
+            rvc_sample_rate,
             resampler_16k: None,
             #[cfg(feature = "gtcrn")]
             gtcrn: None,
@@ -176,13 +181,13 @@ impl RvcStreamState {
 
         let extra_16k_samples = samples_between_rates(
             extra_convert_samples,
-            RVC_SAMPLE_RATE,
+            self.rvc_sample_rate,
             EMBEDDER_SAMPLE_RATE,
             Rounding::Floor,
         );
         let volume_excluded_16k_samples = samples_between_rates(
             volume_excluded_samples,
-            RVC_SAMPLE_RATE,
+            self.rvc_sample_rate,
             EMBEDDER_SAMPLE_RATE,
             Rounding::Floor,
         );
@@ -191,6 +196,7 @@ impl RvcStreamState {
             sample_rate,
             crossfade_and_search_samples,
             extra_convert_samples,
+            self.rvc_sample_rate,
         );
         let convert_size = samples_between_rates(
             convert_size_16k,
@@ -201,7 +207,7 @@ impl RvcStreamState {
         let out_size = samples_between_rates(
             convert_size_16k.saturating_sub(extra_16k_samples),
             EMBEDDER_SAMPLE_RATE,
-            RVC_SAMPLE_RATE,
+            self.rvc_sample_rate,
             Rounding::Floor,
         );
         let out_size = out_size.max(1);

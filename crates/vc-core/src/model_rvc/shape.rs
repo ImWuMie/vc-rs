@@ -12,8 +12,8 @@ pub(super) fn ms_to_samples(sample_rate: u32, ms: u32) -> usize {
     ((sample_rate as u64 * ms as u64) / 1000) as usize
 }
 
-pub(super) fn extra_convert_samples_from_ms(ms: u32) -> usize {
-    ms_to_samples(RVC_SAMPLE_RATE, ms)
+pub(super) fn extra_convert_samples_from_ms(ms: u32, rvc_sample_rate: u32) -> usize {
+    ms_to_samples(rvc_sample_rate, ms)
 }
 
 pub(super) fn feature_len_for_samples(samples: usize, sample_rate: u32) -> usize {
@@ -39,9 +39,12 @@ pub(super) fn samples_between_rates(
     }
 }
 
-pub(super) fn onnx_silence_front_feature_frames(extra_convert_samples: usize) -> usize {
+pub(super) fn onnx_silence_front_feature_frames(
+    extra_convert_samples: usize,
+    rvc_sample_rate: u32,
+) -> usize {
     let extra_16k_samples = (extra_convert_samples as u64 * EMBEDDER_SAMPLE_RATE as u64
-        / RVC_SAMPLE_RATE as u64) as usize;
+        / rvc_sample_rate as u64) as usize;
     (extra_16k_samples / 360) * 2
 }
 
@@ -113,12 +116,14 @@ pub(super) fn tensor_rt_model_input_samples_16k(
     sample_rate: u32,
     output_extra_ms: u32,
     extra_convert_samples: usize,
+    rvc_sample_rate: u32,
 ) -> usize {
     tensor_rt_convert_size_16k(
         chunk_samples,
         sample_rate,
-        ms_to_samples(RVC_SAMPLE_RATE, output_extra_ms),
+        ms_to_samples(rvc_sample_rate, output_extra_ms),
         extra_convert_samples,
+        rvc_sample_rate,
     )
 }
 
@@ -145,6 +150,7 @@ pub(super) fn tensor_rt_convert_size_16k(
     sample_rate: u32,
     output_extra_samples: usize,
     extra_convert_samples: usize,
+    rvc_sample_rate: u32,
 ) -> usize {
     let new_audio_16k_samples = samples_between_rates(
         new_audio_samples,
@@ -154,13 +160,13 @@ pub(super) fn tensor_rt_convert_size_16k(
     );
     let output_extra_16k_samples = samples_between_rates(
         output_extra_samples,
-        RVC_SAMPLE_RATE,
+        rvc_sample_rate,
         EMBEDDER_SAMPLE_RATE,
         Rounding::Floor,
     );
     let extra_16k_samples = samples_between_rates(
         extra_convert_samples,
-        RVC_SAMPLE_RATE,
+        rvc_sample_rate,
         EMBEDDER_SAMPLE_RATE,
         Rounding::Floor,
     );

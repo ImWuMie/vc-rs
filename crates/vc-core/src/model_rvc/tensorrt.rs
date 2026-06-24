@@ -1190,11 +1190,13 @@ pub(super) fn tensor_rt_benchmark_profile(role: ModelRole) -> Result<TensorRtSes
 pub(super) fn derive_rvc_feature_len(
     contentvec_frames: usize,
     extra_convert_samples: usize,
+    rvc_sample_rate: u32,
 ) -> Result<usize> {
     let frames2 = contentvec_frames
         .checked_mul(2)
         .context("RVC feature length overflow")?;
-    let silence_front_frames = onnx_silence_front_feature_frames(extra_convert_samples);
+    let silence_front_frames =
+        onnx_silence_front_feature_frames(extra_convert_samples, rvc_sample_rate);
     let feature_len = if silence_front_frames > 0 && silence_front_frames < frames2 {
         frames2 - silence_front_frames
     } else {
@@ -1211,6 +1213,7 @@ pub(super) fn tensor_rt_warmup_feature_len(
     embedder: &mut HubertEmbedderSession,
     input_samples_16k: usize,
     extra_convert_samples: usize,
+    rvc_sample_rate: u32,
 ) -> Result<TensorRtWarmupInfo> {
     let silence = vec![0.0; input_samples_16k];
     // Warmup is a one-shot load-time probe, so a local tensor is fine here.
@@ -1218,7 +1221,8 @@ pub(super) fn tensor_rt_warmup_feature_len(
     embedder.extract_into(&silence, &mut features)?;
     let contentvec_output_shape = features.shape.clone();
     let contentvec_frames = feature_len_from_shape(&features.shape, "embedder warmup output")?;
-    let feature_len = derive_rvc_feature_len(contentvec_frames, extra_convert_samples)?;
+    let feature_len =
+        derive_rvc_feature_len(contentvec_frames, extra_convert_samples, rvc_sample_rate)?;
     info!(
         "TensorRT warmup derived RVC frame count: contentvec_input_samples={} rvc_frames={}",
         input_samples_16k, feature_len
@@ -1599,27 +1603,31 @@ mod tests {
 
     #[test]
     fn derive_rvc_feature_len_doubles_then_trims_silence_front() {
+        let rvc_rate = 48_000;
         // No extra convert window -> no leading silence to trim -> exactly 2x,
         // matching the realtime pipeline's repeat_frames(2).
-        assert_eq!(derive_rvc_feature_len(100, 0).unwrap(), 200);
+        assert_eq!(derive_rvc_feature_len(100, 0, rvc_rate).unwrap(), 200);
 
         // With a nonzero extra window the result is 2x minus the trimmed leading
         // silence frames, exactly what tensor_rt_warmup_feature_len computes from
         // a run (repeat_frames(2) followed by trim_front_frames).
         let frames = 100usize;
         let extra = 48_000usize;
-        let silence_front = onnx_silence_front_feature_frames(extra);
+        let silence_front = onnx_silence_front_feature_frames(extra, rvc_rate);
         assert!(
             silence_front > 0,
             "test input should exercise the trim branch"
         );
         let frames2 = frames * 2;
         let expected = frames2 - silence_front;
-        assert_eq!(derive_rvc_feature_len(frames, extra).unwrap(), expected);
+        assert_eq!(
+            derive_rvc_feature_len(frames, extra, rvc_rate).unwrap(),
+            expected
+        );
     }
 
     #[test]
     fn derive_rvc_feature_len_rejects_zero_frames() {
-        assert!(derive_rvc_feature_len(0, 0).is_err());
+        assert!(derive_rvc_feature_len(0, 0, 48_000).is_err());
     }
 }

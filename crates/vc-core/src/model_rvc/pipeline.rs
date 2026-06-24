@@ -111,6 +111,10 @@ pub struct RvcPipeline {
     noise_gate_sample_rate: f32,
     output_extra_ms: u32,
     volume_excluded_ms: u32,
+    // The RVC model's native output sample rate (metadata `samplingRate`, default
+    // RVC_SAMPLE_RATE). All convert/output-window sizing and the reported output
+    // rate use this so non-48 kHz models (e.g. 32 kHz) are not mis-sized.
+    rvc_sample_rate: u32,
     extra_convert_samples: usize,
     rmvpe_input_samples_16k: usize,
     output_gain: f32,
@@ -395,15 +399,23 @@ impl RvcPipeline {
         }
 
         report_progress(&config, LoadProgress::PreparingProvider);
+        // Resolve the generator's I/O names (vcclient vs RVC WebUI / converter
+        // export aliases) and the model's native sample rate before sizing the
+        // convert/output windows, so the ORT bind sites use the right names and
+        // all sizing math runs in the model's actual rate domain.
+        let rvc_info = inspect_rvc_model(config.model)?;
+        let rvc_sample_rate = rvc_info.rvc_sample_rate.unwrap_or(RVC_SAMPLE_RATE);
         // CLI-facing configuration is milliseconds for consistency with other latency knobs.
-        // The RVC shape and trimming code below use the fixed 48 kHz model domain, so keep the
+        // The RVC shape and trimming code below use the model's sample-rate domain, so keep the
         // conversion at load time and leave the per-chunk processing path in samples.
-        let extra_convert_samples = extra_convert_samples_from_ms(config.extra_convert_ms);
+        let extra_convert_samples =
+            extra_convert_samples_from_ms(config.extra_convert_ms, rvc_sample_rate);
         let input_samples_16k = tensor_rt_model_input_samples_16k(
             config.chunk_samples,
             config.sample_rate,
             config.output_extra_ms,
             extra_convert_samples,
+            rvc_sample_rate,
         );
         let rmvpe_input_samples_16k = rmvpe_model_input_samples_for_context_16k(
             config.chunk_samples,
@@ -416,10 +428,6 @@ impl RvcPipeline {
                 role: LoadModelRole::Rvc,
             },
         );
-        // Resolve the generator's I/O names (vcclient vs RVC WebUI / converter
-        // export aliases) before loading, so the ORT bind sites use the names this
-        // model exports.
-        let rvc_info = inspect_rvc_model(config.model)?;
         let rvc = RvcModelSession::load(
             config.model,
             config.provider,
@@ -477,6 +485,7 @@ impl RvcPipeline {
             noise_gate_sample_rate: config.sample_rate as f32,
             output_extra_ms: config.output_extra_ms,
             volume_excluded_ms: config.volume_excluded_ms,
+            rvc_sample_rate,
             extra_convert_samples,
             rmvpe_input_samples_16k,
             output_gain: config.output_gain,
@@ -485,7 +494,7 @@ impl RvcPipeline {
             auto_output_gain: config.output_dynamics.auto_output_gain,
             target_output_rms: config.output_dynamics.target_output_rms,
             max_output_gain: config.output_dynamics.max_output_gain,
-            stream_state: RvcStreamState::new(),
+            stream_state: RvcStreamState::new(rvc_sample_rate),
             input_scratch: Vec::new(),
             feature_tensor: FeatureTensor::default(),
             input_reference_scratch: Vec::new(),
@@ -533,12 +542,15 @@ impl RvcPipeline {
         let expected_feat_channels = rvc_info.expected_feat_channels;
         let expected_feat_channels_usize = usize::try_from(expected_feat_channels)
             .context("RVC expected feature channel count does not fit in usize")?;
-        let extra_convert_samples = extra_convert_samples_from_ms(config.extra_convert_ms);
+        let rvc_sample_rate = rvc_info.rvc_sample_rate.unwrap_or(RVC_SAMPLE_RATE);
+        let extra_convert_samples =
+            extra_convert_samples_from_ms(config.extra_convert_ms, rvc_sample_rate);
         let input_samples_16k = tensor_rt_model_input_samples_16k(
             config.chunk_samples,
             config.sample_rate,
             config.output_extra_ms,
             extra_convert_samples,
+            rvc_sample_rate,
         );
         let rmvpe_input_samples_16k = rmvpe_model_input_samples_for_context_16k(
             config.chunk_samples,
@@ -610,6 +622,7 @@ impl RvcPipeline {
                     &mut embedder_probe,
                     input_samples_16k,
                     extra_convert_samples,
+                    rvc_sample_rate,
                 )?;
                 drop(embedder_probe);
                 let feature_len = warmup.rvc_feature_len;
@@ -736,7 +749,8 @@ impl RvcPipeline {
                 Some(frames) => frames?,
                 None => bail!("native TensorRT embedder is missing its engine"),
             };
-            let feature_len = derive_rvc_feature_len(contentvec_frames, extra_convert_samples)?;
+            let feature_len =
+                derive_rvc_feature_len(contentvec_frames, extra_convert_samples, rvc_sample_rate)?;
             let rvc_profile = TensorRtSessionProfile::rvc(
                 feature_len,
                 expected_feat_channels_usize,
@@ -817,6 +831,7 @@ impl RvcPipeline {
                     &mut embedder,
                     input_samples_16k,
                     extra_convert_samples,
+                    rvc_sample_rate,
                 )?;
                 let feature_len = warmup.rvc_feature_len;
                 shared_waveform = if tensor_rt_run_mode.device_io() {
@@ -915,6 +930,7 @@ impl RvcPipeline {
             noise_gate_sample_rate: config.sample_rate as f32,
             output_extra_ms: config.output_extra_ms,
             volume_excluded_ms: config.volume_excluded_ms,
+            rvc_sample_rate,
             extra_convert_samples,
             rmvpe_input_samples_16k,
             output_gain: config.output_gain,
@@ -923,7 +939,7 @@ impl RvcPipeline {
             auto_output_gain: config.output_dynamics.auto_output_gain,
             target_output_rms: config.output_dynamics.target_output_rms,
             max_output_gain: config.output_dynamics.max_output_gain,
-            stream_state: RvcStreamState::new(),
+            stream_state: RvcStreamState::new(rvc_sample_rate),
             input_scratch: Vec::new(),
             feature_tensor: FeatureTensor::default(),
             input_reference_scratch: Vec::new(),
@@ -1027,7 +1043,7 @@ impl RvcPipeline {
         // not emit audio captured before the pause.
         #[cfg(feature = "gtcrn")]
         let gtcrn = self.stream_state.gtcrn.take();
-        self.stream_state = RvcStreamState::new();
+        self.stream_state = RvcStreamState::new(self.rvc_sample_rate);
         #[cfg(feature = "gtcrn")]
         if let Some(mut gtcrn) = gtcrn {
             gtcrn.reset()?;
@@ -1086,8 +1102,8 @@ impl VoiceModel for RvcPipeline {
         } else {
             audio
         };
-        let output_extra_len = ms_to_samples(RVC_SAMPLE_RATE, self.output_extra_ms);
-        let volume_excluded_len = ms_to_samples(RVC_SAMPLE_RATE, self.volume_excluded_ms);
+        let output_extra_len = ms_to_samples(self.rvc_sample_rate, self.output_extra_ms);
+        let volume_excluded_len = ms_to_samples(self.rvc_sample_rate, self.volume_excluded_ms);
         let stream_input = self.stream_state.generate_input(
             input_audio,
             sample_rate,
@@ -1143,7 +1159,8 @@ impl VoiceModel for RvcPipeline {
             .checked_mul(2)
             .context("repeated embedder frame length overflowed")?;
 
-        let silence_front_frames = onnx_silence_front_feature_frames(self.extra_convert_samples);
+        let silence_front_frames =
+            onnx_silence_front_feature_frames(self.extra_convert_samples, self.rvc_sample_rate);
         if silence_front_frames > 0 && silence_front_frames < feature_len_before_trim {
             if silence_front_frames.is_multiple_of(2) {
                 // `silence_front_frames` is on RVC's repeated 10 ms grid. Drop
@@ -1234,7 +1251,7 @@ impl VoiceModel for RvcPipeline {
             out_audio.resize(stream_input.out_size, 0.0);
             out_pitchf.clear();
             return Ok(ModelOutput {
-                sample_rate: RVC_SAMPLE_RATE,
+                sample_rate: self.rvc_sample_rate,
                 inference_time: total_start.elapsed(),
                 embedder_time: Duration::ZERO,
                 pitch_time: Duration::ZERO,
@@ -1270,7 +1287,7 @@ impl VoiceModel for RvcPipeline {
         let rvc_time = rvc_start.elapsed();
         let raw_output_samples = out_audio.len();
         keep_tail_in_place(out_audio, stream_input.out_size);
-        pitchf_tail_for_output_into(pitchf, out_audio.len(), RVC_SAMPLE_RATE, out_pitchf);
+        pitchf_tail_for_output_into(pitchf, out_audio.len(), self.rvc_sample_rate, out_pitchf);
         let output_envelope = if self.volume_envelope {
             stream_input.volume.sqrt().clamp(0.0, 1.0)
         } else {
@@ -1294,14 +1311,14 @@ impl VoiceModel for RvcPipeline {
             // model's input for every denoiser mode.
             let input_reference = self.stream_state.output_reference_audio(
                 super::shape::EMBEDDER_SAMPLE_RATE,
-                RVC_SAMPLE_RATE,
+                self.rvc_sample_rate,
                 out_audio.len(),
                 &mut self.input_reference_scratch,
             )?;
             dsp::apply_rms_mix_with_scratch(
                 input_reference,
                 out_audio,
-                RVC_SAMPLE_RATE as usize,
+                self.rvc_sample_rate as usize,
                 self.rms_mix_rate,
                 &mut self.rms_mix_scratch,
             );
@@ -1322,7 +1339,7 @@ impl VoiceModel for RvcPipeline {
         };
 
         Ok(ModelOutput {
-            sample_rate: RVC_SAMPLE_RATE,
+            sample_rate: self.rvc_sample_rate,
             inference_time: total_start.elapsed(),
             embedder_time,
             pitch_time,

@@ -243,12 +243,38 @@ impl ModelIo {
 
     pub(super) fn validate_rvc_metadata(&self) -> Result<()> {
         if let Some(metadata) = self.metadata_value("metadata") {
-            if !metadata.contains(r#""f0": 1"#) {
-                bail!("RVC model metadata does not indicate f0=1: {metadata}");
+            // Exporters format the `f0` flag differently: vcclient emits the
+            // spaced integer `"f0": 1` (Python `json.dumps`), while compact
+            // exporters (RVC_CONVERTER / rvc-onnx-web) emit `"f0":true`. Strip
+            // whitespace and accept either truthy form so all of them load;
+            // f0=0 / f0=false (non-pitch models) still fail this guard. The
+            // leading quote in the needle keeps `"dynamicShapes":true` etc. from
+            // matching.
+            let compact: String = metadata.chars().filter(|c| !c.is_whitespace()).collect();
+            if !compact.contains(r#""f0":1"#) && !compact.contains(r#""f0":true"#) {
+                bail!("RVC model metadata does not indicate f0=1 or f0=true: {metadata}");
             }
             info!("RVC metadata: {metadata}");
         }
         Ok(())
+    }
+
+    /// The model's native audio sample rate from the metadata `samplingRate`
+    /// field, when present and parseable. RVC exporters (RVC_CONVERTER /
+    /// rvc-onnx-web / RVC WebUI) record it as a JSON number; vcclient's
+    /// `{"f0": 1}` blob omits it. `None` means "unknown", and the pipeline falls
+    /// back to the [`RVC_SAMPLE_RATE`](super::shape::RVC_SAMPLE_RATE) default.
+    /// Dependency-free string parse, matching `validate_rvc_metadata`.
+    pub(super) fn rvc_sample_rate(&self) -> Option<u32> {
+        let metadata = self.metadata_value("metadata")?;
+        let compact: String = metadata.chars().filter(|c| !c.is_whitespace()).collect();
+        const KEY: &str = r#""samplingRate":"#;
+        let start = compact.find(KEY)? + KEY.len();
+        let digits: String = compact[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse::<u32>().ok().filter(|rate| *rate > 0)
     }
 
     /// Pick the embedder output matching `expected_channels`, honouring an
@@ -690,6 +716,64 @@ mod tests {
                 .collect(),
             metadata: Vec::new(),
         }
+    }
+
+    fn io_with_metadata(json: &str) -> ModelIo {
+        let mut io = rvc_io(&["feats", "p_len", "pitch", "pitchf", "sid"], &["audio"]);
+        io.metadata = vec![("metadata".to_string(), json.to_string())];
+        io
+    }
+
+    #[test]
+    fn accepts_spaced_integer_and_compact_boolean_f0() {
+        // vcclient spaced integer, plus the compact/spaced boolean forms emitted
+        // by RVC_CONVERTER / rvc-onnx-web.
+        for json in [
+            r#"{"f0": 1}"#,
+            r#"{"f0":1}"#,
+            r#"{"f0":true,"samplingRate":32000}"#,
+            r#"{"f0": true}"#,
+        ] {
+            assert!(
+                io_with_metadata(json).validate_rvc_metadata().is_ok(),
+                "should accept {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_pitch_f0_metadata() {
+        for json in [r#"{"f0":0}"#, r#"{"f0": 0}"#, r#"{"f0":false}"#] {
+            assert!(
+                io_with_metadata(json).validate_rvc_metadata().is_err(),
+                "should reject {json}"
+            );
+        }
+        // Absent metadata is permitted (the guard only runs when present).
+        assert!(
+            rvc_io(&["feats", "p_len", "pitch", "pitchf", "sid"], &["audio"])
+                .validate_rvc_metadata()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn parses_sampling_rate_from_metadata() {
+        assert_eq!(
+            io_with_metadata(r#"{"f0":true,"samplingRate":32000}"#).rvc_sample_rate(),
+            Some(32_000)
+        );
+        // Spaced JSON is normalized before the lookup.
+        assert_eq!(
+            io_with_metadata(r#"{"samplingRate": 40000, "f0": 1}"#).rvc_sample_rate(),
+            Some(40_000)
+        );
+        // No samplingRate field, or no metadata blob -> unknown (pipeline default).
+        assert_eq!(io_with_metadata(r#"{"f0": 1}"#).rvc_sample_rate(), None);
+        assert_eq!(
+            rvc_io(&["feats", "p_len", "pitch", "pitchf", "sid"], &["audio"]).rvc_sample_rate(),
+            None
+        );
     }
 
     #[test]

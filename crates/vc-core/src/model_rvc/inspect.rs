@@ -130,6 +130,11 @@ pub(super) struct RvcModelInfo {
     /// to every binding site so vcclient, RVC WebUI, and third-party converter
     /// exports all load.
     pub(super) io_names: RvcIoNames,
+    /// The model's native audio sample rate from metadata `samplingRate`, when
+    /// recorded. `None` means unknown; the pipeline falls back to the default
+    /// `RVC_SAMPLE_RATE`. Threaded so the convert/output windows are sized at the
+    /// model's real rate (e.g. 32 kHz) instead of the hardcoded 48 kHz.
+    pub(super) rvc_sample_rate: Option<u32>,
 }
 
 pub(super) fn inspect_contentvec_input_name(
@@ -154,13 +159,14 @@ pub(super) fn inspect_rvc_model(path: &Path) -> Result<RvcModelInfo> {
     let io_names = io.resolve_rvc_io_names()?;
     let expected_feat_channels = io.feat_channels(&io_names.feats)?;
     io.validate_rvc_metadata()?;
+    let rvc_sample_rate = io.rvc_sample_rate();
     let rnd_desc = io_names
         .rnd
         .as_ref()
         .map(|rnd| format!("{}[1,{},frames]", rnd.name, rnd.channels))
         .unwrap_or_else(|| "none".to_string());
     info!(
-        "inspected RVC model: {} inputs=[{},{},{},{},{}] rnd={} output={} feat_channels={}",
+        "inspected RVC model: {} inputs=[{},{},{},{},{}] rnd={} output={} feat_channels={} sample_rate={}",
         path.display(),
         io_names.feats,
         io_names.p_len,
@@ -169,10 +175,14 @@ pub(super) fn inspect_rvc_model(path: &Path) -> Result<RvcModelInfo> {
         io_names.sid,
         rnd_desc,
         io_names.audio,
-        expected_feat_channels
+        expected_feat_channels,
+        rvc_sample_rate
+            .map(|rate| rate.to_string())
+            .unwrap_or_else(|| "default".to_string())
     );
     Ok(RvcModelInfo {
         expected_feat_channels,
         io_names,
+        rvc_sample_rate,
     })
 }
