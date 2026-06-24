@@ -16,6 +16,9 @@ use tracing::{info, warn};
 
 const COINIT_MULTITHREADED: u32 = 0;
 const RPC_E_CHANGED_MODE: i32 = 0x80010106u32 as i32;
+const ERROR_SUCCESS: i32 = 0;
+const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
 const WINDOWS_APP_SDK_2_1: u32 = 0x0002_0001;
 const WINDOWS_ML_BOOTSTRAP_ENV: &str = "VC_RS_WINDOWSML_BOOTSTRAP_DLL";
 
@@ -59,6 +62,10 @@ struct WinMLEpInfoRaw {
 extern "system" {
     fn LoadLibraryW(name: *const u16) -> Hmodule;
     fn GetProcAddress(module: Hmodule, name: *const c_char) -> Farproc;
+    fn GetCurrentPackageFullName(
+        package_full_name_length: *mut u32,
+        package_full_name: *mut u16,
+    ) -> i32;
 }
 
 #[link(name = "ole32")]
@@ -317,16 +324,34 @@ fn initialize() -> Result<BootstrapState, String> {
 
 fn initialize_inner() -> Result<BootstrapState> {
     let com = ComInit::new()?;
-    let bootstrap_path = std::env::var(WINDOWS_ML_BOOTSTRAP_ENV)
-        .unwrap_or_else(|_| "Microsoft.WindowsAppRuntime.Bootstrap.dll".to_string());
+    let (bootstrap_path, bootstrap_path_from_env) = std::env::var(WINDOWS_ML_BOOTSTRAP_ENV)
+        .map(|path| (path, true))
+        .unwrap_or_else(|_| {
+            (
+                "Microsoft.WindowsAppRuntime.Bootstrap.dll".to_string(),
+                false,
+            )
+        });
     let wide_path = wide(&bootstrap_path);
     let module = unsafe { LoadLibraryW(wide_path.as_ptr()) };
     let module = if module.is_null() {
+        let load_error = std::io::Error::last_os_error();
+        if bootstrap_path_from_env {
+            bail!(
+                "failed to load Windows App SDK bootstrapper from {bootstrap_path} (set by {WINDOWS_ML_BOOTSTRAP_ENV}): {load_error}"
+            );
+        }
+        if !has_package_identity()? {
+            bail!(
+                "failed to load Windows App SDK bootstrapper {bootstrap_path}: {load_error}. Standalone ZIP/VST3 Windows ML builds must ship Microsoft.WindowsAppRuntime.Bootstrap.dll beside the executable or plugin DLL; run the repository packaging script or set {WINDOWS_ML_BOOTSTRAP_ENV} to the bootstrapper DLL path"
+            );
+        }
         // Store/MSIX packages declare Microsoft.WindowsAppRuntime.2 as a
         // framework dependency, so the runtime DLLs are already in the package
         // graph and the unpackaged-app bootstrapper is intentionally absent.
-        // Standalone ZIP/VST3 builds still bundle the bootstrapper and take the
-        // branch below to add the runtime package graph dynamically.
+        // Only take this path after checking package identity; otherwise a
+        // broken ZIP/VST3 package would fall through into ORT initialization and
+        // look like a hang instead of a missing-file error.
         warn!(
             "Windows App SDK bootstrapper {bootstrap_path} was not found; trying packaged Windows App Runtime dependency"
         );
@@ -355,6 +380,18 @@ fn initialize_inner() -> Result<BootstrapState> {
 
     drop(com);
     Ok(BootstrapState { _module: module })
+}
+
+fn has_package_identity() -> Result<bool> {
+    let mut len = 0u32;
+    let rc = unsafe { GetCurrentPackageFullName(&mut len, ptr::null_mut()) };
+    match rc {
+        ERROR_SUCCESS | ERROR_INSUFFICIENT_BUFFER => Ok(true),
+        APPMODEL_ERROR_NO_PACKAGE => Ok(false),
+        other => bail!(
+            "failed to detect Windows package identity: GetCurrentPackageFullName returned 0x{other:08X}"
+        ),
+    }
 }
 
 fn register_best_catalog_ep_inner() -> Result<Option<CatalogExecutionProvider>> {
