@@ -127,7 +127,7 @@ fn describe_tensor(tensor: &super::onnx_meta::TensorInfo) -> String {
 pub(super) struct RvcModelInfo {
     pub(super) expected_feat_channels: i64,
     /// Generator I/O names resolved to this model's export convention; threaded
-    /// to every binding site so RVC-WebUI and Applio exports both load.
+    /// to every binding site so vcclient, RVC WebUI, and Applio exports all load.
     pub(super) io_names: RvcIoNames,
 }
 

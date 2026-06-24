@@ -655,9 +655,9 @@ extern "C" int vc_rs_trt_rvc_infer(
         msg.append("TensorRT RVC infer received a partial rnd input (name/data mismatch)\n");
         return 2;
     }
-    // Bind by the model's resolved tensor names: RVC-WebUI and Applio exports
-    // disagree (feats/p_len/pitchf vs phone/phone_lengths/nsff0), so the caller
-    // passes whichever names this engine actually exposes.
+    // Bind by the model's resolved tensor names: exporters disagree (vcclient
+    // feats/p_len/pitchf vs RVC WebUI / Applio phone/phone_lengths/nsff0), so the
+    // caller passes whichever names this engine actually exposes.
     int64_t p_len = static_cast<int64_t>(pitch_len);
     if (!copy_to_device(*native, feats_name, feats, feats_len * sizeof(float), msg)) {
         return 1;

@@ -57,11 +57,13 @@ pub(super) struct ModelIo {
 }
 
 /// The RVC generator's I/O tensor names, resolved to whatever aliases a given
-/// model actually exports. RVC ONNX exporters disagree on names: RVC-WebUI emits
-/// `feats`/`p_len`/`pitchf`, while Applio (and some older RVC export scripts)
-/// emit `phone`/`phone_lengths`/`nsff0`. The tensors carry the same semantics, so
-/// we resolve each role once at load and bind by the resolved name everywhere
-/// downstream (ORT `run`/IoBinding, TensorRT profiles, the native shim).
+/// model actually exports. RVC ONNX exporters disagree on names: vcclient emits
+/// `feats`/`p_len`/`pitch`/`pitchf`/`sid`, while RVC WebUI and Applio emit
+/// `phone`/`phone_lengths`/... — RVC WebUI uses `ds` (speaker id) and a `rnd`
+/// latent-noise input, Applio uses `nsff0` for the continuous pitch. The tensors
+/// carry the same semantics, so we resolve each role once at load and bind by the
+/// resolved name everywhere downstream (ORT `run`/IoBinding, TensorRT profiles,
+/// the native shim).
 #[derive(Debug, Clone)]
 pub(super) struct RvcIoNames {
     pub(super) feats: String,
@@ -70,8 +72,8 @@ pub(super) struct RvcIoNames {
     pub(super) pitchf: String,
     pub(super) sid: String,
     pub(super) audio: String,
-    /// Optional latent-noise input. Some RVC exporters (e.g. the "latest" RVC /
-    /// Applio variants) expose the VITS reparameterization noise `z`
+    /// Optional latent-noise input. Some RVC exporters (e.g. RVC WebUI) expose
+    /// the VITS reparameterization noise `z`
     /// (`rnd`, shape `[1, inter_channels, frames]`) as a generator input instead
     /// of sampling it inside the graph. When present, the pipeline must feed a
     /// fresh `N(0, 1)` tensor of this shape each inference; `None` means the model
@@ -87,7 +89,7 @@ pub(super) struct RvcRndInput {
     pub(super) channels: i64,
 }
 
-// Accepted aliases per role, canonical (RVC-WebUI) name first. Resolution picks
+// Accepted aliases per role, canonical (vcclient) name first. Resolution picks
 // the first alias the model actually exposes, so the canonical name keeps
 // precedence when a model happens to expose several.
 const RVC_FEATS_ALIASES: &[&str] = &["feats", "phone"];
@@ -101,7 +103,7 @@ const RVC_AUDIO_ALIASES: &[&str] = &["audio", "out", "output"];
 const RVC_RND_ALIASES: &[&str] = &["rnd", "z"];
 
 impl RvcIoNames {
-    /// The canonical RVC-WebUI names, for tests/benchmarks that synthesize a
+    /// The canonical vcclient names, for tests/benchmarks that synthesize a
     /// profile without a real model to resolve against.
     #[cfg(test)]
     pub(super) fn canonical() -> Self {

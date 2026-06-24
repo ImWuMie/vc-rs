@@ -814,8 +814,8 @@ pub(super) struct RvcModelSession {
     cpu_output_binding: Option<RvcCpuOutputBinding>,
     pub(super) expected_feat_channels: i64,
     /// Generator I/O names for this model's export convention; every ORT/TensorRT
-    /// bind site uses these instead of the canonical literals so Applio-named
-    /// models (`phone`/`nsff0`/...) bind correctly.
+    /// bind site uses these instead of the canonical vcclient literals so RVC
+    /// WebUI / Applio exports (`phone`/`nsff0`/`ds`/`rnd`/...) bind correctly.
     io_names: RvcIoNames,
     /// Latent-noise generator for ORT-backed sessions whose export takes the
     /// `rnd` input. `None` when the model samples noise internally. The native

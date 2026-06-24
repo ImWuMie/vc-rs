@@ -102,8 +102,8 @@ pub(super) struct NativeRmvpeEngine {
 // The model's RVC input tensor names as NUL-terminated C strings, resolved once
 // at load so per-chunk inference passes pointers without re-allocating CStrings.
 // The native engine binds device tensors by name, so these must be the model's
-// actual exported names (Applio: phone/phone_lengths/nsff0/...), not the
-// canonical RVC-WebUI literals the shim previously hard-coded.
+// actual exported names (RVC WebUI/Applio: phone/phone_lengths/...), not the
+// canonical vcclient literals the shim previously hard-coded.
 #[cfg(native_tensorrt)]
 struct NativeRvcInputNames {
     feats: CString,
