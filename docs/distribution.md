@@ -118,8 +118,11 @@ To prepare a release:
 1. Bump `[workspace.package].version` in the root `Cargo.toml`.
 2. Run a build (`cargo build`) so the bumped version is written back into
    `Cargo.lock`, and commit both files together.
-3. Move the [`../CHANGELOG.md`](../CHANGELOG.md) `Unreleased` entries under a new
-   `## [X.Y.Z] - <date>` heading and refresh the comparison links at the bottom.
+3. Add a finalized [`../CHANGELOG.md`](../CHANGELOG.md)
+   `## [X.Y.Z] - <date>` section for the release and refresh the version
+   comparison links at the bottom. This project does not keep an `Unreleased`
+   section; development-only notes belong in plans, issues, or commit history
+   until they are promoted into a release entry.
 
 > The tag `v<version>` and the `v<version>` embedded in each archive name must
 > match. A mismatch means the version was bumped after the binaries were built —
