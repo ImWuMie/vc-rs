@@ -5,6 +5,7 @@ mod f0_postprocess;
 mod feature;
 mod inspect;
 mod native_tensorrt;
+mod noise;
 mod onnx_meta;
 mod pipeline;
 mod pitch;

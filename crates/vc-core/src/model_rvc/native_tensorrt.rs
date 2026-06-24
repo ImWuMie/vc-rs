@@ -61,6 +61,12 @@ mod ffi {
             pitch_name: *const c_char,
             pitchf_name: *const c_char,
             sid_name: *const c_char,
+            // Optional latent-noise input. `rnd_name`/`rnd` are null and `rnd_len`
+            // is 0 for exports that sample their own noise; non-null binds the
+            // caller-supplied N(0,1) tensor under the model's `rnd` input name.
+            rnd_name: *const c_char,
+            rnd: *const f32,
+            rnd_len: usize,
             feats: *const f32,
             feats_len: usize,
             pitch: *const i64,
@@ -107,6 +113,17 @@ struct NativeRvcInputNames {
     sid: CString,
 }
 
+// Per-engine latent-noise generator for RVC exports that take the `rnd` input.
+// The engine owns it so the native path matches the ORT path: fresh N(0,1) noise
+// shaped [1, channels, frames] each chunk, reusing one scratch buffer.
+#[cfg(native_tensorrt)]
+struct NativeRvcRnd {
+    name: CString,
+    channels: NonZeroUsize,
+    generator: super::noise::GaussianNoise,
+    scratch: Vec<f32>,
+}
+
 #[cfg_attr(not(native_tensorrt), allow(dead_code))]
 pub(super) struct NativeRvcEngine {
     #[cfg(native_tensorrt)]
@@ -116,6 +133,9 @@ pub(super) struct NativeRvcEngine {
     output_len: NonZeroUsize,
     #[cfg(native_tensorrt)]
     input_names: NativeRvcInputNames,
+    // `None` when the export samples its own noise (no `rnd` input).
+    #[cfg(native_tensorrt)]
+    rnd: Option<NativeRvcRnd>,
 }
 
 // Native TensorRT handles own CUDA streams, execution contexts, and fixed device
@@ -331,6 +351,8 @@ impl NativeRvcEngine {
             output_len,
             #[cfg(native_tensorrt)]
             input_names: native_rvc_input_names(names)?,
+            #[cfg(native_tensorrt)]
+            rnd: native_rvc_rnd(names)?,
         })
     }
 
@@ -904,6 +926,34 @@ fn native_rvc_input_names(names: &RvcIoNames) -> Result<NativeRvcInputNames> {
     })
 }
 
+// Fixed seed for the native RVC latent-noise generator (mirrors the ORT path):
+// reproducible across runs, advances per chunk for independent noise.
+#[cfg(native_tensorrt)]
+const RVC_RND_SEED: u64 = 0x0000_5256_4352_4e44;
+
+#[cfg(native_tensorrt)]
+fn native_rvc_rnd(names: &RvcIoNames) -> Result<Option<NativeRvcRnd>> {
+    let Some(rnd) = names.rnd.as_ref() else {
+        return Ok(None);
+    };
+    let channels = usize::try_from(rnd.channels)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| anyhow!("RVC '{}' input has non-positive channel count", rnd.name))?;
+    let name = CString::new(rnd.name.as_str()).with_context(|| {
+        format!(
+            "RVC rnd input name '{}' contains an interior NUL byte",
+            rnd.name
+        )
+    })?;
+    Ok(Some(NativeRvcRnd {
+        name,
+        channels,
+        generator: super::noise::GaussianNoise::new(RVC_RND_SEED),
+        scratch: Vec::new(),
+    }))
+}
+
 #[cfg(native_tensorrt)]
 fn infer_rvc(
     engine: &mut NativeRvcEngine,
@@ -913,6 +963,24 @@ fn infer_rvc(
     speaker_id: i64,
 ) -> Result<Vec<f32>> {
     let mut output = vec![0.0f32; engine.output_len.get()];
+    // Refresh latent noise (when this export takes it) into the reused scratch;
+    // pass null pointers / zero length otherwise so the shim skips the input.
+    // The raw pointers derived here stay valid through the FFI call below because
+    // `engine.rnd` is not touched again until the call returns.
+    let frames = engine.frames.get();
+    let (rnd_name_ptr, rnd_ptr, rnd_len) = match engine.rnd.as_mut() {
+        Some(rnd) => {
+            let len = rnd
+                .channels
+                .get()
+                .checked_mul(frames)
+                .context("native TensorRT RVC rnd length overflow")?;
+            rnd.scratch.resize(len, 0.0);
+            rnd.generator.fill(&mut rnd.scratch);
+            (rnd.name.as_ptr(), rnd.scratch.as_ptr(), rnd.scratch.len())
+        }
+        None => (std::ptr::null(), std::ptr::null(), 0usize),
+    };
     let mut message = MessageBuffer::new();
     let status = unsafe {
         ffi::vc_rs_trt_rvc_infer(
@@ -922,6 +990,9 @@ fn infer_rvc(
             engine.input_names.pitch.as_ptr(),
             engine.input_names.pitchf.as_ptr(),
             engine.input_names.sid.as_ptr(),
+            rnd_name_ptr,
+            rnd_ptr,
+            rnd_len,
             feats.as_ptr(),
             feats.len(),
             pitch.as_ptr(),

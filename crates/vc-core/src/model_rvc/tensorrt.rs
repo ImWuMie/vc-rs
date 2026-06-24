@@ -118,23 +118,30 @@ impl TensorRtSessionProfile {
     // model's actual input names, so use the resolved aliases, not the canonical
     // `feats`/`pitch`/`pitchf` literals (Applio exports name them differently).
     pub(super) fn rvc(frames: usize, channels: usize, names: &RvcIoNames) -> Self {
-        Self::new(
-            ModelRole::Rvc,
-            vec![
-                TensorRtInputShape {
-                    name: names.feats.clone(),
-                    dims: vec![1, frames, channels],
-                },
-                TensorRtInputShape {
-                    name: names.pitch.clone(),
-                    dims: vec![1, frames],
-                },
-                TensorRtInputShape {
-                    name: names.pitchf.clone(),
-                    dims: vec![1, frames],
-                },
-            ],
-        )
+        let mut inputs = vec![
+            TensorRtInputShape {
+                name: names.feats.clone(),
+                dims: vec![1, frames, channels],
+            },
+            TensorRtInputShape {
+                name: names.pitch.clone(),
+                dims: vec![1, frames],
+            },
+            TensorRtInputShape {
+                name: names.pitchf.clone(),
+                dims: vec![1, frames],
+            },
+        ];
+        // Latent-noise input, when the export exposes it: [1, inter_channels,
+        // frames]. Including it in the fixed profile makes the native builder's
+        // optimization profile and the IoBinding shapes agree with the model.
+        if let Some(rnd) = names.rnd.as_ref() {
+            inputs.push(TensorRtInputShape {
+                name: rnd.name.clone(),
+                dims: vec![1, rnd.channels.max(0) as usize, frames],
+            });
+        }
+        Self::new(ModelRole::Rvc, inputs)
     }
 
     pub(super) fn cache_dir_from_root(&self, cache_root: &Path) -> Result<PathBuf> {
@@ -467,6 +474,9 @@ pub(super) struct RvcTensorRtPinnedBinding {
     pub(super) pitchf: Tensor<f32>,
     pub(super) p_len: Tensor<i64>,
     pub(super) sid: Tensor<i64>,
+    /// Latent-noise input buffer, when the export takes `rnd`. Re-bound per run
+    /// like `feats`, since fresh noise is copied in each chunk.
+    pub(super) rnd: Option<Tensor<f32>>,
     pub(super) output: Tensor<f32>,
     pub(super) _input_allocator: Allocator,
     pub(super) _output_allocator: Allocator,
@@ -476,6 +486,22 @@ pub(super) struct RvcTensorRtPinnedBinding {
     pub(super) bound_p_len: i64,
     pub(super) bound_sid: i64,
     pub(super) names: RvcIoNames,
+}
+
+// Fixed `rnd` tensor shape `[1, inter_channels, frame_len]` for a fixed-shape
+// RVC binding, or `None` when the export samples its own noise. Shared by the
+// pinned and CUDA-graph constructors so both agree with the profile's `rnd` dims.
+#[cfg(feature = "ort")]
+fn rvc_rnd_shape(names: &RvcIoNames, frame_len: i64) -> Result<Option<Vec<usize>>> {
+    let Some(rnd) = names.rnd.as_ref() else {
+        return Ok(None);
+    };
+    let channels = usize::try_from(rnd.channels)
+        .ok()
+        .filter(|channels| *channels > 0)
+        .ok_or_else(|| anyhow!("RVC '{}' input has non-positive channel count", rnd.name))?;
+    let frames = usize::try_from(frame_len).context("RVC rnd frame count does not fit usize")?;
+    Ok(Some(vec![1, channels, frames]))
 }
 
 #[cfg(feature = "ort")]
@@ -510,6 +536,15 @@ impl RvcTensorRtPinnedBinding {
             .context("failed to allocate TensorRT RVC input 'sid'")?;
         write_scalar_i64_tensor(&mut p_len, frame_len, "p_len")?;
         write_scalar_i64_tensor(&mut sid, speaker_id, "sid")?;
+        // Latent-noise input buffer (allocated only when the export takes it);
+        // bound per run alongside feats, since fresh noise is copied each chunk.
+        let rnd = match rvc_rnd_shape(names, frame_len)? {
+            Some(shape) => Some(
+                Tensor::<f32>::new(&input_allocator, shape)
+                    .context("failed to allocate TensorRT RVC input 'rnd'")?,
+            ),
+            None => None,
+        };
         let mut output = Tensor::<f32>::new(&output_allocator, output_shape.to_vec())
             .context("failed to allocate TensorRT RVC output 'audio'")?;
         let mut binding = session
@@ -530,6 +565,7 @@ impl RvcTensorRtPinnedBinding {
             pitchf,
             p_len,
             sid,
+            rnd,
             output,
             _input_allocator: input_allocator,
             _output_allocator: output_allocator,
@@ -878,6 +914,11 @@ pub(super) struct RvcTensorRtGraphBinding {
     pub(super) device_p_len: Tensor<i64>,
     pub(super) host_sid: Tensor<i64>,
     pub(super) device_sid: Tensor<i64>,
+    /// Latent-noise input (host staging + device buffer), when the export takes
+    /// `rnd`. The device tensor keeps a stable bound address; fresh noise is
+    /// staged into `host_rnd` and copied into `device_rnd` each chunk.
+    pub(super) host_rnd: Option<Tensor<f32>>,
+    pub(super) device_rnd: Option<Tensor<f32>>,
     pub(super) device_output: Tensor<f32>,
     pub(super) host_output: Tensor<f32>,
     pub(super) _host_input_allocator: Allocator,
@@ -962,6 +1003,29 @@ impl RvcTensorRtGraphBinding {
         binding
             .bind_input(names.sid.as_str(), &device_sid)
             .context("failed to bind TensorRT RVC CUDA input 'sid'")?;
+        // Latent noise: device buffer keeps a stable bound address for CUDA Graph
+        // replay; per-chunk noise is staged through host_rnd into device_rnd.
+        let (host_rnd, device_rnd) = match rvc_rnd_shape(names, frame_len)? {
+            Some(shape) => {
+                let rnd_name = names
+                    .rnd
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("RVC rnd shape without a resolved name"))?
+                    .name
+                    .as_str();
+                let mut host_rnd = Tensor::<f32>::new(&host_input_allocator, shape.clone())
+                    .context("failed to allocate TensorRT RVC host input 'rnd'")?;
+                zero_f32_tensor(&mut host_rnd, "rnd")?;
+                let mut device_rnd = Tensor::<f32>::new(&device_allocator, shape)
+                    .context("failed to allocate TensorRT RVC CUDA input 'rnd'")?;
+                copy_f32_tensor_to_device(&host_rnd, &mut device_rnd, "rnd")?;
+                binding
+                    .bind_input(rnd_name, &device_rnd)
+                    .context("failed to bind TensorRT RVC CUDA input 'rnd'")?;
+                (Some(host_rnd), Some(device_rnd))
+            }
+            None => (None, None),
+        };
         bind_output_tensor(&mut binding, names.audio.as_str(), &mut device_output)
             .context("failed to bind TensorRT RVC CUDA output 'audio'")?;
         Ok(Self {
@@ -976,6 +1040,8 @@ impl RvcTensorRtGraphBinding {
             device_p_len,
             host_sid,
             device_sid,
+            host_rnd,
+            device_rnd,
             device_output,
             host_output,
             _host_input_allocator: host_input_allocator,

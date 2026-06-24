@@ -617,6 +617,12 @@ extern "C" int vc_rs_trt_rvc_infer(
     char const* pitch_name,
     char const* pitchf_name,
     char const* sid_name,
+    // Optional latent-noise input: rnd_name/rnd are null and rnd_len is 0 for
+    // exports that sample their own noise; non-null binds the caller-supplied
+    // N(0,1) tensor under this engine's `rnd` input name.
+    char const* rnd_name,
+    float const* rnd,
+    std::size_t rnd_len,
     float const* feats,
     std::size_t feats_len,
     int64_t const* pitch,
@@ -642,6 +648,13 @@ extern "C" int vc_rs_trt_rvc_infer(
         msg.append("null input-name passed to TensorRT RVC infer\n");
         return 2;
     }
+    // A latent-noise input must arrive as a matched (name, data) pair: a name
+    // without data (or vice versa) means the caller and engine disagree on
+    // whether this export takes `rnd`.
+    if ((rnd_name == nullptr) != (rnd == nullptr)) {
+        msg.append("TensorRT RVC infer received a partial rnd input (name/data mismatch)\n");
+        return 2;
+    }
     // Bind by the model's resolved tensor names: RVC-WebUI and Applio exports
     // disagree (feats/p_len/pitchf vs phone/phone_lengths/nsff0), so the caller
     // passes whichever names this engine actually exposes.
@@ -659,6 +672,9 @@ extern "C" int vc_rs_trt_rvc_infer(
         return 1;
     }
     if (!copy_to_device(*native, sid_name, &speaker_id, sizeof(int64_t), msg)) {
+        return 1;
+    }
+    if (rnd != nullptr && !copy_to_device(*native, rnd_name, rnd, rnd_len * sizeof(float), msg)) {
         return 1;
     }
     return enqueue_and_copy(*native, output, output_len, msg) ? 0 : 1;

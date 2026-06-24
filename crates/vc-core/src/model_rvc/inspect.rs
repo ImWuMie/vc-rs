@@ -153,14 +153,20 @@ pub(super) fn inspect_rvc_model(path: &Path) -> Result<RvcModelInfo> {
     let io_names = io.resolve_rvc_io_names()?;
     let expected_feat_channels = io.feat_channels(&io_names.feats)?;
     io.validate_rvc_metadata()?;
+    let rnd_desc = io_names
+        .rnd
+        .as_ref()
+        .map(|rnd| format!("{}[1,{},frames]", rnd.name, rnd.channels))
+        .unwrap_or_else(|| "none".to_string());
     info!(
-        "inspected RVC model: {} inputs=[{},{},{},{},{}] output={} feat_channels={}",
+        "inspected RVC model: {} inputs=[{},{},{},{},{}] rnd={} output={} feat_channels={}",
         path.display(),
         io_names.feats,
         io_names.p_len,
         io_names.pitch,
         io_names.pitchf,
         io_names.sid,
+        rnd_desc,
         io_names.audio,
         expected_feat_channels
     );

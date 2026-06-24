@@ -70,6 +70,21 @@ pub(super) struct RvcIoNames {
     pub(super) pitchf: String,
     pub(super) sid: String,
     pub(super) audio: String,
+    /// Optional latent-noise input. Some RVC exporters (e.g. the "latest" RVC /
+    /// Applio variants) expose the VITS reparameterization noise `z`
+    /// (`rnd`, shape `[1, inter_channels, frames]`) as a generator input instead
+    /// of sampling it inside the graph. When present, the pipeline must feed a
+    /// fresh `N(0, 1)` tensor of this shape each inference; `None` means the model
+    /// samples its own noise and needs no extra input.
+    pub(super) rnd: Option<RvcRndInput>,
+}
+
+/// The resolved name and static channel count (`inter_channels`, the middle axis
+/// of `[1, channels, frames]`) of an RVC model's latent-noise input.
+#[derive(Debug, Clone)]
+pub(super) struct RvcRndInput {
+    pub(super) name: String,
+    pub(super) channels: i64,
 }
 
 // Accepted aliases per role, canonical (RVC-WebUI) name first. Resolution picks
@@ -81,6 +96,9 @@ const RVC_PITCH_ALIASES: &[&str] = &["pitch"];
 const RVC_PITCHF_ALIASES: &[&str] = &["pitchf", "nsff0"];
 const RVC_SID_ALIASES: &[&str] = &["sid", "ds"];
 const RVC_AUDIO_ALIASES: &[&str] = &["audio", "out", "output"];
+// Latent-noise input is optional, so it has no canonical fallback: a model
+// either exports it under one of these names or samples noise internally.
+const RVC_RND_ALIASES: &[&str] = &["rnd", "z"];
 
 impl RvcIoNames {
     /// The canonical RVC-WebUI names, for tests/benchmarks that synthesize a
@@ -94,6 +112,7 @@ impl RvcIoNames {
             pitchf: "pitchf".to_string(),
             sid: "sid".to_string(),
             audio: "audio".to_string(),
+            rnd: None,
         }
     }
 }
@@ -152,7 +171,36 @@ impl ModelIo {
             pitchf: self.resolve_input_alias("pitchf", RVC_PITCHF_ALIASES)?,
             sid: self.resolve_input_alias("sid", RVC_SID_ALIASES)?,
             audio: self.resolve_rvc_output()?,
+            rnd: self.resolve_rvc_rnd()?,
         })
+    }
+
+    /// Detect the optional latent-noise input. Returns `None` when the model
+    /// samples its own noise (no `rnd`/`z` input). When present, the channel
+    /// count (middle axis of `[1, channels, frames]`) must be statically known so
+    /// the pipeline can size the `N(0, 1)` tensor it feeds each chunk.
+    fn resolve_rvc_rnd(&self) -> Result<Option<RvcRndInput>> {
+        for alias in RVC_RND_ALIASES {
+            if let Some(input) = self.input(alias) {
+                let channels = input
+                    .dims
+                    .get(1)
+                    .copied()
+                    .filter(|dim| *dim > 0)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "RVC '{alias}' latent-noise input must expose a static channel count \
+                             as its middle axis [1, channels, frames]; got {}",
+                            input.describe()
+                        )
+                    })?;
+                return Ok(Some(RvcRndInput {
+                    name: (*alias).to_string(),
+                    channels,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     fn resolve_input_alias(&self, role: &str, aliases: &[&str]) -> Result<String> {
@@ -672,6 +720,45 @@ mod tests {
     fn resolves_single_bespoke_output_name() {
         let io = rvc_io(&["phone", "phone_lengths", "pitch", "nsff0", "sid"], &["o"]);
         assert_eq!(io.resolve_rvc_io_names().unwrap().audio, "o");
+    }
+
+    #[test]
+    fn resolves_no_rnd_input_when_absent() {
+        let io = rvc_io(&["feats", "p_len", "pitch", "pitchf", "sid"], &["audio"]);
+        assert!(io.resolve_rvc_io_names().unwrap().rnd.is_none());
+    }
+
+    #[test]
+    fn resolves_rnd_latent_noise_input() {
+        // "latest" RVC export: phone/phone_lengths/pitch/pitchf/ds plus an `rnd`
+        // latent-noise input shaped [1, inter_channels, frames].
+        let mut io = rvc_io(
+            &["phone", "phone_lengths", "pitch", "pitchf", "ds"],
+            &["audio"],
+        );
+        io.inputs.push(TensorInfo {
+            name: "rnd".to_string(),
+            elem_type: 1,
+            dims: vec![1, 192, 0],
+        });
+        let names = io.resolve_rvc_io_names().unwrap();
+        assert_eq!(names.sid, "ds");
+        let rnd = names.rnd.expect("rnd should resolve");
+        assert_eq!(rnd.name, "rnd");
+        assert_eq!(rnd.channels, 192);
+    }
+
+    #[test]
+    fn rnd_without_static_channels_errors() {
+        let mut io = rvc_io(&["feats", "p_len", "pitch", "pitchf", "sid"], &["audio"]);
+        io.inputs.push(TensorInfo {
+            name: "rnd".to_string(),
+            elem_type: 1,
+            dims: vec![1, 0, 0],
+        });
+        let err = io.resolve_rvc_io_names().unwrap_err().to_string();
+        assert!(err.contains("rnd"), "{err}");
+        assert!(err.contains("static channel count"), "{err}");
     }
 
     #[test]
