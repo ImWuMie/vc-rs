@@ -58,9 +58,10 @@ pub(super) struct ModelIo {
 
 /// The RVC generator's I/O tensor names, resolved to whatever aliases a given
 /// model actually exports. RVC ONNX exporters disagree on names: vcclient emits
-/// `feats`/`p_len`/`pitch`/`pitchf`/`sid`, while RVC WebUI and Applio emit
-/// `phone`/`phone_lengths`/... — RVC WebUI uses `ds` (speaker id) and a `rnd`
-/// latent-noise input, Applio uses `nsff0` for the continuous pitch. The tensors
+/// `feats`/`p_len`/`pitch`/`pitchf`/`sid`, RVC WebUI's own ONNX export emits
+/// `phone`/`phone_lengths`/`pitch`/`pitchf`/`ds`/`rnd` (it adds the `rnd`
+/// latent-noise input), and third-party `.pth`->`.onnx` converters such as
+/// rvc-onnx-web emit `phone`/`phone_lengths`/`pitch`/`nsff0`/`sid`. The tensors
 /// carry the same semantics, so we resolve each role once at load and bind by the
 /// resolved name everywhere downstream (ORT `run`/IoBinding, TensorRT profiles,
 /// the native shim).
@@ -703,8 +704,9 @@ mod tests {
     }
 
     #[test]
-    fn resolves_applio_input_name_aliases() {
-        // Applio export: phone/phone_lengths/nsff0 instead of feats/p_len/pitchf.
+    fn resolves_converter_input_name_aliases() {
+        // rvc-onnx-web converter export: phone/phone_lengths/nsff0 instead of the
+        // vcclient feats/p_len/pitchf names.
         let io = rvc_io(
             &["phone", "phone_lengths", "pitch", "nsff0", "sid"],
             &["audio"],

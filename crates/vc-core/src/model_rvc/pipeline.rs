@@ -416,9 +416,9 @@ impl RvcPipeline {
                 role: LoadModelRole::Rvc,
             },
         );
-        // Resolve the generator's I/O names (vcclient vs RVC WebUI / Applio export
-        // aliases) before loading, so the ORT bind sites use the names this model
-        // exports.
+        // Resolve the generator's I/O names (vcclient vs RVC WebUI / converter
+        // export aliases) before loading, so the ORT bind sites use the names this
+        // model exports.
         let rvc_info = inspect_rvc_model(config.model)?;
         let rvc = RvcModelSession::load(
             config.model,

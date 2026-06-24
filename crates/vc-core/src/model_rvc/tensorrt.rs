@@ -116,8 +116,8 @@ impl TensorRtSessionProfile {
 
     // Profile/cache and the native builder key the optimization profile by the
     // model's actual input names, so use the resolved aliases, not the canonical
-    // vcclient `feats`/`pitch`/`pitchf` literals (RVC WebUI and Applio exports
-    // name them differently).
+    // vcclient `feats`/`pitch`/`pitchf` literals (RVC WebUI and third-party
+    // converter exports name them differently).
     pub(super) fn rvc(frames: usize, channels: usize, names: &RvcIoNames) -> Self {
         let mut inputs = vec![
             TensorRtInputShape {

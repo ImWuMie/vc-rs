@@ -2,15 +2,42 @@
 
 All notable changes to this project are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+with versioned release entries only, and this project adheres to
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Version numbers come from `[workspace.package].version` in the root
 [`Cargo.toml`](Cargo.toml); the packaging scripts read the same field to name the
 release archives. See [`docs/distribution.md`](docs/distribution.md) for the full
 versioning and publishing procedure.
 
-## [Unreleased]
+## [0.4.0] - 2026-06-24
+
+### Added
+
+- Standalone GTCRN input denoising across the shared runtime, CLI, GUI,
+  Windows ML packages, and native TensorRT path.
+- Optional ASIO support for standalone CLI and GUI builds, with per-direction
+  audio host selection and RT-priority CPAL handling.
+- Microsoft Store GUI-only MSIX packaging via the Windows App Development CLI.
+- Offline chunk-join sweep tooling, model-free pipeline benchmarks, and
+  validation shared across frontends.
+
+### Changed
+
+- Reworked the standalone audio host layer to support separate input and output
+  backends.
+- Optimized mono channel mixing, RMS mix-gain processing, output level
+  postprocessing, and shared waveform handling.
+- Expanded distribution packaging and release checks for GTCRN, Store MSIX, and
+  version-specific GitHub release notes.
+
+### Fixed
+
+- Supported Applio-style RVC exports and models with the optional `rnd`
+  latent-noise input.
+- Fixed TensorRT-only RVC profile builds.
+- Validated conversion settings consistently across frontends.
 
 ## [0.3.0] - 2026-06-15
 
@@ -115,7 +142,7 @@ Initial release.
 - One-shot distribution packaging scripts for all four Windows x64 variants.
 - Auto-generated bundled third-party license notices during packaging.
 
-[Unreleased]: https://github.com/shirohata/vc-rs/compare/v0.3.0...HEAD
+[0.4.0]: https://github.com/shirohata/vc-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/shirohata/vc-rs/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/shirohata/vc-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/shirohata/vc-rs/compare/v0.1.0...v0.2.0
