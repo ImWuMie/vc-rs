@@ -468,58 +468,56 @@ fn derives_vcclient_onnx_silence_front_feature_offset() {
 fn extra_convert_samples_scale_with_model_sample_rate() {
     // The same convert-context duration is fewer samples at a lower model rate.
     assert_eq!(extra_convert_samples_from_ms(100, 48_000), 4_800);
+    assert_eq!(extra_convert_samples_from_ms(100, 40_000), 4_000);
     assert_eq!(extra_convert_samples_from_ms(100, 32_000), 3_200);
 }
 
 #[test]
 fn out_size_tracks_model_sample_rate() {
-    // Identical device-rate input through a 48 kHz vs a 32 kHz model: the
-    // ContentVec/F0 window lives in the 16 kHz domain (independent of the model's
-    // output rate), so `convert_size` matches; `out_size` is in the model's
-    // output-rate domain, so the 32 kHz window is 32/48 of the 48 kHz one.
+    // Run the same device-rate input through models of different native rates.
+    // The fix is rate-generic (reads `samplingRate`), not special-cased per rate,
+    // so 32 kHz and 40 kHz are both handled like 48 kHz.
     let chunk = vec![0.1f32; 4_800]; // 100 ms at the 48 kHz device rate
     let device_rate = 48_000;
 
-    let mut s48 = RvcStreamState::new(48_000);
-    let in48 = s48
-        .generate_input(
-            &chunk,
-            device_rate,
-            0,
-            0,
-            extra_convert_samples_from_ms(100, 48_000),
-        )
-        .unwrap();
+    let run = |rvc_rate: u32| {
+        RvcStreamState::new(rvc_rate)
+            .generate_input(
+                &chunk,
+                device_rate,
+                0,
+                0,
+                extra_convert_samples_from_ms(100, rvc_rate),
+            )
+            .unwrap()
+    };
 
-    let mut s32 = RvcStreamState::new(32_000);
-    let in32 = s32
-        .generate_input(
-            &chunk,
-            device_rate,
-            0,
-            0,
-            extra_convert_samples_from_ms(100, 32_000),
-        )
-        .unwrap();
-
-    assert_eq!(
-        in48.convert_size, in32.convert_size,
-        "device-rate convert window is independent of the model output rate"
-    );
-    assert!(
-        in32.out_size < in48.out_size,
-        "32 kHz output window must be shorter: 32k={} 48k={}",
-        in32.out_size,
-        in48.out_size
-    );
-    let expected = in48.out_size * 32_000 / 48_000;
-    assert!(
-        (in32.out_size as i64 - expected as i64).abs() <= 1,
-        "32k out_size {} not ~32/48 of 48k out_size {} (expected {})",
-        in32.out_size,
-        in48.out_size,
-        expected
-    );
+    let base = run(48_000);
+    for rvc_rate in [32_000u32, 40_000] {
+        let out = run(rvc_rate);
+        // The ContentVec/F0 window lives in the 16 kHz domain (independent of the
+        // model output rate), so `convert_size` matches the 48 kHz baseline.
+        assert_eq!(
+            base.convert_size, out.convert_size,
+            "device-rate convert window must not depend on model rate ({rvc_rate} Hz)"
+        );
+        // `out_size` is in the model's output-rate domain, so it scales by
+        // rvc_rate/48000 relative to the 48 kHz baseline.
+        assert!(
+            out.out_size < base.out_size,
+            "{rvc_rate} Hz output window must be shorter than 48 kHz: {} vs {}",
+            out.out_size,
+            base.out_size
+        );
+        let expected = base.out_size * rvc_rate as usize / 48_000;
+        assert!(
+            (out.out_size as i64 - expected as i64).abs() <= 1,
+            "{rvc_rate} Hz out_size {} not ~{rvc_rate}/48000 of 48 kHz {} (expected {})",
+            out.out_size,
+            base.out_size,
+            expected
+        );
+    }
 }
 #[test]
 fn gpu_priority_defaults_to_high() {
