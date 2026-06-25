@@ -7,7 +7,6 @@
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -93,20 +92,6 @@ static CATALOG_QNN_EP: OnceLock<()> = OnceLock::new();
 static CATALOG_OPENVINO_EP: OnceLock<()> = OnceLock::new();
 static CATALOG_MIGRAPHX_EP: OnceLock<()> = OnceLock::new();
 static CATALOG_VITISAI_EP: OnceLock<()> = OnceLock::new();
-
-// Process-wide policy: may a model load download a missing Windows ML catalog EP
-// on demand? Default off so the VST3 plugin keeps its report-only behavior
-// (a multi-minute blocking download triggered from a DAW is undesirable). The
-// standalone front-ends (GUI/CLI via vc-app) opt in with `set_ep_download_allowed`.
-static EP_DOWNLOAD_ALLOWED: AtomicBool = AtomicBool::new(false);
-
-/// Allow (or forbid) on-demand download of a missing Windows ML catalog EP
-/// during model load for an explicit `windowsml-*` provider. Set once at
-/// front-end startup; the explicit CLI `windows-ml-eps install` command downloads
-/// regardless of this flag.
-pub fn set_ep_download_allowed(allowed: bool) {
-    EP_DOWNLOAD_ALLOWED.store(allowed, Ordering::Relaxed);
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CatalogExecutionProvider {
@@ -199,12 +184,14 @@ pub(crate) fn try_register_best_catalog_ep() -> Result<Option<CatalogExecutionPr
     if let Some(ep) = BEST_CATALOG_EP.get() {
         return Ok(Some(*ep));
     }
-    // Auto never downloads: it registers a catalog EP only if the platform
-    // already has one ready, otherwise it falls back to DirectML/CPU. Explicit
-    // windowsml-* providers (try_register_catalog_ep) own the download path.
+    // Some catalog providers report NotReady after every process start until
+    // EnsureReady is called. Keep auto windowsml behavior consistent across CLI,
+    // GUI, and VST3: try to prepare listed providers, but still fall back when
+    // the catalog reports NotPresent or an unknown state.
     let selected = register_best_catalog_ep_inner()?;
     if let Some(ep) = selected {
         let _ = BEST_CATALOG_EP.set(ep);
+        mark_catalog_ep_registered(ep);
     }
     Ok(selected)
 }
@@ -218,7 +205,7 @@ pub(crate) fn try_register_catalog_ep(provider: CatalogExecutionProvider) -> Res
     // is not yet Ready. Only a successful registration is cached.
     let registered = register_catalog_ep_inner(provider)?;
     if registered {
-        let _ = catalog_ep_cache(provider).set(());
+        mark_catalog_ep_registered(provider);
     }
     Ok(registered)
 }
@@ -244,14 +231,48 @@ pub fn list_catalog_providers() -> Result<Vec<CatalogProviderInfo>> {
 pub fn select_best_catalog_provider(
     providers: &[CatalogProviderInfo],
 ) -> Option<CatalogExecutionProvider> {
-    CATALOG_PRIORITY
-        .iter()
-        .find(|candidate| {
-            providers
-                .iter()
-                .any(|provider| provider.name == candidate.catalog_name)
-        })
-        .map(|candidate| candidate.provider)
+    select_best_catalog_provider_info(providers).and_then(|provider| provider.vc_provider)
+}
+
+pub fn select_best_catalog_provider_info(
+    providers: &[CatalogProviderInfo],
+) -> Option<&CatalogProviderInfo> {
+    select_catalog_provider_info_by_candidates(providers, CATALOG_PRIORITY.iter())
+}
+
+pub fn select_catalog_provider_info(
+    providers: &[CatalogProviderInfo],
+    catalog_provider: CatalogExecutionProvider,
+) -> Option<&CatalogProviderInfo> {
+    select_catalog_provider_info_by_candidates(
+        providers,
+        CATALOG_PRIORITY
+            .iter()
+            .filter(move |candidate| candidate.provider == catalog_provider),
+    )
+}
+
+fn select_catalog_provider_info_by_candidates<'a>(
+    providers: &'a [CatalogProviderInfo],
+    candidates: impl Iterator<Item = &'static CatalogCandidate>,
+) -> Option<&'a CatalogProviderInfo> {
+    let mut fallback = None;
+    for candidate in candidates {
+        for provider in providers
+            .iter()
+            .filter(|provider| provider.name == candidate.catalog_name)
+        {
+            if fallback.is_none() {
+                fallback = Some(provider);
+            }
+            if provider.ready_state == CatalogReadyState::Ready
+                || provider.ready_state == CatalogReadyState::NotReady
+            {
+                return Some(provider);
+            }
+        }
+    }
+    fallback
 }
 
 pub fn ensure_catalog_provider_ready(
@@ -274,12 +295,11 @@ pub fn ensure_catalog_provider_ready(
     })
 }
 
-/// Read a catalog EP's ready state without downloading or registering anything.
+/// Read a catalog EP's ready state without preparing or registering anything.
 ///
 /// Front-ends call this to decide whether a model load will block on a
-/// (possibly multi-minute) EP download, so they can surface a "downloading"
-/// status before the blocking registration. Returns `NotPresent` when the EP is
-/// not listed for this device.
+/// preparation step, so they can surface a status before the blocking
+/// registration. Returns `NotPresent` when the EP is not listed for this device.
 pub fn catalog_provider_ready_state(
     provider: CatalogExecutionProvider,
 ) -> Result<CatalogReadyState> {
@@ -299,11 +319,14 @@ pub fn catalog_provider_ready_state(
     )
 }
 
-/// Best-effort: true if loading `provider` will trigger a Windows ML catalog EP
-/// download/preparation because its EP is listed but not yet `Ready`. Returns
-/// false for providers without a catalog EP, or when the state cannot be read
-/// (the load path will surface the real error).
-pub fn provider_download_pending(provider: crate::Provider) -> bool {
+pub fn catalog_provider_requires_prepare(provider: CatalogExecutionProvider) -> Result<bool> {
+    Ok(catalog_provider_ready_state(provider)? == CatalogReadyState::NotReady)
+}
+
+/// Best-effort: true if loading `provider` will call `EnsureReady` for a listed
+/// but not-yet-ready Windows ML catalog EP. `NotPresent` is intentionally false:
+/// ordinary model load should not install absent catalog packages.
+pub fn provider_prepare_pending(provider: crate::Provider) -> bool {
     let ep = match provider {
         crate::Provider::WindowsMlNvTensorRtRtx => CatalogExecutionProvider::NvTensorRtRtx,
         crate::Provider::WindowsMlOpenVino => CatalogExecutionProvider::OpenVino,
@@ -312,10 +335,7 @@ pub fn provider_download_pending(provider: crate::Provider) -> bool {
         crate::Provider::WindowsMlVitisAi => CatalogExecutionProvider::VitisAi,
         _ => return false,
     };
-    matches!(
-        catalog_provider_ready_state(ep),
-        Ok(CatalogReadyState::NotPresent | CatalogReadyState::NotReady)
-    )
+    matches!(catalog_provider_requires_prepare(ep), Ok(true))
 }
 
 fn initialize() -> Result<BootstrapState, String> {
@@ -397,7 +417,9 @@ fn has_package_identity() -> Result<bool> {
 fn register_best_catalog_ep_inner() -> Result<Option<CatalogExecutionProvider>> {
     with_catalog(|catalog_api, catalog| {
         for candidate in CATALOG_PRIORITY {
-            // Auto path: allow_download = false (use only already-ready EPs).
+            if catalog_ep_cache(candidate.provider).get().is_some() {
+                return Ok(Some(candidate.provider));
+            }
             match try_register_candidate(catalog_api, catalog, candidate, false) {
                 Ok(true) => {
                     info!(
@@ -428,11 +450,7 @@ fn register_catalog_ep_inner(provider: CatalogExecutionProvider) -> Result<bool>
             .filter(|candidate| candidate.provider == provider)
         {
             saw_candidate = true;
-            // Explicit path: download a listed-but-absent EP only if the
-            // front-end opted in (GUI/CLI). VST3 leaves the flag off and gets
-            // the report-only "not present" error instead.
-            let allow_download = EP_DOWNLOAD_ALLOWED.load(Ordering::Relaxed);
-            match try_register_candidate(catalog_api, catalog, candidate, allow_download) {
+            match try_register_candidate(catalog_api, catalog, candidate, true) {
                 Ok(true) => {
                     info!(
                         "registered Windows ML catalog EP {}",
@@ -492,6 +510,11 @@ fn catalog_ep_cache(provider: CatalogExecutionProvider) -> &'static OnceLock<()>
     }
 }
 
+fn mark_catalog_ep_registered(provider: CatalogExecutionProvider) {
+    let _ = catalog_ep_cache(provider).set(());
+}
+
+#[derive(Clone, Copy)]
 struct FoundCatalogCandidate<'a> {
     handle: WinMLEpHandle,
     candidate: &'a CatalogCandidate,
@@ -502,6 +525,7 @@ fn find_catalog_candidate(
     catalog: WinMLEpCatalogHandle,
     provider: CatalogExecutionProvider,
 ) -> Result<Option<FoundCatalogCandidate<'static>>> {
+    let mut fallback = None;
     for candidate in CATALOG_PRIORITY
         .iter()
         .filter(|candidate| candidate.provider == provider)
@@ -511,13 +535,35 @@ fn find_catalog_candidate(
         let hr =
             unsafe { (api.find_provider)(catalog, catalog_name.as_ptr(), ptr::null(), &mut ep) };
         if hr >= 0 && !ep.is_null() {
-            return Ok(Some(FoundCatalogCandidate {
+            let found = FoundCatalogCandidate {
                 handle: ep,
                 candidate,
-            }));
+            };
+            if fallback.is_none() {
+                fallback = Some(found);
+            }
+
+            let mut state = 0;
+            match check_hr(
+                unsafe { (api.get_ready_state)(ep, &mut state) },
+                "WinMLEpGetReadyState",
+            ) {
+                Ok(()) => {
+                    let state = CatalogReadyState::from_raw(state);
+                    if state == CatalogReadyState::Ready || state == CatalogReadyState::NotReady {
+                        return Ok(Some(found));
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to read Windows ML catalog EP {} ready state while selecting provider alias: {err:#}",
+                        candidate.catalog_name
+                    );
+                }
+            }
         }
     }
-    Ok(None)
+    Ok(fallback)
 }
 
 fn provider_info_from_handle(
@@ -575,7 +621,7 @@ fn try_register_candidate(
     api: &CatalogApi,
     catalog: WinMLEpCatalogHandle,
     candidate: &CatalogCandidate,
-    allow_download: bool,
+    allow_not_present: bool,
 ) -> Result<bool> {
     let catalog_name = CString::new(candidate.catalog_name)?;
     let mut ep = ptr::null_mut();
@@ -589,11 +635,12 @@ fn try_register_candidate(
         unsafe { (api.get_ready_state)(ep, &mut state) },
         "WinMLEpGetReadyState",
     )?;
-    // Any non-Ready state may require a blocking download or preparation step.
-    // Standalone front-ends opt in; VST3 and automatic provider selection do
-    // not, so they must skip rather than unexpectedly blocking a host.
-    if state != 0 && !allow_download {
-        return Ok(false);
+    match CatalogReadyState::from_raw(state) {
+        CatalogReadyState::Ready | CatalogReadyState::NotReady => {}
+        CatalogReadyState::NotPresent if allow_not_present => {}
+        CatalogReadyState::NotPresent | CatalogReadyState::Unknown(_) => {
+            return Ok(false);
+        }
     }
     check_hr(unsafe { (api.ensure_ready)(ep) }, "WinMLEpEnsureReady")?;
 
@@ -603,8 +650,17 @@ fn try_register_candidate(
     }
 
     let env = Environment::current()?;
-    let _library = env.register_ep_library(candidate.catalog_name, &path)?;
+    match env.register_ep_library(candidate.catalog_name, &path) {
+        Ok(_library) => {}
+        Err(err) if library_already_registered_error(&err, candidate.catalog_name) => {}
+        Err(err) => return Err(err.into()),
+    }
     Ok(true)
+}
+
+fn library_already_registered_error(err: &ort::Error, catalog_name: &str) -> bool {
+    let message = err.to_string();
+    message.contains("already registered") && message.contains(catalog_name)
 }
 
 fn read_ep_library_path(api: &CatalogApi, ep: WinMLEpHandle) -> Result<String> {
@@ -714,6 +770,106 @@ const CATALOG_PRIORITY: &[CatalogCandidate] = &[
         provider: CatalogExecutionProvider::VitisAi,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(name: &str, ready_state: CatalogReadyState) -> CatalogProviderInfo {
+        CatalogProviderInfo {
+            name: name.to_string(),
+            version: String::new(),
+            package_family_name: String::new(),
+            library_path: String::new(),
+            package_root_path: String::new(),
+            ready_state,
+            certification: 0,
+            vc_provider: CatalogExecutionProvider::from_catalog_name(name),
+        }
+    }
+
+    #[test]
+    fn selects_ready_alias_for_same_catalog_provider() {
+        let providers = vec![
+            provider(
+                "NvTensorRtRtxExecutionProvider",
+                CatalogReadyState::NotPresent,
+            ),
+            provider("NvTensorRTRTXExecutionProvider", CatalogReadyState::Ready),
+        ];
+
+        let selected = select_best_catalog_provider_info(&providers).unwrap();
+
+        assert_eq!(selected.name, "NvTensorRTRTXExecutionProvider");
+        assert_eq!(
+            select_best_catalog_provider(&providers),
+            Some(CatalogExecutionProvider::NvTensorRtRtx)
+        );
+    }
+
+    #[test]
+    fn selects_ready_alias_for_explicit_catalog_provider() {
+        let providers = vec![
+            provider(
+                "NvTensorRTRTXExecutionProvider",
+                CatalogReadyState::NotReady,
+            ),
+            provider("NvTensorRtRtxExecutionProvider", CatalogReadyState::Ready),
+        ];
+
+        let selected =
+            select_catalog_provider_info(&providers, CatalogExecutionProvider::NvTensorRtRtx)
+                .unwrap();
+
+        assert_eq!(selected.name, "NvTensorRtRtxExecutionProvider");
+    }
+
+    #[test]
+    fn selects_not_ready_priority_candidate_before_later_ready_provider() {
+        let providers = vec![
+            provider(
+                "NvTensorRtRtxExecutionProvider",
+                CatalogReadyState::NotPresent,
+            ),
+            provider(
+                "NvTensorRTRTXExecutionProvider",
+                CatalogReadyState::NotReady,
+            ),
+            provider("QNNExecutionProvider", CatalogReadyState::Ready),
+        ];
+
+        let selected = select_best_catalog_provider_info(&providers).unwrap();
+
+        assert_eq!(selected.name, "NvTensorRTRTXExecutionProvider");
+        assert_eq!(
+            select_best_catalog_provider(&providers),
+            Some(CatalogExecutionProvider::NvTensorRtRtx)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_first_priority_candidate_when_none_are_ready_or_preparable() {
+        let providers = vec![
+            provider("QNNExecutionProvider", CatalogReadyState::Unknown(99)),
+            provider(
+                "NvTensorRtRtxExecutionProvider",
+                CatalogReadyState::NotPresent,
+            ),
+            provider(
+                "NvTensorRTRTXExecutionProvider",
+                CatalogReadyState::Unknown(99),
+            ),
+        ];
+
+        let selected = select_best_catalog_provider_info(&providers).unwrap();
+
+        assert_eq!(selected.name, "NvTensorRtRtxExecutionProvider");
+        assert_eq!(
+            select_best_catalog_provider(&providers),
+            Some(CatalogExecutionProvider::NvTensorRtRtx)
+        );
+    }
+}
 
 struct ComInit {
     should_uninitialize: bool,

@@ -26,12 +26,20 @@ fn list() -> Result<()> {
         print_provider(provider);
     }
 
-    match windows_ml::select_best_catalog_provider(&providers) {
+    match windows_ml::select_best_catalog_provider_info(&providers) {
         Some(provider) => {
+            let vc_provider = provider.vc_provider.with_context(|| {
+                format!(
+                    "Windows ML catalog EP {} matched vc-rs priority but has no vc provider mapping",
+                    provider.name
+                )
+            })?;
             println!(
-                "\nvc-rs priority would select: {} ({})",
-                provider.label(),
-                provider.vc_provider_name()
+                "\nvc-rs priority would select: {} ({}) via {} ready-state={}",
+                vc_provider.label(),
+                vc_provider.vc_provider_name(),
+                provider.name,
+                provider.ready_state.label()
             );
         }
         None => {
@@ -44,22 +52,34 @@ fn list() -> Result<()> {
 
 fn install(args: WindowsMlEpsInstallArgs) -> Result<()> {
     let providers = windows_ml::list_catalog_providers()?;
-    let selected = match args.provider {
-        Some(provider) => provider.into_catalog_provider(),
-        None => windows_ml::select_best_catalog_provider(&providers).with_context(|| {
-            "no vc-rs-supported Windows ML catalog EP is compatible on this device; use provider windowsml for DirectML/CPU fallback"
-        })?,
+    let selected_info = match args.provider {
+        Some(provider) => {
+            let selected = provider.into_catalog_provider();
+            windows_ml::select_catalog_provider_info(&providers, selected)
+        }
+        None => Some(windows_ml::select_best_catalog_provider_info(&providers).with_context(
+            || {
+                "no vc-rs-supported Windows ML catalog EP is compatible on this device; use provider windowsml for DirectML/CPU fallback"
+            },
+        )?),
     };
-    let current = providers
-        .iter()
-        .find(|provider| provider.vc_provider == Some(selected));
+    let selected = selected_info
+        .and_then(|provider| provider.vc_provider)
+        .or_else(|| {
+            args.provider
+                .map(WindowsMlEpProvider::into_catalog_provider)
+        })
+        .with_context(|| {
+            "selected Windows ML catalog EP matched vc-rs priority but has no vc provider mapping"
+        })?;
 
     println!(
         "Selected Windows ML catalog EP: {} ({})",
         selected.label(),
         selected.vc_provider_name()
     );
-    if let Some(provider) = current {
+    if let Some(provider) = selected_info {
+        println!("Catalog provider: {}", provider.name);
         println!("Current state: {}", provider.ready_state.label());
         if !provider.version.is_empty() {
             println!("Version: {}", provider.version);
@@ -76,10 +96,9 @@ fn install(args: WindowsMlEpsInstallArgs) -> Result<()> {
     }
 
     // Download/install can take minutes and may use Windows Update/Store-backed
-    // services. Keep it behind an explicit CLI command plus confirmation; VST3
-    // model load should only report the missing EP and point users here.
+    // services, so keep the explicit install command behind confirmation.
     if !args.yes {
-        let action = match current.map(|provider| provider.ready_state) {
+        let action = match selected_info.map(|provider| provider.ready_state) {
             Some(CatalogReadyState::NotPresent) => "download and install",
             Some(CatalogReadyState::NotReady) => "prepare",
             Some(CatalogReadyState::Unknown(_)) | None => "attempt to prepare",
@@ -107,14 +126,17 @@ fn print_provider(provider: &CatalogProviderInfo) {
         .vc_provider
         .map(CatalogExecutionProvider::vc_provider_name)
         .unwrap_or("-");
-    let status = match provider.ready_state {
-        CatalogReadyState::Ready | CatalogReadyState::NotReady => "installed",
-        CatalogReadyState::NotPresent => "not-installed",
+    let availability = match provider.ready_state {
+        CatalogReadyState::Ready | CatalogReadyState::NotReady => "present",
+        CatalogReadyState::NotPresent => "not-present",
         CatalogReadyState::Unknown(_) => "unknown",
     };
     println!(
-        "  {} status={} vc-provider={}",
-        provider.name, status, vc_provider
+        "  {} ready-state={} availability={} vc-provider={}",
+        provider.name,
+        provider.ready_state.label(),
+        availability,
+        vc_provider
     );
     if !provider.version.is_empty() {
         println!("    version={}", provider.version);

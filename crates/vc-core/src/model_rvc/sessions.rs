@@ -1773,7 +1773,7 @@ pub(super) fn load_session(
             #[cfg(all(windows, feature = "windowsml"))]
             {
                 // Auto Windows ML optimizes for "works with the platform runtime":
-                // catalog EP if ready, then DirectML, then ORT's CPU fallback.
+                // catalog EP if present/preparable, then DirectML, then ORT's CPU fallback.
                 // Explicit windowsml-* providers below intentionally fail
                 // instead of silently changing the requested accelerator.
                 match crate::windows_ml::try_register_best_catalog_ep()? {
@@ -1814,7 +1814,7 @@ pub(super) fn load_session(
                     }
                     None => {
                         info!(
-                            "no ready Windows ML catalog EP found; using DirectML/CPU fallback for {}",
+                            "no usable Windows ML catalog EP found; using DirectML/CPU fallback for {}",
                             path.display()
                         );
                         builder = builder

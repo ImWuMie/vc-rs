@@ -160,7 +160,7 @@ fn check_windows_ml(report: &mut DoctorReport) {
                 return;
             }
 
-            let selected = windows_ml::select_best_catalog_provider(&providers);
+            let selected = windows_ml::select_best_catalog_provider_info(&providers);
             let mut details = Vec::new();
             for provider in &supported {
                 let vc_name = provider
@@ -168,24 +168,20 @@ fn check_windows_ml(report: &mut DoctorReport) {
                     .map(|provider| provider.vc_provider_name())
                     .unwrap_or("-");
                 details.push(format!(
-                    "{} status={} vc-provider={}",
+                    "{} ready-state={} vc-provider={}",
                     provider.name,
                     provider.ready_state.label(),
                     vc_name
                 ));
             }
 
-            match selected.and_then(|selected| {
-                supported
-                    .iter()
-                    .find(|provider| provider.vc_provider == Some(selected))
-            }) {
+            match selected {
                 Some(provider) if provider.ready_state == CatalogReadyState::Ready => {
                     report.add_with_details(
                         CheckStatus::Ok,
                         "Windows ML catalog EPs",
                         format!(
-                            "best supported EP is ready: {} ({})",
+                            "best supported EP is ready: {} ({}) via {}",
                             provider
                                 .vc_provider
                                 .map(|provider| provider.label())
@@ -193,7 +189,27 @@ fn check_windows_ml(report: &mut DoctorReport) {
                             provider
                                 .vc_provider
                                 .map(|provider| provider.vc_provider_name())
-                                .unwrap_or("-")
+                                .unwrap_or("-"),
+                            provider.name
+                        ),
+                        details,
+                    );
+                }
+                Some(provider) if provider.ready_state == CatalogReadyState::NotReady => {
+                    report.add_with_details(
+                        CheckStatus::Ok,
+                        "Windows ML catalog EPs",
+                        format!(
+                            "best supported EP is present and will be prepared on load: {} ({}) via {}",
+                            provider
+                                .vc_provider
+                                .map(|provider| provider.label())
+                                .unwrap_or("unknown"),
+                            provider
+                                .vc_provider
+                                .map(|provider| provider.vc_provider_name())
+                                .unwrap_or("-"),
+                            provider.name
                         ),
                         details,
                     );
@@ -203,7 +219,7 @@ fn check_windows_ml(report: &mut DoctorReport) {
                         CheckStatus::Warn,
                         "Windows ML catalog EPs",
                         format!(
-                            "best supported EP is listed but not ready: {} status={}; run `vc-rs windowsml-eps install` if you want catalog acceleration",
+                            "best supported EP is listed but not usable without install/repair: {} ready-state={}; run `vc-rs windowsml-eps install` if you want catalog acceleration",
                             provider.name,
                             provider.ready_state.label()
                         ),

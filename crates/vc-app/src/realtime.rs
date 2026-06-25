@@ -413,10 +413,6 @@ pub struct EngineController {
 
 impl EngineController {
     pub fn new(initial_live: LiveParams) -> Self {
-        // Standalone front-ends (GUI/CLI) may auto-download a missing Windows ML
-        // catalog EP during model load; the VST3 plugin does not opt in.
-        #[cfg(all(windows, feature = "windowsml"))]
-        vc_core::windows_ml::set_ep_download_allowed(true);
         let (tx, rx) = mpsc::sync_channel(COMMAND_CAPACITY);
         let status = Arc::new(Mutex::new(EngineStatusSnapshot::default()));
         let devices = Arc::new(Mutex::new(DeviceList::default()));
