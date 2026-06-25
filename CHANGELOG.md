@@ -11,7 +11,7 @@ Version numbers come from `[workspace.package].version` in the root
 release archives. See [`docs/distribution.md`](docs/distribution.md) for the full
 versioning and publishing procedure.
 
-## [0.4.0] - 2026-06-24
+## [0.4.0] - 2026-06-25
 
 ### Added
 
@@ -36,6 +36,10 @@ versioning and publishing procedure.
 
 - Supported Applio-style RVC exports and models with the optional `rnd`
   latent-noise input.
+- Accepted `f0: true` metadata and sized model windows at the exported model's
+  sample rate.
+- Failed fast when the Windows ML bootstrap DLL is missing and handled catalog
+  execution-provider preparation consistently.
 - Fixed TensorRT-only RVC profile builds.
 - Validated conversion settings consistently across frontends.
 
