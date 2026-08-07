@@ -29,6 +29,7 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         speaker_id: args.speaker_id,
         input_gain: args.input_gain,
         output_gain: args.output_gain,
+        monitor_gain: args.monitor_gain,
         // Gate on/off is static for the CLI session (no live denoiser control),
         // so derive it from the selected mode; the unified live path applies it.
         noise_gate_enabled: denoiser_mode == DenoiserMode::NoiseGate,
@@ -51,6 +52,8 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         output_host,
         input_device: args.input,
         output_device: args.output,
+        monitor_output_enabled: args.monitor_output.is_some(),
+        monitor_output_device: args.monitor_output.clone().filter(|name| !name.is_empty()),
         wasapi_input_exclusive,
         wasapi_output_exclusive,
         wasapi_buffer_ms: args.wasapi_buffer_ms,

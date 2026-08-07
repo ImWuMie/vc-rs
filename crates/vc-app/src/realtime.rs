@@ -112,6 +112,11 @@ pub struct RealtimeConfig {
     pub output_host: AudioHost,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
+    // Optional monitor output: a second device (on `output_host`, shared cpal
+    // path) that plays the converted signal with its own live `monitor_gain`.
+    // `monitor_output_device` is `None` = system default when enabled.
+    pub monitor_output_enabled: bool,
+    pub monitor_output_device: Option<String>,
     pub wasapi_input_exclusive: bool,
     pub wasapi_output_exclusive: bool,
     pub wasapi_buffer_ms: u32,
@@ -149,6 +154,8 @@ impl Default for RealtimeConfig {
             output_host: AudioHost::default(),
             input_device: None,
             output_device: None,
+            monitor_output_enabled: false,
+            monitor_output_device: None,
             wasapi_input_exclusive: false,
             wasapi_output_exclusive: false,
             wasapi_buffer_ms: 0,
@@ -181,6 +188,9 @@ impl RealtimeConfig {
         }
         if self.wasapi_output_exclusive && self.output_host != AudioHost::Wasapi {
             bail!("WASAPI exclusive output requires the WASAPI output host");
+        }
+        if self.monitor_output_enabled && self.output_host == AudioHost::Asio {
+            bail!("monitor output is not supported with the ASIO output host");
         }
         validate_conversion_timing(
             ConversionTiming {
@@ -271,6 +281,7 @@ struct AtomicLiveParams {
     speaker_id: AtomicI64,
     input_gain: AtomicU32,
     output_gain: AtomicU32,
+    monitor_gain: AtomicU32,
     noise_gate_enabled: AtomicBool,
     noise_gate_threshold: AtomicU32,
 }
@@ -290,6 +301,8 @@ impl AtomicLiveParams {
             .store(value.input_gain.to_bits(), Ordering::Relaxed);
         self.output_gain
             .store(value.output_gain.to_bits(), Ordering::Relaxed);
+        self.monitor_gain
+            .store(value.monitor_gain.to_bits(), Ordering::Relaxed);
         self.noise_gate_enabled
             .store(value.noise_gate_enabled, Ordering::Relaxed);
         self.noise_gate_threshold
@@ -302,6 +315,7 @@ impl AtomicLiveParams {
             speaker_id: self.speaker_id.load(Ordering::Relaxed),
             input_gain: f32::from_bits(self.input_gain.load(Ordering::Relaxed)),
             output_gain: f32::from_bits(self.output_gain.load(Ordering::Relaxed)),
+            monitor_gain: f32::from_bits(self.monitor_gain.load(Ordering::Relaxed)),
             noise_gate_enabled: self.noise_gate_enabled.load(Ordering::Relaxed),
             noise_gate_threshold: f32::from_bits(self.noise_gate_threshold.load(Ordering::Relaxed)),
         }
@@ -327,6 +341,9 @@ pub struct EngineStatusSnapshot {
     pub output_device: String,
     pub input_sample_rate: u32,
     pub output_sample_rate: u32,
+    // Monitor output device + sample rate; empty/0 when the monitor is disabled.
+    pub monitor_device: String,
+    pub monitor_sample_rate: u32,
     pub passthrough_live_switchable: bool,
 }
 
@@ -347,6 +364,8 @@ pub struct TelemetrySnapshot {
     pub output_underruns: u64,
     pub output_dropped_samples: u64,
     pub output_buffer_samples: u64,
+    pub monitor_underruns: u64,
+    pub monitor_dropped_samples: u64,
 }
 
 #[derive(Default)]
@@ -359,6 +378,8 @@ struct Telemetry {
     output_underruns: AtomicU64,
     output_dropped_samples: AtomicU64,
     output_buffer_samples: AtomicU64,
+    monitor_underruns: AtomicU64,
+    monitor_dropped_samples: AtomicU64,
 }
 
 impl Telemetry {
@@ -371,6 +392,8 @@ impl Telemetry {
         self.output_underruns.store(0, Ordering::Relaxed);
         self.output_dropped_samples.store(0, Ordering::Relaxed);
         self.output_buffer_samples.store(0, Ordering::Relaxed);
+        self.monitor_underruns.store(0, Ordering::Relaxed);
+        self.monitor_dropped_samples.store(0, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> TelemetrySnapshot {
@@ -383,6 +406,8 @@ impl Telemetry {
             output_underruns: self.output_underruns.load(Ordering::Relaxed),
             output_dropped_samples: self.output_dropped_samples.load(Ordering::Relaxed),
             output_buffer_samples: self.output_buffer_samples.load(Ordering::Relaxed),
+            monitor_underruns: self.monitor_underruns.load(Ordering::Relaxed),
+            monitor_dropped_samples: self.monitor_dropped_samples.load(Ordering::Relaxed),
         }
     }
 }
@@ -558,6 +583,8 @@ fn set_status(
             status.output_device.clear();
             status.input_sample_rate = 0;
             status.output_sample_rate = 0;
+            status.monitor_device.clear();
+            status.monitor_sample_rate = 0;
             status.passthrough_live_switchable = false;
         }
     }
@@ -572,6 +599,8 @@ fn set_error(status: &Mutex<EngineStatusSnapshot>, error: &anyhow::Error) {
         status.output_device.clear();
         status.input_sample_rate = 0;
         status.output_sample_rate = 0;
+        status.monitor_device.clear();
+        status.monitor_sample_rate = 0;
         status.passthrough_live_switchable = false;
     }
 }
@@ -890,6 +919,7 @@ struct RealtimeSession {
     worker: Option<JoinHandle<()>>,
     input_stream: Option<AudioStream>,
     output_stream: Option<AudioStream>,
+    monitor_stream: Option<AudioStream>,
     status: EngineStatusSnapshot,
     debug_input_wav: Option<PathBuf>,
     debug_output_wav: Option<PathBuf>,
@@ -926,11 +956,34 @@ impl RealtimeSession {
             config.input_device.as_deref(),
             config.output_device.as_deref(),
             config.wasapi_buffer_ms,
+            config.monitor_output_enabled,
+            config.monitor_output_device.as_deref(),
         )?;
         let input_rate = audio.input_sample_rate();
         let output_rate = audio.output_sample_rate();
         let input_chunk = dsp::chunk_samples_for_rate(input_rate, config.chunk_ms);
         let output_chunk = dsp::chunk_samples_for_rate(output_rate, config.chunk_ms);
+        // Monitor output: a second device playing the converted signal at its
+        // own rate, resampled from the primary output rate on the worker.
+        let monitor_rate = audio.monitor_sample_rate();
+        let monitor_chunk = if config.monitor_output_enabled {
+            dsp::chunk_samples_for_rate(monitor_rate, config.chunk_ms)
+        } else {
+            0
+        };
+        let monitor_capacity = if config.monitor_output_enabled {
+            monitor_chunk * OUTPUT_QUEUE_CHUNKS
+        } else {
+            0
+        };
+        let mut monitor_resampler = if config.monitor_output_enabled {
+            Some(dsp::StreamingResampleMono::new(
+                output_rate as usize,
+                monitor_rate as usize,
+            )?)
+        } else {
+            None
+        };
         let current_live = live.load();
         #[cfg(feature = "gtcrn")]
         let gtcrn_backend = vc_core::denoise::GtcrnBackend::for_provider(
@@ -1023,14 +1076,21 @@ impl RealtimeSession {
         // stream failure then returns without ever starting (and stopping) the
         // worker and its model/CUDA context. The streams stay paused until
         // play(), so the worker can attach afterwards.
-        let (input_stream, output_stream, mut input_consumer, mut output_producer) = build_streams(
+        let endpoints = build_streams(
             &audio,
             input_chunk * INPUT_QUEUE_CHUNKS,
             output_capacity,
+            config.monitor_output_enabled.then_some(monitor_capacity),
             &running,
             &wake,
             &telemetry,
         )?;
+        let input_stream = endpoints.input_stream;
+        let output_stream = endpoints.output_stream;
+        let monitor_stream = endpoints.monitor_stream;
+        let mut input_consumer = endpoints.input_consumer;
+        let mut output_producer = endpoints.output_producer;
+        let mut monitor_producer = endpoints.monitor_producer;
         let worker_running = Arc::clone(&running);
         let worker_wake = Arc::clone(&wake);
         let worker_telemetry = Arc::clone(&telemetry);
@@ -1054,6 +1114,7 @@ impl RealtimeSession {
                     let mut model = model;
                     let mut input_acc = Vec::<f32>::with_capacity(input_chunk * 2);
                     let mut prepared = Vec::<f32>::with_capacity(output_chunk * 2);
+                    let mut monitor_prepared = Vec::<f32>::with_capacity(monitor_chunk * 2);
                     while worker_running.load(Ordering::SeqCst) {
                         if !accumulate_input_chunk(&mut input_consumer, &mut input_acc, input_chunk)
                         {
@@ -1075,10 +1136,11 @@ impl RealtimeSession {
                                 samples.extend_from_slice(&input_acc[..input_chunk]);
                             }
                         }
+                        let live_params = live.load();
                         let stats = model.process_chunk(
                             &input_acc[..input_chunk],
                             input_rate,
-                            &live.load(),
+                            &live_params,
                             passthrough_live.load(Ordering::Relaxed),
                             &mut prepared,
                         );
@@ -1118,13 +1180,55 @@ impl RealtimeSession {
                             (output_capacity - output_producer.slots()) as u64,
                             Ordering::Relaxed,
                         );
+                        // Monitor output: resample the converted signal to the
+                        // monitor device's rate, apply the live monitor gain, and
+                        // queue it. The resampler is fed every chunk (even when
+                        // the silence gate below suppresses the push) so its
+                        // stateful phase stays aligned with the primary timeline.
+                        if let (Some(producer), Some(resampler)) =
+                            (monitor_producer.as_mut(), monitor_resampler.as_mut())
+                        {
+                            monitor_prepared.clear();
+                            if resampler
+                                .process_into(&prepared, &mut monitor_prepared)
+                                .is_err()
+                            {
+                                monitor_prepared.clear();
+                            }
+                            let monitor_gain = live_params.monitor_gain.max(0.0);
+                            if (monitor_gain - 1.0).abs() > f32::EPSILON {
+                                for sample in monitor_prepared.iter_mut() {
+                                    *sample = (*sample * monitor_gain).clamp(-1.0, 1.0);
+                                }
+                            }
+                            if !output_silent
+                                || should_queue_silent_output(
+                                    monitor_capacity - producer.slots(),
+                                    monitor_chunk,
+                                )
+                            {
+                                let (_, remainder) = producer.push_partial_slice(&monitor_prepared);
+                                worker_telemetry
+                                    .monitor_dropped_samples
+                                    .fetch_add(remainder.len() as u64, Ordering::Relaxed);
+                            }
+                        }
                     }
                 })?,
         );
 
-        if let Err(err) = output_stream.play().and_then(|_| input_stream.play()) {
+        let monitor_play = match &monitor_stream {
+            Some(stream) => stream.play(),
+            None => Ok(()),
+        };
+        if let Err(err) = output_stream
+            .play()
+            .and(monitor_play)
+            .and_then(|_| input_stream.play())
+        {
             drop(input_stream);
             drop(output_stream);
+            drop(monitor_stream);
             stop_startup_worker(&running, &wake, &mut worker);
             return Err(err);
         }
@@ -1135,6 +1239,7 @@ impl RealtimeSession {
             worker: worker.take(),
             input_stream: Some(input_stream),
             output_stream: Some(output_stream),
+            monitor_stream,
             status: EngineStatusSnapshot {
                 state: EngineState::Running,
                 message: format!(
@@ -1147,6 +1252,16 @@ impl RealtimeSession {
                 output_device: audio.output_name().to_string(),
                 input_sample_rate: input_rate,
                 output_sample_rate: output_rate,
+                monitor_device: if config.monitor_output_enabled {
+                    audio.monitor_name().to_string()
+                } else {
+                    String::new()
+                },
+                monitor_sample_rate: if config.monitor_output_enabled {
+                    monitor_rate
+                } else {
+                    0
+                },
                 passthrough_live_switchable,
             },
             debug_input_wav: config.debug_input_wav,
@@ -1171,6 +1286,7 @@ impl Drop for RealtimeSession {
         self.wake.wake();
         drop(self.input_stream.take());
         drop(self.output_stream.take());
+        drop(self.monitor_stream.take());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -1195,17 +1311,22 @@ fn should_queue_silent_output(buffered: usize, output_chunk: usize) -> bool {
 }
 
 /// Streams plus the worker-side ring-buffer ends created in the same attempt.
-type StreamEndpoints = (
-    AudioStream,
-    AudioStream,
-    rtrb::Consumer<f32>,
-    rtrb::Producer<f32>,
-);
+/// The monitor ends are optional (present only when a monitor output is
+/// configured); the monitor consumer lives inside the monitor stream callback.
+struct StreamEndpoints {
+    input_stream: AudioStream,
+    output_stream: AudioStream,
+    monitor_stream: Option<AudioStream>,
+    input_consumer: rtrb::Consumer<f32>,
+    output_producer: rtrb::Producer<f32>,
+    monitor_producer: Option<rtrb::Producer<f32>>,
+}
 
 fn build_streams(
     audio: &RealtimeAudio,
     input_capacity: usize,
     output_capacity: usize,
+    monitor_capacity: Option<usize>,
     running: &Arc<AtomicBool>,
     wake: &Arc<WorkerWake>,
     telemetry: &Arc<Telemetry>,
@@ -1251,7 +1372,36 @@ fn build_streams(
             .output_buffer_samples
             .store(output_consumer.cached_slots() as u64, Ordering::Relaxed);
     })?;
-    Ok((input_stream, output_stream, input_consumer, output_producer))
+    let (monitor_stream, monitor_producer) = match monitor_capacity {
+        Some(capacity) => {
+            let (monitor_producer, mut monitor_consumer) = RingBuffer::<f32>::new(capacity);
+            let monitor_running = Arc::clone(running);
+            let monitor_telemetry = Arc::clone(telemetry);
+            let stream = audio.build_monitor_stream(move |out| {
+                if !monitor_running.load(Ordering::Relaxed) {
+                    out.fill(0.0);
+                    return;
+                }
+                let (_, remainder) = monitor_consumer.pop_partial_slice(out);
+                if !remainder.is_empty() {
+                    remainder.fill(0.0);
+                    monitor_telemetry
+                        .monitor_underruns
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            })?;
+            (Some(stream), Some(monitor_producer))
+        }
+        None => (None, None),
+    };
+    Ok(StreamEndpoints {
+        input_stream,
+        output_stream,
+        monitor_stream,
+        input_consumer,
+        output_producer,
+        monitor_producer,
+    })
 }
 
 fn stop_startup_worker(
@@ -1301,6 +1451,7 @@ mod tests {
             speaker_id: 7,
             input_gain: 0.5,
             output_gain: 2.0,
+            monitor_gain: 1.5,
             noise_gate_enabled: true,
             noise_gate_threshold: 0.025,
         };
@@ -1310,6 +1461,7 @@ mod tests {
         assert_eq!(out.speaker_id, params.speaker_id);
         assert_eq!(out.input_gain, params.input_gain);
         assert_eq!(out.output_gain, params.output_gain);
+        assert_eq!(out.monitor_gain, params.monitor_gain);
         assert_eq!(out.noise_gate_enabled, params.noise_gate_enabled);
         assert_eq!(out.noise_gate_threshold, params.noise_gate_threshold);
     }
@@ -1319,6 +1471,25 @@ mod tests {
         assert!(RealtimeConfig::default().validate().is_err());
         assert!(RealtimeConfig {
             passthrough: true,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn monitor_output_rejected_with_asio_output_host() {
+        assert!(RealtimeConfig {
+            passthrough: true,
+            monitor_output_enabled: true,
+            output_host: AudioHost::Asio,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RealtimeConfig {
+            passthrough: true,
+            monitor_output_enabled: true,
             ..Default::default()
         }
         .validate()

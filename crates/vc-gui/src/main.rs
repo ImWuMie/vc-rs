@@ -135,6 +135,12 @@ struct GuiSettings {
     output_host: String,
     input_device: String,
     output_device: String,
+    // Optional monitor output: a second device (on the output host) playing the
+    // converted signal with its own live `monitor_gain`. Empty device = system
+    // default, like the primary output device.
+    monitor_output_enabled: bool,
+    monitor_output_device: String,
+    monitor_gain: f32,
     wasapi_input_exclusive: bool,
     wasapi_output_exclusive: bool,
     wasapi_buffer_ms: u32,
@@ -180,6 +186,9 @@ impl Default for GuiSettings {
             output_host: default_host_token().to_string(),
             input_device: String::new(),
             output_device: String::new(),
+            monitor_output_enabled: false,
+            monitor_output_device: String::new(),
+            monitor_gain: 1.0,
             wasapi_input_exclusive: false,
             wasapi_output_exclusive: false,
             wasapi_buffer_ms: 0,
@@ -228,6 +237,7 @@ impl GuiSettings {
         self.wasapi_input_exclusive = false;
         self.wasapi_output_exclusive = false;
         self.wasapi_buffer_ms = 0;
+        self.monitor_gain = self.monitor_gain.max(0.0);
         self.crossfade_ms = GUI_CROSSFADE_MS;
         self.sola_search_ms = GUI_SOLA_SEARCH_MS;
         self.extra_convert_ms = self.extra_convert_ms.max(GUI_MIN_EXTRA_CONVERT_MS);
@@ -253,6 +263,7 @@ impl GuiSettings {
             speaker_id: self.speaker_id,
             input_gain: self.input_gain,
             output_gain: self.output_gain,
+            monitor_gain: self.monitor_gain,
             // Gate on/off rides the unified live path now, so toggling the
             // denoiser between off and noise-gate takes effect without a reload;
             // rnnoise still needs a reload (it rebuilds a stateful denoiser).
@@ -279,6 +290,8 @@ impl GuiSettings {
             output_host: self.output_host(),
             input_device: string_option(&self.input_device),
             output_device: string_option(&self.output_device),
+            monitor_output_enabled: self.monitor_output_enabled,
+            monitor_output_device: string_option(&self.monitor_output_device),
             wasapi_input_exclusive: false,
             wasapi_output_exclusive: false,
             wasapi_buffer_ms: 0,
@@ -440,10 +453,20 @@ impl eframe::App for VcGui {
                 friendly_status_message(&status.message)
             ));
             if status.state == EngineState::Running {
-                ui.label(format!(
-                    "{} Hz -> {} Hz",
-                    status.input_sample_rate, status.output_sample_rate
-                ));
+                let rate_label = if status.monitor_sample_rate > 0 {
+                    format!(
+                        "{} Hz -> {} Hz | monitor {} Hz",
+                        status.input_sample_rate,
+                        status.output_sample_rate,
+                        status.monitor_sample_rate
+                    )
+                } else {
+                    format!(
+                        "{} Hz -> {} Hz",
+                        status.input_sample_rate, status.output_sample_rate
+                    )
+                };
+                ui.label(rate_label);
             }
         });
         if let Some(detail) = &status.detail {
@@ -585,6 +608,21 @@ impl eframe::App for VcGui {
                 &devices.outputs,
                 &mut changed,
             );
+            changed |= ui
+                .checkbox(
+                    &mut self.settings.monitor_output_enabled,
+                    "Enable monitor output",
+                )
+                .changed();
+            if self.settings.monitor_output_enabled {
+                device_combo(
+                    ui,
+                    "Monitor device",
+                    &mut self.settings.monitor_output_device,
+                    &devices.outputs,
+                    &mut changed,
+                );
+            }
 
             ui.separator();
             ui.heading("Engine configuration (Apply to restart)");
@@ -628,6 +666,12 @@ impl eframe::App for VcGui {
                 .add(
                     egui::Slider::new(&mut self.settings.output_gain, 0.0..=12.0)
                         .text("Output gain"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.settings.monitor_gain, 0.0..=12.0)
+                        .text("Monitor gain"),
                 )
                 .changed();
             egui::ComboBox::from_label("Input denoiser")
@@ -717,6 +761,12 @@ impl eframe::App for VcGui {
                     ui,
                     "Output buffered samples",
                     telemetry.output_buffer_samples,
+                );
+                metric(ui, "Monitor underruns", telemetry.monitor_underruns);
+                metric(
+                    ui,
+                    "Dropped monitor samples",
+                    telemetry.monitor_dropped_samples,
                 );
             });
         });
@@ -1135,6 +1185,23 @@ mod tests {
             settings.realtime().unwrap().denoiser_mode,
             DenoiserMode::NoiseGate
         );
+    }
+
+    #[test]
+    fn monitor_settings_round_trip_through_config() {
+        let mut settings: GuiSettings = toml::from_str(
+            "monitor_output_enabled = true\nmonitor_output_device = \"Headphones\"\nmonitor_gain = 2.0",
+        )
+        .unwrap();
+        settings.normalize_gui_managed_settings();
+        assert_eq!(settings.live().monitor_gain, 2.0);
+        let config = settings.realtime().unwrap();
+        assert!(config.monitor_output_enabled);
+        assert_eq!(config.monitor_output_device.as_deref(), Some("Headphones"));
+        // Defaults stay disabled with unity gain.
+        let defaults = GuiSettings::default();
+        assert!(!defaults.realtime().unwrap().monitor_output_enabled);
+        assert_eq!(defaults.live().monitor_gain, 1.0);
     }
 
     #[test]

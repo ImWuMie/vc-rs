@@ -214,6 +214,17 @@ pub struct RunArgs {
     pub output: Option<String>,
     #[arg(
         long,
+        help = "Enable a monitor output on this device (same backend as --output); pass \"\" for the system default"
+    )]
+    pub monitor_output: Option<String>,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_OUTPUT_GAIN,
+        help = "Monitor output gain (default: 1.0); only applies with --monitor-output"
+    )]
+    pub monitor_gain: f32,
+    #[arg(
+        long,
         value_enum,
         help = "Audio backend for both directions (default: platform default); override per direction with --input-backend/--output-backend"
     )]
@@ -1331,6 +1342,32 @@ mod tests {
         assert!(!args.wasapi_input_exclusive());
         assert!(!args.wasapi_output_exclusive());
         assert!(args.validate_audio_options().is_ok());
+    }
+
+    #[test]
+    fn parses_monitor_output_flags() {
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--monitor-output",
+            "Headphones",
+            "--monitor-gain",
+            "2.0",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.monitor_output.as_deref(), Some("Headphones"));
+        assert_eq!(args.monitor_gain, 2.0);
+        // Empty monitor-output selects the system default device.
+        let cli =
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--monitor-output", ""]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.monitor_output, Some(String::new()));
     }
 
     #[test]

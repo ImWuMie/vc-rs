@@ -77,10 +77,16 @@ pub struct RealtimeAudio {
     wasapi_output_exclusive: bool,
     input: InputEndpoint,
     output: OutputEndpoint,
+    // Optional monitor output: a second device (on the same `output_host`,
+    // always through the shared cpal path) that plays the converted signal with
+    // its own gain. `None` when the monitor output is disabled.
+    monitor: Option<OutputEndpoint>,
     input_sample_rate: u32,
     output_sample_rate: u32,
+    monitor_sample_rate: u32,
     input_name: String,
     output_name: String,
+    monitor_name: String,
 }
 
 enum InputEndpoint {
@@ -106,6 +112,11 @@ impl RealtimeAudio {
     // different host (e.g. input WASAPI + output ASIO). The exception is
     // ASIO-on-both, which must share one driver (cpal loads a single ASIO driver
     // globally) and is handled by `open_asio_duplex`.
+    //
+    // The device-selection parameters stay flat (not bundled into a config
+    // struct) because each endpoint is opened independently and the constructor
+    // only forwards them to the per-endpoint openers.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         input_host: AudioHost,
         output_host: AudioHost,
@@ -114,6 +125,8 @@ impl RealtimeAudio {
         input_name: Option<&str>,
         output_name: Option<&str>,
         wasapi_buffer_ms: u32,
+        monitor_output_enabled: bool,
+        monitor_output_device: Option<&str>,
     ) -> Result<Self> {
         if wasapi_input_exclusive && input_host != AudioHost::Wasapi {
             bail!("WASAPI exclusive input requires the WASAPI input host");
@@ -122,35 +135,45 @@ impl RealtimeAudio {
             bail!("WASAPI exclusive output requires the WASAPI output host");
         }
 
-        if input_host == AudioHost::Asio && output_host == AudioHost::Asio {
-            return Self::open_asio_duplex(input_name, output_name);
-        }
-
-        let (input, input_sample_rate, input_name) = open_input_endpoint(
-            input_host,
-            input_name,
-            wasapi_input_exclusive,
+        let mut audio = if input_host == AudioHost::Asio && output_host == AudioHost::Asio {
+            Self::open_asio_duplex(input_name, output_name)?
+        } else {
+            let (input, input_sample_rate, input_name) = open_input_endpoint(
+                input_host,
+                input_name,
+                wasapi_input_exclusive,
+                wasapi_buffer_ms,
+            )?;
+            let (output, output_sample_rate, output_name) = open_output_endpoint(
+                output_host,
+                output_name,
+                wasapi_output_exclusive,
+                wasapi_buffer_ms,
+            )?;
+            Self {
+                input_host,
+                output_host,
+                wasapi_input_exclusive,
+                wasapi_output_exclusive,
+                input,
+                output,
+                monitor: None,
+                input_sample_rate,
+                output_sample_rate,
+                monitor_sample_rate: 0,
+                input_name,
+                output_name,
+                monitor_name: String::new(),
+            }
+        };
+        // The monitor endpoint is attached after either branch so the both-ASIO
+        // duplex path (which returns early above) still supports a monitor.
+        audio.open_monitor(
+            monitor_output_enabled,
+            monitor_output_device,
             wasapi_buffer_ms,
         )?;
-        let (output, output_sample_rate, output_name) = open_output_endpoint(
-            output_host,
-            output_name,
-            wasapi_output_exclusive,
-            wasapi_buffer_ms,
-        )?;
-
-        Ok(Self {
-            input_host,
-            output_host,
-            wasapi_input_exclusive,
-            wasapi_output_exclusive,
-            input,
-            output,
-            input_sample_rate,
-            output_sample_rate,
-            input_name,
-            output_name,
-        })
+        Ok(audio)
     }
 
     // Both directions on ASIO: resolve one driver and share it across the input
@@ -187,11 +210,37 @@ impl RealtimeAudio {
                 device,
                 config: output_config,
             },
+            monitor: None,
             input_sample_rate,
             output_sample_rate,
+            monitor_sample_rate: 0,
             input_name: name.clone(),
             output_name: name,
+            monitor_name: String::new(),
         })
+    }
+
+    // Opens the optional monitor output endpoint on the same `output_host`.
+    // Monitor is always routed through the shared cpal path (exclusive=false),
+    // independent of the primary output's exclusivity mode.
+    fn open_monitor(
+        &mut self,
+        enabled: bool,
+        device: Option<&str>,
+        wasapi_buffer_ms: u32,
+    ) -> Result<()> {
+        if !enabled {
+            self.monitor = None;
+            self.monitor_sample_rate = 0;
+            self.monitor_name.clear();
+            return Ok(());
+        }
+        let (endpoint, sample_rate, name) =
+            open_output_endpoint(self.output_host, device, false, wasapi_buffer_ms)?;
+        self.monitor = Some(endpoint);
+        self.monitor_sample_rate = sample_rate;
+        self.monitor_name = name;
+        Ok(())
     }
 
     pub fn input_host_label(&self) -> &'static str {
@@ -216,6 +265,16 @@ impl RealtimeAudio {
 
     pub fn output_name(&self) -> &str {
         &self.output_name
+    }
+
+    /// Sample rate of the monitor output, or 0 when the monitor is disabled.
+    pub fn monitor_sample_rate(&self) -> u32 {
+        self.monitor_sample_rate
+    }
+
+    /// Resolved monitor device name, empty when the monitor is disabled.
+    pub fn monitor_name(&self) -> &str {
+        &self.monitor_name
     }
 
     pub fn build_input_stream<F>(&self, on_samples: F) -> Result<AudioStream>
@@ -245,6 +304,24 @@ impl RealtimeAudio {
             OutputEndpoint::Wasapi(config) => Ok(AudioStream::Wasapi(
                 wasapi_audio::build_output_stream(config.clone(), fill)?,
             )),
+        }
+    }
+
+    /// Builds the monitor output stream. The monitor endpoint is always the
+    /// shared cpal path, so a `Wasapi` endpoint here is a bug.
+    pub fn build_monitor_stream<F>(&self, fill: F) -> Result<AudioStream>
+    where
+        F: FnMut(&mut [f32]) + Send + 'static,
+    {
+        match &self.monitor {
+            Some(OutputEndpoint::Cpal { device, config }) => Ok(AudioStream::Cpal(
+                build_cpal_output_stream(device, config, fill)?,
+            )),
+            #[cfg(windows)]
+            Some(OutputEndpoint::Wasapi(_)) => {
+                bail!("monitor output requires a shared (cpal) endpoint")
+            }
+            None => bail!("monitor output is not enabled"),
         }
     }
 }
