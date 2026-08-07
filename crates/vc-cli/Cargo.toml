@@ -18,7 +18,7 @@ path = "src/main.rs"
 # `cargo build`/`cargo test` keep their current backend set. The distribution
 # packages (package.ps1) build single-provider variants explicitly with
 # `--no-default-features --features windowsml|tensorrt|cuda`, mirroring vc-vst3.
-default = ["windowsml", "tensorrt", "rnnoise", "gtcrn"]
+default = ["tensorrt", "rnnoise", "gtcrn"]
 windowsml = ["vc-core/windowsml", "vc-app/windowsml"]
 tensorrt = ["vc-core/tensorrt", "vc-app/tensorrt"]
 cuda = ["vc-core/cuda", "vc-app/cuda"]
