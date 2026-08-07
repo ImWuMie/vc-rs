@@ -424,6 +424,9 @@ impl WorkerCtx {
                 speaker_id: self.params.speaker_id.value() as i64,
                 input_gain: util::db_to_gain(self.params.input_gain_db.value()),
                 output_gain: util::db_to_gain(self.params.output_gain_db.value()),
+                // The VST3 has no monitor output (it plays through the host), so
+                // the monitor gain stays at unity.
+                monitor_gain: 1.0,
                 noise_gate_enabled: self.params.noise_gate.value(),
                 noise_gate_threshold: util::db_to_gain(self.params.noise_gate_threshold_db.value()),
             });

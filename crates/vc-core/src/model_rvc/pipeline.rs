@@ -245,6 +245,12 @@ pub struct LiveParams {
     pub speaker_id: i64,
     pub input_gain: f32,
     pub output_gain: f32,
+    // Monitor output gain, applied by the vc-app realtime worker when routing
+    // the converted signal to the separate monitor output device. The RVC
+    // pipeline itself ignores it (it is a vc-app routing concern, but it rides
+    // on LiveParams so it flows through the atomic live-params channel to the
+    // worker alongside the other live knobs).
+    pub monitor_gain: f32,
     pub noise_gate_enabled: bool,
     pub noise_gate_threshold: f32,
 }
@@ -256,6 +262,7 @@ impl Default for LiveParams {
             speaker_id: 0,
             input_gain: 1.0,
             output_gain: 1.0,
+            monitor_gain: 1.0,
             noise_gate_enabled: false,
             noise_gate_threshold: 0.01,
         }

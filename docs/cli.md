@@ -127,6 +127,11 @@ lower `--chunk-ms`** to reduce latency.
   up, `-12.0` one octave down.
 - `--input-gain 1.0` / `--output-gain 1.0`: input/output gain (default: 1.0).
   Raise when too quiet; raising too far clips.
+- `--monitor-output <name>`: enable a monitor output — a second output device
+  (on the same backend as `--output`) playing the converted signal with its own
+  gain, e.g. headphones while the primary output feeds a stream or DAW. Pass `""`
+  for the system default device. `--monitor-gain 1.0` sets the monitor gain
+  (default: 1.0). Not supported with an ASIO output host.
 - `--denoiser off|noise-gate|rnnoise|gtcrn`: exclusive input denoiser selection.
   RNNoise uses an embedded model. GTCRN requires `--gtcrn-model <dir>` pointing
   at a directory containing `gtcrn_stream.onnx` (download with
