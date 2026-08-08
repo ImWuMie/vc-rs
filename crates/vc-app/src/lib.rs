@@ -8,7 +8,8 @@ pub mod audio;
 mod realtime;
 
 pub use realtime::{
-    write_wav_mono, AudioHost, DenoiserMode, DeviceList, EngineController, EngineState,
-    EngineStatusSnapshot, RealtimeConfig, Smoother, TelemetrySnapshot,
+    write_wav_mono, AudioHost, DenoiserMode, DeviceList, DeviceSpec, EngineController, EngineState,
+    EngineStatusSnapshot, ModelLoadState, ModelLoadStatus, RealtimeConfig, Smoother,
+    TelemetrySnapshot,
 };
 pub use vc_core::model_rvc::{F0Config, LiveParams, NoiseGateShaping, OutputDynamicsConfig};

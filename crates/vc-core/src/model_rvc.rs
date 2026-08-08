@@ -40,10 +40,11 @@ pub use chunk_converter::{ChunkConverter, ChunkOutputConfig, ChunkStats};
 pub use f0_postprocess::F0PostprocessConfig;
 pub use inspect::inspect_model;
 pub use pipeline::{
-    F0Config, LiveParams, LoadModelRole, LoadProgress, NoiseGateShaping, OutputDynamicsConfig,
-    RvcPipeline, RvcPipelineConfig,
+    F0Config, InputDenoiserMode, LiveParams, LoadModelRole, LoadProgress, NoiseGateShaping,
+    OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
 pub use process_priority::{set_process_gpu_priority, set_process_power_throttling};
+pub use shape::EMBEDDER_SAMPLE_RATE;
 
 #[cfg(test)]
 mod tests;

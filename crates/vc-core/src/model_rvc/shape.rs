@@ -1,7 +1,7 @@
 // ContentVec emits frames on a 20 ms stride at 16 kHz. RVC's 10 ms grid is
 // created later by repeating feature frames, so keep this alignment scoped to
 // the shared ContentVec/RMVPE waveform context and not pitch/output sizing.
-pub(super) const EMBEDDER_SAMPLE_RATE: u32 = 16_000;
+pub const EMBEDDER_SAMPLE_RATE: u32 = 16_000;
 pub(super) const RVC_SAMPLE_RATE: u32 = 48_000;
 pub(super) const CONTENTVEC_CONTEXT_ALIGN_SAMPLES: usize = 320;
 pub(super) const RMVPE_FRAME_SAMPLES_16K: usize = 160;

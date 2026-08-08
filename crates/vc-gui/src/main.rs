@@ -1,7 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -9,8 +9,9 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use vc_app::{
-    AudioHost, DenoiserMode, EngineController, EngineState, F0Config, LiveParams, NoiseGateShaping,
-    OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot,
+    AudioHost, DenoiserMode, DeviceSpec, EngineController, EngineState, F0Config, LiveParams,
+    ModelLoadState, NoiseGateShaping, OutputDynamicsConfig, RealtimeConfig, Smoother,
+    TelemetrySnapshot,
 };
 use vc_core::gpu::{list_cuda_devices, GpuDevice};
 use vc_core::validation::CONVERSION_TIMING_LIMITS;
@@ -334,6 +335,23 @@ impl GuiSettings {
         })
     }
 
+    /// Device-only selection for live reconfiguration while a session is running
+    /// (see `EngineController::set_devices`). Mirrors the device fields in
+    /// `realtime()`, keeping WASAPI exclusive off / buffer 0 (GUI-pinned).
+    fn device_spec(&self) -> DeviceSpec {
+        DeviceSpec {
+            input_host: self.input_host(),
+            output_host: self.output_host(),
+            input_device: string_option(&self.input_device),
+            output_device: string_option(&self.output_device),
+            monitor_output_enabled: self.monitor_output_enabled,
+            monitor_output_device: string_option(&self.monitor_output_device),
+            wasapi_input_exclusive: false,
+            wasapi_output_exclusive: false,
+            wasapi_buffer_ms: 0,
+        }
+    }
+
     fn input_host(&self) -> AudioHost {
         parse_gui_host(&self.input_host)
     }
@@ -529,6 +547,54 @@ impl eframe::App for VcGui {
                 self.browse_into(ModelKind::F0);
             }
 
+            ui.separator();
+            ui.heading("Model pool (live switch)");
+            if ui.button("Add model…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("ONNX model", &["onnx"])
+                    .pick_file()
+                {
+                    let path_string = path.to_string_lossy().into_owned();
+                    let already = status.model_loads.iter().any(|m| m.path == path_string)
+                        || self.settings.model == path_string;
+                    if already {
+                        self.ui_error = Some(
+                            "This model is already loaded or queued in the pool.".to_string(),
+                        );
+                    } else if let Err(err) = self.controller.add_model(path) {
+                        self.ui_error = Some(format!("{err:#}"));
+                    }
+                }
+            }
+            let active_model = status.active_model.clone();
+            for entry in &status.model_loads {
+                let short = Path::new(&entry.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry.path.clone());
+                let active = active_model.as_deref() == Some(entry.path.as_str());
+                let state_label = match &entry.state {
+                    ModelLoadState::Loaded => String::new(),
+                    ModelLoadState::Loading(msg) => format!(" (loading: {msg})"),
+                    ModelLoadState::Error(msg) => format!(" (error: {msg})"),
+                };
+                ui.horizontal(|ui| {
+                    let label = if active {
+                        format!("▶ {short}{state_label}")
+                    } else {
+                        format!("  {short}{state_label}")
+                    };
+                    ui.label(label);
+                    if matches!(entry.state, ModelLoadState::Loaded) && !active {
+                        if let Some(index) = entry.pool_index {
+                            if ui.button("Switch").clicked() {
+                                self.controller.set_active_model(index);
+                            }
+                        }
+                    }
+                });
+            }
+
             egui::ComboBox::from_label("Provider")
                 .selected_text(&self.settings.provider)
                 .show_ui(ui, |ui| {
@@ -593,22 +659,25 @@ impl eframe::App for VcGui {
                     .controller
                     .refresh_devices(self.settings.input_host(), self.settings.output_host());
             }
-            changed |= host_changed;
+            // Device changes apply live while a session is running: same-sample-
+            // rate swaps rebind the worker rings without a restart (rate changes
+            // restart the session). Settings still save for the next full Apply.
+            let mut devices_changed = host_changed;
             device_combo(
                 ui,
                 "Input device",
                 &mut self.settings.input_device,
                 &devices.inputs,
-                &mut changed,
+                &mut devices_changed,
             );
             device_combo(
                 ui,
                 "Output device",
                 &mut self.settings.output_device,
                 &devices.outputs,
-                &mut changed,
+                &mut devices_changed,
             );
-            changed |= ui
+            devices_changed |= ui
                 .checkbox(
                     &mut self.settings.monitor_output_enabled,
                     "Enable monitor output",
@@ -620,8 +689,14 @@ impl eframe::App for VcGui {
                     "Monitor device",
                     &mut self.settings.monitor_output_device,
                     &devices.outputs,
-                    &mut changed,
+                    &mut devices_changed,
                 );
+            }
+            changed |= devices_changed;
+            if devices_changed && status.state == EngineState::Running {
+                if let Err(err) = self.controller.set_devices(self.settings.device_spec()) {
+                    self.ui_error = Some(format!("{err:#}"));
+                }
             }
 
             ui.separator();
@@ -674,6 +749,9 @@ impl eframe::App for VcGui {
                         .text("Monitor gain"),
                 )
                 .changed();
+            // Denoiser switching applies live while a session is running (all
+            // four modes; gtcrn loads its engine in the background first).
+            let denoiser_before = self.settings.denoiser.clone();
             egui::ComboBox::from_label("Input denoiser")
                 .selected_text(&self.settings.denoiser)
                 .show_ui(ui, |ui| {
@@ -687,6 +765,13 @@ impl eframe::App for VcGui {
                             .changed();
                     }
                 });
+            if self.settings.denoiser != denoiser_before && status.state == EngineState::Running {
+                if let Ok(mode) = parse_denoiser(&self.settings.denoiser) {
+                    if let Err(err) = self.controller.set_denoiser(mode) {
+                        self.ui_error = Some(format!("{err:#}"));
+                    }
+                }
+            }
             if self.settings.denoiser == "noise-gate" {
                 changed |= ui
                     .add(

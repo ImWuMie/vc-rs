@@ -45,6 +45,17 @@ enum InputDenoiser {
     Rnnoise(Box<crate::denoise::RnnoiseDenoiser>),
 }
 
+/// Input denoiser variant for live hot-swapping on `RvcPipeline`. Distinct from
+/// vc-app's front-end `DenoiserMode` (which also covers gate shaping), so the
+/// engine can convert between them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputDenoiserMode {
+    Off,
+    Gate,
+    Rnnoise,
+    Gtcrn,
+}
+
 impl InputDenoiser {
     fn process_in_place(&mut self, buf: &mut [f32]) -> Result<()> {
         match self {
@@ -1009,6 +1020,54 @@ impl RvcPipeline {
                 ));
             }
         }
+    }
+
+    /// Hot-swap the input denoiser variant live (off / gate / rnnoise). GTCRN
+    /// attaches through `set_gtcrn` (built off-thread); switching away from
+    /// gtcrn clears the 16 kHz seam. RNNoise construction is cheap (pure CPU),
+    /// so this is safe to run on the worker thread. The gate/stateful stages are
+    /// mutually exclusive by construction.
+    pub fn set_denoiser_mode(&mut self, mode: InputDenoiserMode, device_rate: u32) -> Result<()> {
+        #[cfg(feature = "gtcrn")]
+        {
+            self.stream_state.gtcrn = None;
+        }
+        self.input_denoiser = match mode {
+            InputDenoiserMode::Off => InputDenoiser::Off,
+            InputDenoiserMode::Gate => InputDenoiser::Gate(dsp::NoiseGate::new(
+                device_rate as f32,
+                self.noise_gate_threshold,
+                self.noise_gate_attack_ms,
+                self.noise_gate_release_ms,
+                self.noise_gate_floor,
+            )),
+            InputDenoiserMode::Rnnoise => {
+                #[cfg(feature = "rnnoise")]
+                {
+                    InputDenoiser::Rnnoise(Box::new(crate::denoise::RnnoiseDenoiser::new(
+                        device_rate,
+                    )?))
+                }
+                #[cfg(not(feature = "rnnoise"))]
+                {
+                    bail!("RNNoise support is not enabled in this build")
+                }
+            }
+            // GTCRN attaches via `set_gtcrn`; clear the device-rate stage so the
+            // two never coexist.
+            InputDenoiserMode::Gtcrn => InputDenoiser::Off,
+        };
+        Ok(())
+    }
+
+    /// Hot-swap the GTCRN stage (16 kHz input seam). `None` leaves gtcrn mode.
+    /// The caller builds the denoiser off the worker thread (engine load takes
+    /// seconds); clearing the gate/rnnoise stage here keeps the stages mutually
+    /// exclusive.
+    #[cfg(feature = "gtcrn")]
+    pub fn set_gtcrn(&mut self, denoiser: Option<crate::denoise::GtcrnDenoiser>) {
+        self.input_denoiser = InputDenoiser::Off;
+        self.stream_state.gtcrn = denoiser;
     }
 
     pub fn set_output_gain(&mut self, output_gain: f32) {
