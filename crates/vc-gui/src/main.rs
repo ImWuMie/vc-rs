@@ -9,9 +9,9 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use vc_app::{
-    AudioHost, DenoiserMode, DeviceSpec, EngineController, EngineState, F0Config, LiveParams,
-    ModelLoadState, NoiseGateShaping, OutputDynamicsConfig, RealtimeConfig, Smoother,
-    TelemetrySnapshot,
+    AudioHost, DenoiserMode, DeviceSpec, EngineController, EngineState, EngineStatusSnapshot,
+    F0Config, LiveParams, ModelLoadState, NoiseGateShaping, OutputDynamicsConfig, RealtimeConfig,
+    Smoother, TelemetrySnapshot,
 };
 use vc_core::gpu::{list_cuda_devices, GpuDevice};
 use vc_core::validation::CONVERSION_TIMING_LIMITS;
@@ -172,6 +172,9 @@ struct GuiSettings {
     target_output_rms: f32,
     max_output_gain: f32,
     passthrough: bool,
+    // Models the user added to the live-switch pool, persisted so a GUI restart
+    // re-adds them after the next Apply.
+    pool_models: Vec<String>,
 }
 
 impl Default for GuiSettings {
@@ -218,6 +221,7 @@ impl Default for GuiSettings {
             target_output_rms: 0.03,
             max_output_gain: 512.0,
             passthrough: false,
+            pool_models: Vec::new(),
         }
     }
 }
@@ -370,6 +374,9 @@ struct VcGui {
     telemetry_updated_at: Instant,
     applied_chunk_ms: Option<u32>,
     gpu_devices: Arc<Mutex<GpuDeviceDiscovery>>,
+    // Previous engine state, so a transition into Running (a fresh session, or
+    // one recreated by a device restart) triggers a model-pool restore.
+    last_state: EngineState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -394,12 +401,28 @@ impl VcGui {
             telemetry_updated_at: Instant::now() - TELEMETRY_REFRESH,
             applied_chunk_ms: None,
             gpu_devices: Arc::new(Mutex::new(GpuDeviceDiscovery::default())),
+            last_state: EngineState::Stopped,
         }
     }
 
     fn changed(&mut self) {
         self.dirty_since = Some(Instant::now());
         self.controller.set_live_params(self.settings.live());
+    }
+
+    /// Re-add the persisted pool models after a fresh session starts. `add_model`
+    /// itself dedups against the pool, so double-invocation is safe.
+    fn restore_pool(&mut self, status: &EngineStatusSnapshot) {
+        for path in &self.settings.pool_models {
+            let already =
+                status.model_loads.iter().any(|m| m.path == *path) || self.settings.model == *path;
+            if already {
+                continue;
+            }
+            if let Err(err) = self.controller.add_model(PathBuf::from(path)) {
+                self.ui_error = Some(format!("{err:#}"));
+            }
+        }
     }
 
     fn maybe_save(&mut self) {
@@ -458,6 +481,14 @@ impl eframe::App for VcGui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.maybe_save();
         let (status, latest_telemetry, devices) = self.controller.snapshot();
+        // A transition into Running means a fresh session (first Apply, or one
+        // recreated by a device restart) whose pool was reset — re-add the
+        // persisted pool models. Same-rate device swaps keep Running, so they
+        // do not re-trigger.
+        if status.state == EngineState::Running && self.last_state != EngineState::Running {
+            self.restore_pool(&status);
+        }
+        self.last_state = status.state;
         if self.telemetry_updated_at.elapsed() >= TELEMETRY_REFRESH {
             self.telemetry = latest_telemetry;
             self.telemetry_updated_at = Instant::now();
@@ -563,6 +594,11 @@ impl eframe::App for VcGui {
                         );
                     } else if let Err(err) = self.controller.add_model(path) {
                         self.ui_error = Some(format!("{err:#}"));
+                    } else {
+                        // Persist the pool so a GUI restart re-adds it.
+                        if !self.settings.pool_models.contains(&path_string) {
+                            self.settings.pool_models.push(path_string);
+                        }
                     }
                 }
             }
@@ -1307,6 +1343,19 @@ mod tests {
         assert_eq!(gui_host_label("wasapi"), "WASAPI");
         assert_eq!(gui_host_label("asio"), "ASIO");
         assert_eq!(gui_host_label("coreaudio"), "Core Audio");
+    }
+
+    #[test]
+    fn pool_models_round_trip_through_toml() {
+        let settings: GuiSettings =
+            toml::from_str("pool_models = [\"a.onnx\", \"b.onnx\"]").unwrap();
+        assert_eq!(
+            settings.pool_models,
+            vec!["a.onnx".to_string(), "b.onnx".to_string()]
+        );
+        // Defaults stay empty; a missing key loads fine (serde default).
+        let defaults: GuiSettings = toml::from_str("").unwrap();
+        assert!(defaults.pool_models.is_empty());
     }
 
     #[test]
