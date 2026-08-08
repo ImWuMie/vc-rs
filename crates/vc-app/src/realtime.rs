@@ -2021,6 +2021,10 @@ impl RealtimeSession {
                     let mut input_acc = Vec::<f32>::with_capacity(input_chunk * 2);
                     let mut prepared = Vec::<f32>::with_capacity(output_chunk * 2);
                     let mut monitor_prepared = Vec::<f32>::with_capacity(monitor_chunk * 2);
+                    // Last pool slot reported to the shared status, so a live
+                    // model switch is propagated without re-looking-up the name
+                    // (and allocating) on every chunk.
+                    let mut last_active_slot = 0usize;
                     while worker_running.load(Ordering::SeqCst) {
                         // Drain worker commands at the top of every iteration so a
                         // live change (device rebind, later model/denoiser swaps)
@@ -2117,6 +2121,18 @@ impl RealtimeSession {
                             worker_running.store(false, Ordering::SeqCst);
                             break;
                         };
+                        // Reflect a live model switch in the shared status.
+                        // `EngineController::set_active_model` writes the
+                        // `active_model` atomic that `Pool::process_chunk` picks
+                        // up; without this the GUI panel's highlight (and its
+                        // Switch-button logic) would stay on the old model.
+                        let requested = worker_active_model.load(Ordering::Relaxed);
+                        if requested != last_active_slot {
+                            last_active_slot = requested;
+                            if let Ok(mut st) = worker_status.lock() {
+                                st.active_model = model.active_model_name();
+                            }
+                        }
                         worker_telemetry.chunks.fetch_add(1, Ordering::Relaxed);
                         worker_telemetry
                             .inference_us

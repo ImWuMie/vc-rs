@@ -175,6 +175,10 @@ struct GuiSettings {
     // Models the user added to the live-switch pool, persisted so a GUI restart
     // re-adds them after the next Apply.
     pool_models: Vec<String>,
+    // The pool model the user last activated, persisted so a GUI restart
+    // restores it after the pool reloads. None (or equal to the base model)
+    // means the base model stays active.
+    active_pool_model: Option<String>,
 }
 
 impl Default for GuiSettings {
@@ -222,6 +226,7 @@ impl Default for GuiSettings {
             max_output_gain: 512.0,
             passthrough: false,
             pool_models: Vec::new(),
+            active_pool_model: None,
         }
     }
 }
@@ -377,6 +382,9 @@ struct VcGui {
     // Previous engine state, so a transition into Running (a fresh session, or
     // one recreated by a device restart) triggers a model-pool restore.
     last_state: EngineState,
+    // Pool model path to auto-activate once it finishes loading after a fresh
+    // session; consumed when reached, cleared by a manual switch.
+    pending_active_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -402,6 +410,7 @@ impl VcGui {
             applied_chunk_ms: None,
             gpu_devices: Arc::new(Mutex::new(GpuDeviceDiscovery::default())),
             last_state: EngineState::Stopped,
+            pending_active_model: None,
         }
     }
 
@@ -422,6 +431,33 @@ impl VcGui {
             if let Err(err) = self.controller.add_model(PathBuf::from(path)) {
                 self.ui_error = Some(format!("{err:#}"));
             }
+        }
+    }
+
+    /// Activate the persisted pool model once it has finished loading after a
+    /// restart. The pool loads in the background, so this is polled each frame
+    /// while Running: Loaded → switch to it; Error → give up (base model stays);
+    /// Loading or not yet present → wait for the next frame. A manual Switch
+    /// clears `pending_active_model`, so a user action always wins.
+    fn advance_pending_activation(&mut self, status: &EngineStatusSnapshot) {
+        if status.state != EngineState::Running {
+            return;
+        }
+        let Some(target) = self.pending_active_model.clone() else {
+            return;
+        };
+        let Some(entry) = status.model_loads.iter().find(|m| m.path == target) else {
+            return; // not yet listed; wait another frame
+        };
+        match &entry.state {
+            ModelLoadState::Loaded => {
+                if let Some(index) = entry.pool_index {
+                    self.controller.set_active_model(index);
+                }
+                self.pending_active_model = None;
+            }
+            ModelLoadState::Error(_) => self.pending_active_model = None,
+            ModelLoadState::Loading(_) => {}
         }
     }
 
@@ -487,8 +523,17 @@ impl eframe::App for VcGui {
         // do not re-trigger.
         if status.state == EngineState::Running && self.last_state != EngineState::Running {
             self.restore_pool(&status);
+            // Re-arm auto-activation of the persisted active pool model once it
+            // has loaded (skipped when it names the base model — already slot 0).
+            let base = self.settings.model.clone();
+            self.pending_active_model = self
+                .settings
+                .active_pool_model
+                .clone()
+                .filter(|p| *p != base);
         }
         self.last_state = status.state;
+        self.advance_pending_activation(&status);
         if self.telemetry_updated_at.elapsed() >= TELEMETRY_REFRESH {
             self.telemetry = latest_telemetry;
             self.telemetry_updated_at = Instant::now();
@@ -625,6 +670,16 @@ impl eframe::App for VcGui {
                         if let Some(index) = entry.pool_index {
                             if ui.button("Switch").clicked() {
                                 self.controller.set_active_model(index);
+                                // A manual switch overrides any pending restore
+                                // and becomes the model to persist for the next
+                                // GUI start (None when it is the base model).
+                                self.pending_active_model = None;
+                                let new_active =
+                                    (entry.path != self.settings.model).then(|| entry.path.clone());
+                                if self.settings.active_pool_model != new_active {
+                                    self.settings.active_pool_model = new_active;
+                                    self.changed();
+                                }
                             }
                         }
                     }
@@ -1356,6 +1411,21 @@ mod tests {
         // Defaults stay empty; a missing key loads fine (serde default).
         let defaults: GuiSettings = toml::from_str("").unwrap();
         assert!(defaults.pool_models.is_empty());
+    }
+
+    #[test]
+    fn active_pool_model_round_trips_through_toml() {
+        let settings: GuiSettings = toml::from_str(
+            r#"
+            pool_models = ["a.onnx", "b.onnx"]
+            active_pool_model = "b.onnx"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(settings.active_pool_model.as_deref(), Some("b.onnx"));
+        // Missing key defaults to None (base model stays active).
+        let defaults: GuiSettings = toml::from_str("").unwrap();
+        assert!(defaults.active_pool_model.is_none());
     }
 
     #[test]
