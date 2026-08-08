@@ -2,6 +2,12 @@
 
 > [日本語](README.ja.md) | [English](README.en.md) | 简体中文
 
+> [!IMPORTANT]
+> **本项目基于上游 [`shirohata/vc-rs`](https://github.com/shirohata/vc-rs)**。
+> 所有版权与致谢归原作者所有。
+>
+> **Base project:** https://github.com/shirohata/vc-rs
+
 `vc-rs` 是一个 Rust 编写的 **RVC 声音转换应用**。可以将麦克风输入或 WAV 文件,
 通过 ONNX 格式的 RVC 模型转换为另一种声音。有以下 3 种使用方式:
 

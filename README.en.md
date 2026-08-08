@@ -2,6 +2,13 @@
 
 > [日本語](README.ja.md) | English | [简体中文](README.md)
 
+> [!IMPORTANT]
+> **This project is based on the upstream
+> [`shirohata/vc-rs`](https://github.com/shirohata/vc-rs)**. All credit and
+> copyright belong to the original author.
+>
+> **Base project:** https://github.com/shirohata/vc-rs
+
 `vc-rs` is a Rust **RVC voice conversion app**. It converts microphone input or
 WAV files into another voice using an ONNX-format RVC model. There are three ways
 to use it:
