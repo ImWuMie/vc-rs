@@ -1,6 +1,6 @@
 # vc-rs
 
-> [日本語](README.md) | English
+> [日本語](README.ja.md) | English | [简体中文](README.md)
 
 `vc-rs` is a Rust **RVC voice conversion app**. It converts microphone input or
 WAV files into another voice using an ONNX-format RVC model. There are three ways
@@ -116,20 +116,31 @@ still supply your own RVC voice model (`.onnx`).
 
 1. **Models** — **Browse** for the RVC model, embedder (ContentVec), and F0
    (RMVPE) `.onnx` files.
-2. **Provider** — choose the backend (windowsml package: `windowsml` /
+2. **Model pool (live switch)** — click **Add model…** to add more RVC models to
+   the live-switch pool. Models load **in the background** (the list shows load
+   progress); once loaded, **Switch** swaps models **live without a restart**.
+   Added models and the last-activated model persist and are restored on the next
+   launch.
+3. **Provider** — choose the backend (windowsml package: `windowsml` /
    `windowsml-directml` / `windowsml-nvtrtx` / `windowsml-cpu` / `cpu`; tensorrt
    package: `tensorrt`). **GPU Priority** and the CUDA/TensorRT
    **GPU Device ID** are selectable too.
-3. **Audio** — pick the input/output devices (**Refresh devices** to re-scan).
-   Leave blank to use "System default".
-4. **Engine configuration** — set **Chunk ms** / **Extra convert ms** (see
-   *Tuning real-time settings*).
-5. Press **Apply / Start** to apply and start. **Model / Provider / device /
-   Chunk edits do not take effect until you press it.** **Stop** stops the
-   engine.
-6. **Live parameters** (Pitch shift / Speaker ID / Input gain / Output gain)
-   apply in real time.
-7. **Telemetry** shows inference time, input/output RMS, and overruns/underruns
+4. **Audio** — pick the input/output devices (**Refresh devices** to re-scan).
+   Leave blank to use "System default". Enable **Monitor output** to play the
+   converted signal on a second output device (e.g. headphones), then pick
+   **Monitor device**. Device edits apply **live while running**: a same-sample-
+   rate swap switches instantly without restarting the session, while a sample-
+   rate change restarts it automatically.
+5. **Engine configuration (Apply to restart)** — set **Chunk ms** / **Extra
+   convert ms** (see *Tuning real-time settings*). These, like the base model
+   path and Provider, need **Apply / Start** to take effect.
+6. Press **Apply / Start** to apply and start. **Stop** stops the engine.
+7. **Live parameters** (Pitch shift / Speaker ID / Input gain / Output gain /
+   Monitor gain) apply in real time.
+8. **Input denoiser** — switch **live while running** between `off` /
+   `noise-gate` / `rnnoise` / `gtcrn` (see below); the noise-gate threshold and
+   shaping also apply live.
+9. **Telemetry** shows inference time, input/output RMS, and overruns/underruns
    so you can watch for dropouts and load (inference time is color-flagged when
    it exceeds the chunk budget).
 
@@ -140,12 +151,13 @@ switching back discards stale streaming context before conversion resumes.
 Model-free passthrough remains available, but that session cannot switch live
 back to RVC.
 
-Choose `off`, `noise-gate`, `rnnoise`, or `gtcrn` under **Input denoiser**.
-RNNoise uses an embedded model and needs no additional download. Passthrough
-applies Input gain, the selected input denoiser, and Output gain. Switching
-between `off` and `noise-gate`, including the gate threshold, is live; switching
-to RNNoise or GTCRN requires **Apply / Start**. These input denoisers are not
-included in VST3.
+Choose `off`, `noise-gate`, `rnnoise`, or `gtcrn` under **Input denoiser**, all
+switchable **live while running**: the first three are built in the background
+and hot-swapped immediately, while GTCRN loads its engine in the background on
+first switch (the previous denoiser keeps running during the load) and hot-swaps
+in when ready. RNNoise uses an embedded model and needs no additional download.
+Passthrough applies Input gain, the selected input denoiser, and Output gain.
+These input denoisers are not included in VST3.
 
 Where each denoiser sits:
 
