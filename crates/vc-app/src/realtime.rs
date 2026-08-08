@@ -391,6 +391,9 @@ pub struct ModelLoadStatus {
     /// Index into the worker's pool (dense, `Some` once loaded); the front-end
     /// switches to a model via this index.
     pub pool_index: Option<usize>,
+    /// Monotonic load-request id (never reused), so a queued/loading model can
+    /// be addressed even after earlier entries are removed from the list.
+    pub request_id: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -471,17 +474,24 @@ enum Command {
     UpdateDevices(DeviceSpec),
     // Add an RVC model to the running session's pool. The load runs on a
     // background thread; success/failure returns as AddModelReady/AddModelFailed.
+    // `request_id` is the monotonic id of the `model_loads` entry (see
+    // `ModelLoadStatus`), stable across removals of earlier entries.
     AddModel(PathBuf),
     AddModelReady {
-        slot: usize,
+        request_id: u64,
         name: String,
         converter: ChunkConverter<RvcPipeline>,
         built_input_rate: u32,
         built_output_rate: u32,
     },
     AddModelFailed {
-        slot: usize,
+        request_id: u64,
         error: String,
+    },
+    // Remove a model from the running pool by its `model_loads` request id
+    // (used by the front-end's per-model delete button).
+    RemoveModel {
+        request_id: u64,
     },
     // Live denoiser hot-swap (off/gate/rnnoise on the worker; gtcrn pre-built).
     SetDenoiser(DenoiserMode),
@@ -520,12 +530,17 @@ enum WorkerCommand {
         monitor_producer: Option<rtrb::Producer<f32>>,
     },
     // A model finished loading in the background; hand it to the worker to grow
-    // the pool. `slot` is the index into `model_loads` the control loop reserved.
+    // the pool. `request_id` matches the `model_loads` entry the control loop
+    // reserved (stable across removals of earlier entries).
     AddModel {
         converter: ChunkConverter<RvcPipeline>,
         name: String,
-        slot: usize,
+        request_id: u64,
         activate: bool,
+    },
+    // Remove a pool slot (dense pool index; the base model stays slot 0).
+    RemoveModel {
+        slot: usize,
     },
     // Hot-swap the denoiser variant (off/gate/rnnoise built on the worker).
     SetDenoiser {
@@ -638,6 +653,14 @@ impl EngineController {
         self.active_model.store(slot, Ordering::Relaxed);
     }
 
+    /// Remove a model from the running session's pool by its `model_loads`
+    /// `request_id` (used by the front-end's per-model delete button). Unloads
+    /// the worker slot and drops the status entry; if it was active, the active
+    /// slot falls back to the nearest remaining model.
+    pub fn remove_model(&self, request_id: u64) -> Result<()> {
+        self.try_command(Command::RemoveModel { request_id })
+    }
+
     /// Hot-swap the denoiser live (off / noise-gate / rnnoise apply on the next
     /// worker iteration; gtcrn loads its engine in the background first). Also
     /// keeps the live gate flag coherent so the per-chunk live path does not
@@ -695,6 +718,9 @@ fn control_loop(
     // Tracks the live denoiser mode so models added to the pool later load with
     // the currently-active denoiser rather than the Apply-time config value.
     let mut current_denoiser = DenoiserMode::Off;
+    // Monotonic id for each model-load request, so a `model_loads` entry can be
+    // addressed after earlier entries have been removed (per-model delete).
+    let mut next_request_id = 0u64;
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Command::Apply(config)) => {
@@ -745,10 +771,11 @@ fn control_loop(
                     &live,
                     current_denoiser,
                     path,
+                    &mut next_request_id,
                 );
             }
             Ok(Command::AddModelReady {
-                slot,
+                request_id,
                 name,
                 converter,
                 built_input_rate,
@@ -757,15 +784,24 @@ fn control_loop(
                 let Some(s) = session.as_ref() else {
                     update_model_load_status(
                         &status,
-                        slot,
+                        request_id,
                         ModelLoadState::Error("session stopped while loading".to_string()),
                     );
                     continue;
                 };
+                // The entry may have been deleted while it was loading — drop the
+                // finished model instead of adding a ghost slot.
+                let entry_present = status
+                    .lock()
+                    .map(|st| st.model_loads.iter().any(|m| m.request_id == request_id))
+                    .unwrap_or(false);
+                if !entry_present {
+                    continue;
+                }
                 if built_input_rate != s.input_rate || built_output_rate != s.output_rate {
                     update_model_load_status(
                         &status,
-                        slot,
+                        request_id,
                         ModelLoadState::Error(
                             "device sample rates changed; model discarded".to_string(),
                         ),
@@ -784,22 +820,57 @@ fn control_loop(
                     .send(WorkerCommand::AddModel {
                         converter,
                         name,
-                        slot,
+                        request_id,
                         activate,
                     })
                     .is_err()
                 {
                     update_model_load_status(
                         &status,
-                        slot,
+                        request_id,
                         ModelLoadState::Error("worker stopped; model discarded".to_string()),
                     );
                 } else {
                     s.wake.wake();
                 }
             }
-            Ok(Command::AddModelFailed { slot, error }) => {
-                update_model_load_status(&status, slot, ModelLoadState::Error(error));
+            Ok(Command::AddModelFailed { request_id, error }) => {
+                update_model_load_status(&status, request_id, ModelLoadState::Error(error));
+            }
+            Ok(Command::RemoveModel { request_id }) => {
+                let Some(s) = session.as_ref() else { continue };
+                // Pull the entry out of the status list first, fixing up the pool
+                // indices of entries after the removed slot.
+                let pool_slot = {
+                    let mut st = status.lock().unwrap_or_else(|e| e.into_inner());
+                    let pi = st
+                        .model_loads
+                        .iter()
+                        .find(|m| m.request_id == request_id)
+                        .and_then(|m| m.pool_index);
+                    st.model_loads.retain(|m| m.request_id != request_id);
+                    if let Some(pi) = pi {
+                        for m in st.model_loads.iter_mut() {
+                            if let Some(x) = m.pool_index {
+                                if x > pi {
+                                    m.pool_index = Some(x - 1);
+                                }
+                            }
+                        }
+                    }
+                    pi
+                };
+                // A loaded model must be dropped from the worker's pool too.
+                if let Some(pool_slot) = pool_slot {
+                    if s.worker_tx
+                        .send(WorkerCommand::RemoveModel { slot: pool_slot })
+                        .is_err()
+                    {
+                        set_error(&status, &anyhow!("worker command channel closed"));
+                    } else {
+                        s.wake.wake();
+                    }
+                }
             }
             Ok(Command::SetDenoiser(mode)) => {
                 current_denoiser = mode;
@@ -841,6 +912,7 @@ fn handle_add_model(
     live: &Arc<AtomicLiveParams>,
     denoiser_mode: DenoiserMode,
     path: PathBuf,
+    next_request_id: &mut u64,
 ) {
     let Some(session) = session else {
         set_note(status, "Cannot add a model while stopped");
@@ -866,15 +938,17 @@ fn handle_add_model(
         return;
     }
     let ctx = session.model_load_context(path.clone(), &live.load(), denoiser_mode);
-    let slot = {
+    let request_id = *next_request_id;
+    *next_request_id += 1;
+    {
         let mut st = status.lock().unwrap_or_else(|e| e.into_inner());
         st.model_loads.push(ModelLoadStatus {
             path: path_string,
             state: ModelLoadState::Loading("queued".to_string()),
             pool_index: None,
+            request_id,
         });
-        st.model_loads.len() - 1
-    };
+    }
     let tx = tx.clone();
     let loader_status = Arc::clone(status);
     let spawn = thread::Builder::new()
@@ -886,7 +960,11 @@ fn handle_add_model(
             let built_output_rate = ctx.output_rate;
             let result = load_model_converter(&ctx, |progress| {
                 if let Ok(mut st) = loader_status.lock() {
-                    if let Some(entry) = st.model_loads.get_mut(slot) {
+                    if let Some(entry) = st
+                        .model_loads
+                        .iter_mut()
+                        .find(|m| m.request_id == request_id)
+                    {
                         entry.state = ModelLoadState::Loading(load_progress_message(progress));
                     }
                 }
@@ -894,7 +972,7 @@ fn handle_add_model(
             match result {
                 Ok(converter) => {
                     let _ = tx.send(Command::AddModelReady {
-                        slot,
+                        request_id,
                         name,
                         converter,
                         built_input_rate,
@@ -903,7 +981,7 @@ fn handle_add_model(
                 }
                 Err(err) => {
                     let _ = tx.send(Command::AddModelFailed {
-                        slot,
+                        request_id,
                         error: format!("{err:#}"),
                     });
                 }
@@ -912,7 +990,7 @@ fn handle_add_model(
     if let Err(err) = spawn {
         update_model_load_status(
             status,
-            slot,
+            request_id,
             ModelLoadState::Error(format!("failed to spawn model loader: {err}")),
         );
     }
@@ -1050,11 +1128,15 @@ fn load_gtcrn_denoisers(
 /// status (device fields, message, state). Never goes through `set_status`.
 fn update_model_load_status(
     status: &Mutex<EngineStatusSnapshot>,
-    slot: usize,
+    request_id: u64,
     state: ModelLoadState,
 ) {
     if let Ok(mut st) = status.lock() {
-        if let Some(entry) = st.model_loads.get_mut(slot) {
+        if let Some(entry) = st
+            .model_loads
+            .iter_mut()
+            .find(|m| m.request_id == request_id)
+        {
             entry.state = state;
         }
     }
@@ -1679,6 +1761,34 @@ impl RuntimeModel {
         }
     }
 
+    /// Drop a pool slot by its dense index (the base model is slot 0 and is not
+    /// removed by the front-end). If the active model is removed, the active
+    /// slot falls back to the nearest remaining model; pool indices after the
+    /// removed slot shift down. The requested-slot atomic is re-stored so the
+    /// worker's next `process_chunk` converges to the new active slot.
+    fn remove_model(mut self, slot: usize) -> RuntimeModel {
+        if let Self::Pool {
+            models,
+            names,
+            active,
+            active_requested,
+            ..
+        } = &mut self
+        {
+            if slot < models.len() {
+                models.remove(slot);
+                names.remove(slot);
+                if slot == *active {
+                    *active = slot.min(models.len().saturating_sub(1));
+                } else if slot < *active {
+                    *active -= 1;
+                }
+                active_requested.store(*active, Ordering::Relaxed);
+            }
+        }
+        self
+    }
+
     fn active_model_name(&self) -> Option<String> {
         match self {
             Self::PassthroughOnly(_) => None,
@@ -2047,7 +2157,7 @@ impl RealtimeSession {
                                 WorkerCommand::AddModel {
                                     converter,
                                     name,
-                                    slot,
+                                    request_id,
                                     activate,
                                 } => {
                                     // A passthrough-only session gains live
@@ -2061,7 +2171,11 @@ impl RealtimeSession {
                                         Arc::clone(&worker_active_model),
                                     );
                                     if let Ok(mut st) = worker_status.lock() {
-                                        if let Some(entry) = st.model_loads.get_mut(slot) {
+                                        if let Some(entry) = st
+                                            .model_loads
+                                            .iter_mut()
+                                            .find(|m| m.request_id == request_id)
+                                        {
                                             entry.state = ModelLoadState::Loaded;
                                             entry.pool_index = Some(model.model_count() - 1);
                                         }
@@ -2070,6 +2184,9 @@ impl RealtimeSession {
                                             st.passthrough_live_switchable = true;
                                         }
                                     }
+                                }
+                                WorkerCommand::RemoveModel { slot } => {
+                                    model = model.remove_model(slot);
                                 }
                                 WorkerCommand::SetDenoiser { mode } => {
                                     let live_params = live.load();
@@ -2268,6 +2385,7 @@ impl RealtimeSession {
                             .unwrap_or_default(),
                         state: ModelLoadState::Loaded,
                         pool_index: Some(0),
+                        request_id: 0,
                     }]
                 } else {
                     Vec::new()

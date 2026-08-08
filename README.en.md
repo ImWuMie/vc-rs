@@ -123,11 +123,13 @@ still supply your own RVC voice model (`.onnx`).
 
 1. **Models** — **Browse** for the RVC model, embedder (ContentVec), and F0
    (RMVPE) `.onnx` files.
-2. **Model pool (live switch)** — click **Add model…** to add more RVC models to
-   the live-switch pool. Models load **in the background** (the list shows load
-   progress); once loaded, **Switch** swaps models **live without a restart**.
-   Added models and the last-activated model persist and are restored on the next
-   launch.
+2. **Model pool (live switch)** — click **Add model…** to register more RVC
+   models in the live-switch pool (not loaded yet). Pressing **Switch** loads the
+   target model **in the background** and activates it automatically (the list
+   shows load progress); an already-loaded model switches instantly without a
+   restart. The pool list persists across launches, but models are **lazy** — they
+   load only when you switch to them. Each row's **✕** removes the model from the
+   pool.
 3. **Provider** — choose the backend (windowsml package: `windowsml` /
    `windowsml-directml` / `windowsml-nvtrtx` / `windowsml-cpu` / `cpu`; tensorrt
    package: `tensorrt`). **GPU Priority** and the CUDA/TensorRT

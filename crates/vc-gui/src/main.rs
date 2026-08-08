@@ -419,26 +419,12 @@ impl VcGui {
         self.controller.set_live_params(self.settings.live());
     }
 
-    /// Re-add the persisted pool models after a fresh session starts. `add_model`
-    /// itself dedups against the pool, so double-invocation is safe.
-    fn restore_pool(&mut self, status: &EngineStatusSnapshot) {
-        for path in &self.settings.pool_models {
-            let already =
-                status.model_loads.iter().any(|m| m.path == *path) || self.settings.model == *path;
-            if already {
-                continue;
-            }
-            if let Err(err) = self.controller.add_model(PathBuf::from(path)) {
-                self.ui_error = Some(format!("{err:#}"));
-            }
-        }
-    }
-
-    /// Activate the persisted pool model once it has finished loading after a
-    /// restart. The pool loads in the background, so this is polled each frame
-    /// while Running: Loaded → switch to it; Error → give up (base model stays);
-    /// Loading or not yet present → wait for the next frame. A manual Switch
-    /// clears `pending_active_model`, so a user action always wins.
+    /// Activate a pool model once it has finished loading. The pool is lazy —
+    /// a Switch on a not-yet-loaded model starts a background load and sets
+    /// `pending_active_model`; this is polled each frame while Running:
+    /// Loaded → switch to it; Error → give up (base model stays); Loading or not
+    /// yet present → wait for the next frame. A later manual Switch clears it, so
+    /// a user action always wins.
     fn advance_pending_activation(&mut self, status: &EngineStatusSnapshot) {
         if status.state != EngineState::Running {
             return;
@@ -518,19 +504,12 @@ impl eframe::App for VcGui {
         self.maybe_save();
         let (status, latest_telemetry, devices) = self.controller.snapshot();
         // A transition into Running means a fresh session (first Apply, or one
-        // recreated by a device restart) whose pool was reset — re-add the
-        // persisted pool models. Same-rate device swaps keep Running, so they
-        // do not re-trigger.
+        // recreated by a device restart). The pool is lazy — models load on
+        // Switch, not at startup — so a fresh session starts with only the base
+        // model. Drop any pending activation that predates the restart. Same-rate
+        // device swaps keep Running, so they do not re-trigger.
         if status.state == EngineState::Running && self.last_state != EngineState::Running {
-            self.restore_pool(&status);
-            // Re-arm auto-activation of the persisted active pool model once it
-            // has loaded (skipped when it names the base model — already slot 0).
-            let base = self.settings.model.clone();
-            self.pending_active_model = self
-                .settings
-                .active_pool_model
-                .clone()
-                .filter(|p| *p != base);
+            self.pending_active_model = None;
         }
         self.last_state = status.state;
         self.advance_pending_activation(&status);
@@ -625,65 +604,130 @@ impl eframe::App for VcGui {
 
             ui.separator();
             ui.heading("Model pool (live switch)");
+            // The pool is lazy: Add just registers the model in the persisted
+            // list; it is loaded in the background when you press Switch.
             if ui.button("Add model…").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("ONNX model", &["onnx"])
                     .pick_file()
                 {
                     let path_string = path.to_string_lossy().into_owned();
-                    let already = status.model_loads.iter().any(|m| m.path == path_string)
-                        || self.settings.model == path_string;
-                    if already {
-                        self.ui_error = Some(
-                            "This model is already loaded or queued in the pool.".to_string(),
-                        );
-                    } else if let Err(err) = self.controller.add_model(path) {
-                        self.ui_error = Some(format!("{err:#}"));
+                    if self.settings.pool_models.contains(&path_string)
+                        || self.settings.model == path_string
+                    {
+                        self.ui_error = Some("This model is already in the pool.".to_string());
                     } else {
-                        // Persist the pool so a GUI restart re-adds it.
-                        if !self.settings.pool_models.contains(&path_string) {
-                            self.settings.pool_models.push(path_string);
-                        }
+                        self.settings.pool_models.push(path_string);
+                        self.changed();
                     }
                 }
             }
             let active_model = status.active_model.clone();
-            for entry in &status.model_loads {
-                let short = Path::new(&entry.path)
+            let base_model = self.settings.model.clone();
+            // egui closures borrow `self`, so collect the requested action here
+            // and apply it after the rows have been drawn.
+            let mut switch_loaded: Option<(String, usize)> = None;
+            let mut load_lazy: Option<String> = None;
+            let mut remove: Option<(String, u64)> = None;
+            // Base model row: always loaded, pool slot 0.
+            if !base_model.is_empty() {
+                let short = Path::new(&base_model)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| entry.path.clone());
-                let active = active_model.as_deref() == Some(entry.path.as_str());
-                let state_label = match &entry.state {
-                    ModelLoadState::Loaded => String::new(),
-                    ModelLoadState::Loading(msg) => format!(" (loading: {msg})"),
-                    ModelLoadState::Error(msg) => format!(" (error: {msg})"),
-                };
+                    .unwrap_or_else(|| base_model.clone());
+                let active = active_model.as_deref() == Some(base_model.as_str());
                 ui.horizontal(|ui| {
-                    let label = if active {
-                        format!("▶ {short}{state_label}")
+                    ui.label(if active {
+                        format!("▶ {short}")
                     } else {
-                        format!("  {short}{state_label}")
-                    };
-                    ui.label(label);
-                    if matches!(entry.state, ModelLoadState::Loaded) && !active {
-                        if let Some(index) = entry.pool_index {
-                            if ui.button("Switch").clicked() {
-                                self.controller.set_active_model(index);
-                                // A manual switch overrides any pending restore
-                                // and becomes the model to persist for the next
-                                // GUI start (None when it is the base model).
-                                self.pending_active_model = None;
-                                let new_active =
-                                    (entry.path != self.settings.model).then(|| entry.path.clone());
-                                if self.settings.active_pool_model != new_active {
-                                    self.settings.active_pool_model = new_active;
-                                    self.changed();
+                        format!("  {short}")
+                    });
+                    if !active && ui.button("Switch").clicked() {
+                        switch_loaded = Some((base_model.clone(), 0));
+                    }
+                });
+            }
+            // Pool models, from the persisted list (lazy — not all are loaded).
+            for path in &self.settings.pool_models {
+                let entry = status.model_loads.iter().find(|m| m.path == *path);
+                let short = Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let active = active_model.as_deref() == Some(path.as_str());
+                ui.horizontal(|ui| {
+                    match &entry {
+                        Some(e) => match &e.state {
+                            ModelLoadState::Loaded => {
+                                ui.label(if active {
+                                    format!("▶ {short}")
+                                } else {
+                                    format!("  {short}")
+                                });
+                                if !active {
+                                    if let Some(index) = e.pool_index {
+                                        if ui.button("Switch").clicked() {
+                                            switch_loaded = Some((path.clone(), index));
+                                        }
+                                    }
                                 }
+                            }
+                            ModelLoadState::Loading(msg) => {
+                                ui.label(format!("  {short} (loading: {msg})"));
+                            }
+                            ModelLoadState::Error(msg) => {
+                                ui.label(format!("  {short} (error: {msg})"));
+                            }
+                        },
+                        None => {
+                            ui.label(format!("  {short} (not loaded)"));
+                            if ui.button("Switch").clicked() {
+                                load_lazy = Some(path.clone());
                             }
                         }
                     }
+                    if ui.button("✕").clicked() {
+                        remove = Some((path.clone(), entry.map(|e| e.request_id).unwrap_or(0)));
+                    }
                 });
+            }
+            if let Some((path, index)) = switch_loaded {
+                self.controller.set_active_model(index);
+                self.pending_active_model = None;
+                let new_active = (path != self.settings.model).then(|| path.clone());
+                if self.settings.active_pool_model != new_active {
+                    self.settings.active_pool_model = new_active;
+                    self.changed();
+                }
+            }
+            if let Some(path) = load_lazy {
+                if let Err(err) = self.controller.add_model(PathBuf::from(&path)) {
+                    self.ui_error = Some(format!("{err:#}"));
+                } else {
+                    // Loads in the background; activate it once ready.
+                    self.pending_active_model = Some(path.clone());
+                    let new_active = (path != self.settings.model).then(|| path.clone());
+                    if self.settings.active_pool_model != new_active {
+                        self.settings.active_pool_model = new_active;
+                        self.changed();
+                    }
+                }
+            }
+            if let Some((path, request_id)) = remove {
+                self.settings.pool_models.retain(|p| *p != path);
+                if self.settings.active_pool_model.as_deref() == Some(path.as_str()) {
+                    self.settings.active_pool_model = None;
+                }
+                if self.pending_active_model.as_deref() == Some(path.as_str()) {
+                    self.pending_active_model = None;
+                }
+                // Unload from the running pool if it was loaded (request_id != 0).
+                if request_id != 0 {
+                    if let Err(err) = self.controller.remove_model(request_id) {
+                        self.ui_error = Some(format!("{err:#}"));
+                    }
+                }
+                self.changed();
             }
 
             egui::ComboBox::from_label("Provider")

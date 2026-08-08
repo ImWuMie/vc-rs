@@ -108,9 +108,10 @@ pwsh .\download-models.ps1
 1. **Models** — 通过 **Browse** 指定 RVC 模型、嵌入(ContentVec)、F0(RMVPE)的
    各个 `.onnx`。
 2. **Model pool (live switch)** — 点击 **Add model…** 把额外的 RVC 模型加入
-   实时切换池。模型在**后台加载**(列表实时显示加载进度),加载完成后点
-   **Switch** 即可在运行中**实时切换模型,无需重启**。添加过的模型与最后激活的
-   模型会持久化,下次启动后自动恢复。
+   实时切换池(仅登记,不立即加载)。点 **Switch** 时目标模型才**后台加载**并自动
+   激活(列表实时显示加载进度);已加载的模型直接实时切换,无需重启。池列表持久化,
+   下次启动保留,但**启动时不自动加载**(懒加载)——用到哪个才加载哪个。每行
+   **✕** 可从池中移除模型。
 3. **Provider** — 选择后端(windowsml 版:`windowsml` / `windowsml-directml` /
    `windowsml-nvtrtx` / `windowsml-cpu` / `cpu`;tensorrt 版:`tensorrt`)。也可选择
    **GPU Priority** 和用于 CUDA / TensorRT 的 **GPU Device ID**。
