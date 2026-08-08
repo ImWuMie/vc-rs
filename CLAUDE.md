@@ -87,10 +87,17 @@ and error at open time when unavailable on the platform/build — keep them
 un-gated so frontend match arms and value-enums stay stable across targets.
 
 Front-end defaults: `vc-app`, `vc-cli`, and `vc-gui` default to
-`["windowsml","tensorrt"]` (one dev binary covers both; the CLI's default
-provider falls back to `cpu`). `vc-vst3` defaults to `["windowsml"]`.
+`["tensorrt","rnnoise","gtcrn"]`. `vc-vst3` defaults to `["windowsml"]`.
 Distribution packages build single-provider variants with `--no-default-features
 --features windowsml|tensorrt`.
+
+> ⚠️ **Windows ML is OFF by default.** The default feature set has no
+> `windowsml`: a plain `cargo build` / `cargo test` gives you native TensorRT
+> (plus RNNoise/GTCRN), not Windows ML. Opt in with `--features windowsml`, or
+> `--no-default-features --features windowsml` for a Windows-ML-only package.
+> Selecting a `windowsml*` provider on a build without the feature fails at
+> runtime with an explicit "rebuild … with the `windowsml` feature" hint. The
+> CLI's default provider falls back to `cpu` when TensorRT is unavailable.
 
 > ⚠️ Build the plugin **package-scoped**: `cargo xtask bundle vc-vst3 …`, not
 > `cargo build --workspace`. A whole-workspace build unifies features and would
