@@ -1,0 +1,157 @@
+"""Export one trained RVC generator checkpoint without using pickle globals.
+
+This script is embedded in vc-rs and written to a temporary file by
+`export-pth`. It intentionally imports the architecture from the explicitly
+trusted local RVC installation rather than vendoring any upstream code or
+weights into this project.
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+import onnx
+import torch
+from torch import nn
+
+from infer.lib.infer_pack.models import (
+    SynthesizerTrnMs256NSFsid,
+    SynthesizerTrnMs768NSFsid,
+)
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def load_checkpoint(path):
+    # RVC's compact target-voice checkpoints are tensor dictionaries. Loading
+    # only weights avoids pickle global execution from untrusted checkpoints.
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError as error:
+        fail(
+            "the selected Python/PyTorch does not support weights_only=True; "
+            "use PyTorch 2.0 or newer instead of falling back to unsafe pickle loading"
+        )
+    if not isinstance(checkpoint, dict):
+        fail("expected a trained RVC checkpoint dictionary")
+    required = {"config", "weight", "version", "f0", "sr"}
+    missing = sorted(required.difference(checkpoint))
+    if missing:
+        keys = ", ".join(sorted(str(key) for key in checkpoint.keys()))
+        fail(
+            "this is not an exported target-voice RVC generator checkpoint; "
+            f"missing {', '.join(missing)} (available keys: {keys}). "
+            "Training base checkpoints such as f0G/f0D are only training initialization weights; "
+            "train a voice first and export its compact assets/weights/*.pth file."
+        )
+    if not checkpoint["f0"]:
+        fail("only F0-guided RVC generator checkpoints are supported")
+    if checkpoint["version"] not in ("v1", "v2"):
+        fail(f"unsupported RVC checkpoint version: {checkpoint['version']!r}")
+    if not isinstance(checkpoint["config"], (list, tuple)) or len(checkpoint["config"]) != 18:
+        fail("RVC checkpoint config must contain the standard 18 generator fields")
+    if not isinstance(checkpoint["weight"], dict):
+        fail("RVC checkpoint weight field is not a tensor dictionary")
+    return checkpoint
+
+
+class GeneratorExport(nn.Module):
+    """Expose RVC's normal infer path as the five-input vc-rs ONNX contract.
+
+    `models_onnx` exposes latent noise as an input and, with current PyTorch,
+    produces an attention graph whose dynamic reshape is invalid at non-example
+    frame counts. The normal RVC inference graph samples that noise internally,
+    which matches the VCClient-style exports accepted by all vc-rs backends.
+    """
+
+    def __init__(self, generator):
+        super().__init__()
+        self.generator = generator
+
+    def forward(self, feats, p_len, pitch, pitchf, sid):
+        audio, _, _ = self.generator.infer(feats, p_len, pitch, pitchf, sid)
+        return audio
+
+
+def export(model_path, output_path):
+    checkpoint = load_checkpoint(model_path)
+    weights = checkpoint["weight"]
+    embedding = weights.get("emb_g.weight")
+    if embedding is None or embedding.ndim != 2 or embedding.shape[0] < 1:
+        fail("RVC checkpoint has no valid emb_g.weight speaker embedding")
+
+    config = list(checkpoint["config"])
+    # The compact checkpoint's embedding tensor is authoritative; RVC's own
+    # exporter makes the same adjustment for models trained with a custom count.
+    config[-3] = int(embedding.shape[0])
+    version = checkpoint["version"]
+    feature_channels = 256 if version == "v1" else 768
+
+    torch.manual_seed(0)
+    generator_type = (
+        SynthesizerTrnMs256NSFsid if version == "v1" else SynthesizerTrnMs768NSFsid
+    )
+    generator = generator_type(*config, is_half=False)
+    generator.load_state_dict(weights, strict=False)
+    generator.eval()
+    model = GeneratorExport(generator).eval()
+
+    frames = 200
+    feats = torch.rand(1, frames, feature_channels)
+    p_len = torch.tensor([frames], dtype=torch.long)
+    pitch = torch.randint(low=5, high=255, size=(1, frames), dtype=torch.long)
+    pitchf = torch.rand(1, frames)
+    speaker = torch.zeros(1, dtype=torch.long)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        model,
+        (feats, p_len, pitch, pitchf, speaker),
+        output_path,
+        dynamic_axes={"feats": [1], "pitch": [1], "pitchf": [1]},
+        # The legacy exporter emits invalid dynamic attention reshapes without
+        # folding. Keep this enabled: it is required for frame lengths other
+        # than the 200-frame tracing example and produces the compact graph
+        # accepted by both ONNX Runtime and TensorRT.
+        do_constant_folding=True,
+        opset_version=20,
+        verbose=False,
+        input_names=["feats", "p_len", "pitch", "pitchf", "sid"],
+        output_names=["audio"],
+    )
+
+    # Preserve the source model's F0/sample-rate facts so vc-rs can size the
+    # shared streaming pipeline correctly for 32/40/48 kHz exports.
+    graph = onnx.load_model(output_path)
+    metadata = {entry.key: entry.value for entry in graph.metadata_props}
+    sample_rate = {"32k": 32000, "40k": 40000, "48k": 48000}.get(
+        checkpoint["sr"], checkpoint["sr"]
+    )
+    try:
+        sample_rate = int(sample_rate)
+    except (TypeError, ValueError):
+        fail(f"unsupported RVC checkpoint sample rate: {checkpoint['sr']!r}")
+    metadata["metadata"] = json.dumps(
+        {"f0": 1, "samplingRate": sample_rate}, separators=(",", ":")
+    )
+    del graph.metadata_props[:]
+    for key, value in metadata.items():
+        entry = graph.metadata_props.add()
+        entry.key = key
+        entry.value = value
+    onnx.checker.check_model(graph)
+    onnx.save_model(graph, output_path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    arguments = parser.parse_args()
+    export(arguments.model, arguments.output)
+
+
+if __name__ == "__main__":
+    main()

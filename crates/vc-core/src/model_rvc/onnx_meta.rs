@@ -31,6 +31,12 @@ pub(super) struct TensorInfo {
     pub(super) dims: Vec<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct InitializerInfo {
+    pub(super) name: String,
+    pub(super) dims: Vec<i64>,
+}
+
 impl TensorInfo {
     /// Final axis when it is a statically known positive size (channel count),
     /// mirroring the ORT-based `shape.last().filter(|c| *c > 0)` behaviour.
@@ -53,6 +59,7 @@ impl TensorInfo {
 pub(super) struct ModelIo {
     pub(super) inputs: Vec<TensorInfo>,
     pub(super) outputs: Vec<TensorInfo>,
+    pub(super) initializers: Vec<InitializerInfo>,
     pub(super) metadata: Vec<(String, String)>,
 }
 
@@ -277,6 +284,25 @@ impl ModelIo {
         digits.parse::<u32>().ok().filter(|rate| *rate > 0)
     }
 
+    /// Number of speaker embeddings compiled into an RVC generator.
+    ///
+    /// RVC exporters keep the first dimension of `emb_g.weight` equal to the
+    /// checkpoint's `spk_embed_dim` (109 for the stock v2 base, 308 for the
+    /// MXGF f0-48k base). This is a load-time structural query: raw initializer
+    /// data is skipped by the protobuf reader and never enters the audio path.
+    pub(super) fn rvc_speaker_count(&self) -> Option<usize> {
+        self.initializers
+            .iter()
+            .find(|initializer| {
+                initializer.name == "emb_g.weight"
+                    || initializer.name.ends_with("/emb_g.weight")
+                    || initializer.name.ends_with(".emb_g.weight")
+            })
+            .and_then(|initializer| initializer.dims.first().copied())
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| *count > 0)
+    }
+
     /// Pick the embedder output matching `expected_channels`, honouring an
     /// explicit `requested_output` and the unit12/unit9 preference for
     /// 768/256-channel ContentVec exports.
@@ -477,6 +503,13 @@ fn parse_model(bytes: &[u8]) -> Result<ModelIo> {
 
 fn parse_graph(bytes: &[u8], io: &mut ModelIo) -> Result<()> {
     for_each_field(bytes, |field, wire, reader| match (field, wire) {
+        // GraphProto.initializer. Parse only dimensions and name; TensorProto's
+        // potentially huge raw_data field is skipped without copying.
+        (5, 2) => {
+            io.initializers
+                .push(parse_initializer(reader.read_len_prefixed()?)?);
+            Ok(true)
+        }
         (11, 2) => {
             io.inputs
                 .push(parse_value_info(reader.read_len_prefixed()?)?);
@@ -489,6 +522,31 @@ fn parse_graph(bytes: &[u8], io: &mut ModelIo) -> Result<()> {
         }
         _ => Ok(false),
     })
+}
+
+fn parse_initializer(bytes: &[u8]) -> Result<InitializerInfo> {
+    let mut name = String::new();
+    let mut dims = Vec::new();
+    for_each_field(bytes, |field, wire, reader| match (field, wire) {
+        // TensorProto.dims may use the unpacked or packed representation.
+        (1, 0) => {
+            dims.push(reader.read_varint()? as i64);
+            Ok(true)
+        }
+        (1, 2) => {
+            let mut packed = Reader::new(reader.read_len_prefixed()?);
+            while !packed.eof() {
+                dims.push(packed.read_varint()? as i64);
+            }
+            Ok(true)
+        }
+        (8, 2) => {
+            name = read_utf8(reader.read_len_prefixed()?, "initializer name")?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    })?;
+    Ok(InitializerInfo { name, dims })
 }
 
 fn parse_value_info(bytes: &[u8]) -> Result<TensorInfo> {
@@ -661,6 +719,19 @@ mod tests {
         out
     }
 
+    fn initializer(name: &str, dims: &[i64]) -> Vec<u8> {
+        let mut packed_dims = Vec::new();
+        for &dim in dims {
+            varint(dim as u64, &mut packed_dims);
+        }
+        let mut out = Vec::new();
+        len_delimited(1, &packed_dims, &mut out);
+        len_delimited(8, name.as_bytes(), &mut out);
+        // A representative raw_data payload must be skipped, not interpreted.
+        len_delimited(10, &[1, 2, 3, 4], &mut out);
+        out
+    }
+
     fn string_entry(key: &str, value: &str) -> Vec<u8> {
         let mut out = Vec::new();
         len_delimited(1, key.as_bytes(), &mut out);
@@ -672,6 +743,7 @@ mod tests {
     fn parses_inputs_outputs_metadata_and_skips_unknown_fields() {
         // GraphProto with two inputs and one output.
         let mut graph = Vec::new();
+        len_delimited(5, &initializer("emb_g.weight", &[308, 256]), &mut graph);
         len_delimited(11, &value_info("feats", 1, &[1, 100, 768]), &mut graph);
         len_delimited(11, &value_info("sid", 7, &[1]), &mut graph);
         len_delimited(12, &value_info("audio", 1, &[1, 65536]), &mut graph);
@@ -690,6 +762,7 @@ mod tests {
         assert_eq!(io.input("feats").unwrap().last_dim_channels(), Some(768));
         assert_eq!(io.input("sid").unwrap().dims, vec![1]);
         assert_eq!(io.output("audio").unwrap().name, "audio");
+        assert_eq!(io.rvc_speaker_count(), Some(308));
         assert!(io
             .metadata_value("metadata")
             .unwrap()
@@ -714,6 +787,7 @@ mod tests {
                     dims: vec![1, 0],
                 })
                 .collect(),
+            initializers: Vec::new(),
             metadata: Vec::new(),
         }
     }

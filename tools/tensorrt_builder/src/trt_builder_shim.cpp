@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -237,6 +238,36 @@ bool cuda_ok(cudaError_t status, Message& msg, char const* what) {
     return false;
 }
 
+bool path_from_utf16(uint16_t const* raw, std::filesystem::path& path, Message& msg, char const* label) {
+    if (raw == nullptr || raw[0] == 0) {
+        msg.append("%s path is empty\n", label);
+        return false;
+    }
+    // Rust passes filesystem paths as UTF-16. This avoids both the Windows ANSI
+    // code page and TensorRT's narrow `parseFromFile` path boundary, so Chinese
+    // model/cache directories work regardless of the user's system locale.
+    std::u16string text;
+    for (auto const* current = raw; *current != 0; ++current) {
+        text.push_back(static_cast<char16_t>(*current));
+    }
+    path = std::filesystem::path(std::move(text));
+    return true;
+}
+
+bool read_file(std::filesystem::path const& path, std::vector<char>& data, Message& msg, char const* label) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        msg.append("failed to open %s\n", label);
+        return false;
+    }
+    data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    if (data.empty()) {
+        msg.append("%s is empty\n", label);
+        return false;
+    }
+    return true;
+}
+
 bool upload_dummy_input(
     char const* name,
     nvinfer1::DataType dtype,
@@ -274,10 +305,10 @@ bool upload_dummy_input(
 } // namespace
 
 extern "C" int trt_build_engine(
-    char const* onnx_path,
-    char const* engine_path,
+    uint16_t const* onnx_path,
+    uint16_t const* engine_path,
     char const* profile_shapes,
-    char const* timing_cache_path,
+    uint16_t const* timing_cache_path,
     int32_t gpu_device_id,
     char* message,
     std::size_t message_len
@@ -298,6 +329,21 @@ extern "C" int trt_build_engine(
 
     std::map<std::string, nvinfer1::Dims> profile;
     if (!parse_profile_shapes(profile_shapes, profile, msg)) {
+        return 1;
+    }
+    std::filesystem::path onnx_file;
+    std::filesystem::path engine_file;
+    if (!path_from_utf16(onnx_path, onnx_file, msg, "ONNX model")
+        || !path_from_utf16(engine_path, engine_file, msg, "TensorRT engine")) {
+        return 1;
+    }
+    std::filesystem::path timing_cache_file;
+    bool const use_timing_cache = timing_cache_path != nullptr && timing_cache_path[0] != 0;
+    if (use_timing_cache && !path_from_utf16(timing_cache_path, timing_cache_file, msg, "TensorRT timing cache")) {
+        return 1;
+    }
+    std::vector<char> onnx_blob;
+    if (!read_file(onnx_file, onnx_blob, msg, "ONNX model")) {
         return 1;
     }
 
@@ -332,8 +378,11 @@ extern "C" int trt_build_engine(
         msg.append("createParser failed\n");
         return 1;
     }
-    if (!parser->parseFromFile(onnx_path, static_cast<int32_t>(nvinfer1::ILogger::Severity::kWARNING))) {
-        msg.append("ONNX parser failed for %s\n", onnx_path);
+    // Parse serialized bytes after opening the model via the UTF-16-aware
+    // filesystem layer. RVC exports embed their weights, so no narrow external
+    // tensor-data path is required here.
+    if (!parser->parse(onnx_blob.data(), onnx_blob.size())) {
+        msg.append("ONNX parser failed\n");
         for (int32_t i = 0; i < parser->getNbErrors(); ++i) {
             auto const* err = parser->getError(i);
             if (err != nullptr) {
@@ -368,15 +417,12 @@ extern "C" int trt_build_engine(
     // only speeds up the build; the resulting engine is identical. A blob built
     // for a different GPU / TensorRT version fails the header check and is safely
     // ignored (we then start from an empty cache and rewrite it).
-    bool const use_timing_cache = timing_cache_path != nullptr && timing_cache_path[0] != '\0';
     std::unique_ptr<nvinfer1::ITimingCache, TrtDeleter<nvinfer1::ITimingCache>> timing_cache;
     if (use_timing_cache) {
         std::vector<char> blob;
-        {
-            std::ifstream cache_file(timing_cache_path, std::ios::binary);
-            if (cache_file) {
-                blob.assign(std::istreambuf_iterator<char>(cache_file), std::istreambuf_iterator<char>());
-            }
+        std::ifstream cache_file(timing_cache_file, std::ios::binary);
+        if (cache_file) {
+            blob.assign(std::istreambuf_iterator<char>(cache_file), std::istreambuf_iterator<char>());
         }
         timing_cache.reset(config->createTimingCache(blob.data(), blob.size()));
         if (timing_cache && !config->setTimingCache(*timing_cache, false)) {
@@ -425,7 +471,7 @@ extern "C" int trt_build_engine(
 
     std::unique_ptr<nvinfer1::IHostMemory, TrtDeleter<nvinfer1::IHostMemory>> plan(builder->buildSerializedNetwork(*network, *config));
     if (!plan) {
-        msg.append("buildSerializedNetwork failed for %s\n", onnx_path);
+        msg.append("buildSerializedNetwork failed\n");
         return 1;
     }
     // Write back the timing cache (now populated by the build) for the next run.
@@ -433,31 +479,31 @@ extern "C" int trt_build_engine(
     if (use_timing_cache && timing_cache) {
         std::unique_ptr<nvinfer1::IHostMemory, TrtDeleter<nvinfer1::IHostMemory>> cache_blob(timing_cache->serialize());
         if (cache_blob) {
-            std::ofstream cache_out(timing_cache_path, std::ios::binary | std::ios::trunc);
+            std::ofstream cache_out(timing_cache_file, std::ios::binary | std::ios::trunc);
             if (cache_out) {
                 cache_out.write(static_cast<char const*>(cache_blob->data()), static_cast<std::streamsize>(cache_blob->size()));
             }
             if (!cache_out) {
-                msg.append("warning: failed to write timing cache %s\n", timing_cache_path);
+                msg.append("warning: failed to write timing cache\n");
             }
         }
     }
-    std::ofstream file(engine_path, std::ios::binary);
+    std::ofstream file(engine_file, std::ios::binary);
     if (!file) {
-        msg.append("failed to create TensorRT engine: %s\n", engine_path);
+        msg.append("failed to create TensorRT engine\n");
         return 1;
     }
     file.write(static_cast<char const*>(plan->data()), static_cast<std::streamsize>(plan->size()));
     if (!file) {
-        msg.append("failed to write TensorRT engine: %s\n", engine_path);
+        msg.append("failed to write TensorRT engine\n");
         return 1;
     }
-    msg.append("built probe TensorRT engine model=%s engine=%s profile=%s bytes=%zu\n", onnx_path, engine_path, profile_shapes, plan->size());
+    msg.append("built TensorRT engine profile=%s bytes=%zu\n", profile_shapes, plan->size());
     return 0;
 }
 
 extern "C" int trt_run_engine(
-    char const* engine_path,
+    uint16_t const* engine_path,
     int32_t frames,
     int32_t channels,
     char* message,
@@ -476,14 +522,12 @@ extern "C" int trt_run_engine(
         return 2;
     }
 
-    std::ifstream file(engine_path, std::ios::binary);
-    if (!file) {
-        msg.append("failed to open engine: %s\n", engine_path);
+    std::filesystem::path engine_file;
+    if (!path_from_utf16(engine_path, engine_file, msg, "TensorRT engine")) {
         return 2;
     }
-    std::vector<char> plan((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    if (plan.empty()) {
-        msg.append("engine file is empty: %s\n", engine_path);
+    std::vector<char> plan;
+    if (!read_file(engine_file, plan, msg, "TensorRT engine")) {
         return 2;
     }
 
@@ -520,7 +564,7 @@ extern "C" int trt_run_engine(
     int32_t const nb_io = engine->getNbIOTensors();
     std::vector<DeviceBuffer> buffers(static_cast<std::size_t>(nb_io));
 
-    msg.append("loaded engine: %s\n", engine_path);
+    msg.append("loaded TensorRT engine\n");
     msg.append("io tensors: %d\n", nb_io);
 
     for (int32_t i = 0; i < nb_io; ++i) {

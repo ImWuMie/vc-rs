@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use vc_core::model_rvc::DEFAULT_F0_THRESHOLD;
 
 use vc_core::validation::{
     validate_conversion_timing, validate_finite_f32, validate_non_negative_f32,
@@ -69,6 +70,9 @@ pub enum Command {
     Devices(DevicesArgs),
     /// Inspect ONNX model inputs, outputs, and metadata.
     Inspect(InspectArgs),
+    /// Export a trained, trusted RVC .pth generator checkpoint to ONNX.
+    #[command(name = "export-pth", alias = "pth-export")]
+    ExportPth(ExportPthArgs),
     /// List or install Windows ML catalog execution providers.
     #[cfg(all(windows, feature = "windowsml"))]
     #[command(name = "windowsml-eps", alias = "windows-ml-eps", alias = "winml-eps")]
@@ -281,8 +285,15 @@ pub struct RunArgs {
     pub speaker_id: i64,
     #[arg(long, default_value_t = 0.0)]
     pub pitch_shift: f32,
-    #[arg(long, default_value_t = 0.3)]
+    #[arg(long, default_value_t = DEFAULT_F0_THRESHOLD)]
     pub f0_threshold: f32,
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        help = "Interpolate internal RMVPE pitch dropouts (true/false)"
+    )]
+    pub f0_continuity: bool,
     #[arg(long, default_value_t = DEFAULT_INPUT_GAIN)]
     pub input_gain: f32,
     #[arg(long, default_value_t = DEFAULT_OUTPUT_GAIN)]
@@ -370,8 +381,15 @@ pub struct WavArgs {
     pub speaker_id: i64,
     #[arg(long, default_value_t = 0.0)]
     pub pitch_shift: f32,
-    #[arg(long, default_value_t = 0.3)]
+    #[arg(long, default_value_t = DEFAULT_F0_THRESHOLD)]
     pub f0_threshold: f32,
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        help = "Interpolate internal RMVPE pitch dropouts (true/false)"
+    )]
+    pub f0_continuity: bool,
     #[arg(long, default_value_t = DEFAULT_INPUT_GAIN)]
     pub input_gain: f32,
     #[arg(long, default_value_t = DEFAULT_OUTPUT_GAIN)]
@@ -430,6 +448,26 @@ pub struct WavArgs {
 pub struct InspectArgs {
     #[arg(long)]
     pub model: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub struct ExportPthArgs {
+    /// A trained RVC generator checkpoint. Training base checkpoints (f0G/f0D)
+    /// are rejected because they do not contain a target voice model.
+    #[arg(long, value_name = "PTH")]
+    pub model: PathBuf,
+    /// Destination ONNX model. The command refuses to overwrite an existing file.
+    #[arg(long, value_name = "ONNX")]
+    pub output: PathBuf,
+    /// Root of a compatible RVC installation containing infer/lib/infer_pack/models_onnx.py.
+    #[arg(long, value_name = "DIR")]
+    pub rvc_root: PathBuf,
+    /// Python executable from that RVC installation.
+    #[arg(long, value_name = "PYTHON")]
+    pub python: PathBuf,
+    /// Required acknowledgement: importing a local RVC installation executes its Python model definitions.
+    #[arg(long)]
+    pub trust_rvc_root: bool,
 }
 
 #[cfg(all(windows, feature = "windowsml"))]
@@ -681,6 +719,8 @@ mod tests {
         assert!(!args.wasapi_output_exclusive());
         assert_eq!(args.wasapi_buffer_ms, DEFAULT_WASAPI_BUFFER_MS);
         assert_eq!(args.rms_mix_rate, 0.0);
+        assert_eq!(args.f0_threshold, DEFAULT_F0_THRESHOLD);
+        assert!(args.f0_continuity);
         assert_eq!(args.smoother, Smoother::Sola);
         assert_eq!(
             args.rvc_output_tail_discard_ms,
@@ -919,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn wav_defaults_to_cpu_provider() {
+    fn wav_defaults_to_build_provider_and_continuous_f0() {
         let cli = Cli::try_parse_from([
             "vc-rs",
             "wav",
@@ -939,7 +979,42 @@ mod tests {
             panic!("expected wav command");
         };
 
-        assert_eq!(args.provider, Provider::Cpu);
+        assert_eq!(args.provider, default_provider());
+        assert_eq!(args.f0_threshold, DEFAULT_F0_THRESHOLD);
+        assert!(args.f0_continuity);
+    }
+
+    #[test]
+    fn parses_disabled_f0_continuity_for_rvc_commands() {
+        let run =
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--f0-continuity", "false"])
+                .unwrap();
+        let Command::Run(run) = run.command else {
+            panic!("expected run command");
+        };
+        assert!(!run.f0_continuity);
+
+        let wav = Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-model",
+            "f0.onnx",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+            "--f0-continuity",
+            "false",
+        ])
+        .unwrap();
+        let Command::Wav(wav) = wav.command else {
+            panic!("expected wav command");
+        };
+        assert!(!wav.f0_continuity);
     }
 
     #[test]
@@ -949,6 +1024,30 @@ mod tests {
             panic!("expected inspect command");
         };
         assert_eq!(args.model, PathBuf::from("model.onnx"));
+    }
+
+    #[test]
+    fn parses_pth_export_with_explicit_trust_boundary() {
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "export-pth",
+            "--model",
+            "voice.pth",
+            "--output",
+            "voice.onnx",
+            "--rvc-root",
+            "rvc-webui",
+            "--python",
+            "rvc-webui/runtime/python.exe",
+            "--trust-rvc-root",
+        ])
+        .unwrap();
+        let Command::ExportPth(args) = cli.command else {
+            panic!("expected export-pth command");
+        };
+        assert_eq!(args.model, PathBuf::from("voice.pth"));
+        assert_eq!(args.output, PathBuf::from("voice.onnx"));
+        assert!(args.trust_rvc_root);
     }
 
     #[test]

@@ -7,16 +7,16 @@ use std::{
 
 unsafe extern "C" {
     fn trt_build_engine(
-        onnx_path: *const c_char,
-        engine_path: *const c_char,
+        onnx_path: *const u16,
+        engine_path: *const u16,
         profile_shapes: *const c_char,
-        timing_cache_path: *const c_char,
+        timing_cache_path: *const u16,
         gpu_device_id: c_int,
         message: *mut c_char,
         message_len: usize,
     ) -> c_int;
     fn trt_run_engine(
-        engine_path: *const c_char,
+        engine_path: *const u16,
         frames: c_int,
         channels: c_int,
         message: *mut c_char,
@@ -45,14 +45,24 @@ enum Mode {
     },
 }
 
-fn cstring_path(path: &PathBuf, label: &str) -> CString {
-    match CString::new(path.to_string_lossy().as_bytes()) {
-        Ok(path) => path,
-        Err(_) => {
-            eprintln!("{label} contains an interior NUL byte");
-            std::process::exit(2);
-        }
+fn utf16_path(path: &PathBuf, label: &str) -> Vec<u16> {
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt;
+
+    #[cfg(windows)]
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    #[cfg(not(windows))]
+    let mut wide = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    if wide.contains(&0) {
+        eprintln!("{label} contains an interior NUL character");
+        std::process::exit(2);
     }
+    wide.push(0);
+    wide
 }
 
 fn cstring_text(value: &str, label: &str) -> CString {
@@ -91,12 +101,12 @@ fn main() {
             timing_cache,
             gpu_device_id,
         } => {
-            let onnx = cstring_path(&onnx, "onnx path");
-            let save_engine = cstring_path(&save_engine, "engine path");
+            let onnx = utf16_path(&onnx, "onnx path");
+            let save_engine = utf16_path(&save_engine, "engine path");
             let profile = cstring_text(&profile, "profile");
             let timing_cache = timing_cache
                 .as_ref()
-                .map(|path| cstring_path(path, "timing cache path"));
+                .map(|path| utf16_path(path, "timing cache path"));
             let timing_cache_ptr = timing_cache
                 .as_ref()
                 .map_or(std::ptr::null(), |value| value.as_ptr());
@@ -117,7 +127,7 @@ fn main() {
             frames,
             channels,
         } => {
-            let engine = cstring_path(&engine, "engine path");
+            let engine = utf16_path(&engine, "engine path");
             unsafe {
                 trt_run_engine(
                     engine.as_ptr(),

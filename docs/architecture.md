@@ -132,7 +132,7 @@ flowchart TD
     resample --> embed["Content embedder"]
     resample --> f0["F0 estimator"]
     embed --> feats["Content feature 2x upsampling"]
-    f0 --> pitchf["Continuous F0 alignment"]
+    f0 --> pitchf["Continuous F0 alignment<br/>+ optional internal-gap interpolation"]
     pitchf --> coarse["Coarse pitch bins"]
     feats --> rvc["RVC generator"]
     pitchf --> rvc
@@ -178,6 +178,12 @@ generation. F0 is then length-matched to the resulting feature frame count and
 kept both as continuous `pitchf` and quantized coarse pitch. Misaligning these
 streams usually sounds like timing drift, pitch lag, or unstable consonants, so
 frame-grid changes should be treated as audio-quality changes, not cleanup.
+
+The default RMVPE confidence threshold is 0.03. Optional F0 continuity runs
+after alignment on the worker and linearly interpolates only zero runs bounded
+by voiced frames; leading/trailing runs stay unvoiced to avoid extrapolating a
+breath or consonant beyond the known streaming window. Coarse pitch is derived
+from the resulting continuous F0 so the generator inputs remain consistent.
 
 After generation, the output may be shaped by volume envelope, RMS mixing, and
 manual or automatic gain. These operations happen before chunk joining so the

@@ -364,6 +364,10 @@ pub struct EngineStatusSnapshot {
     pub monitor_device: String,
     pub monitor_sample_rate: u32,
     pub passthrough_live_switchable: bool,
+    /// Speaker IDs accepted by the currently active RVC model. `None` means
+    /// passthrough/no model or an exporter without a discoverable embedding
+    /// initializer.
+    pub speaker_count: Option<usize>,
     // Multi-model pool state: the active model's display name and the per-slot
     // load status (base model at slot 0, then any models added live).
     pub active_model: Option<String>,
@@ -407,6 +411,10 @@ pub struct DeviceList {
 pub struct TelemetrySnapshot {
     pub chunks: u64,
     pub inference_us: u64,
+    pub embedder_us: u64,
+    pub pitch_us: u64,
+    pub rvc_us: u64,
+    pub f0_voiced_ratio: f32,
     pub input_rms: f32,
     pub output_rms: f32,
     pub input_overruns: u64,
@@ -421,6 +429,10 @@ pub struct TelemetrySnapshot {
 struct Telemetry {
     chunks: AtomicU64,
     inference_us: AtomicU64,
+    embedder_us: AtomicU64,
+    pitch_us: AtomicU64,
+    rvc_us: AtomicU64,
+    f0_voiced_ratio_bits: AtomicU32,
     input_rms_bits: AtomicU32,
     output_rms_bits: AtomicU32,
     input_overruns: AtomicU64,
@@ -435,6 +447,10 @@ impl Telemetry {
     fn reset(&self) {
         self.chunks.store(0, Ordering::Relaxed);
         self.inference_us.store(0, Ordering::Relaxed);
+        self.embedder_us.store(0, Ordering::Relaxed);
+        self.pitch_us.store(0, Ordering::Relaxed);
+        self.rvc_us.store(0, Ordering::Relaxed);
+        self.f0_voiced_ratio_bits.store(0, Ordering::Relaxed);
         self.input_rms_bits.store(0, Ordering::Relaxed);
         self.output_rms_bits.store(0, Ordering::Relaxed);
         self.input_overruns.store(0, Ordering::Relaxed);
@@ -449,6 +465,10 @@ impl Telemetry {
         TelemetrySnapshot {
             chunks: self.chunks.load(Ordering::Relaxed),
             inference_us: self.inference_us.load(Ordering::Relaxed),
+            embedder_us: self.embedder_us.load(Ordering::Relaxed),
+            pitch_us: self.pitch_us.load(Ordering::Relaxed),
+            rvc_us: self.rvc_us.load(Ordering::Relaxed),
+            f0_voiced_ratio: f32::from_bits(self.f0_voiced_ratio_bits.load(Ordering::Relaxed)),
             input_rms: f32::from_bits(self.input_rms_bits.load(Ordering::Relaxed)),
             output_rms: f32::from_bits(self.output_rms_bits.load(Ordering::Relaxed)),
             input_overruns: self.input_overruns.load(Ordering::Relaxed),
@@ -1600,9 +1620,14 @@ impl PassthroughProcessor {
         Ok(ChunkStats {
             silent: false,
             inference_time: Duration::ZERO,
+            embedder_time: Duration::ZERO,
+            pitch_time: Duration::ZERO,
+            rvc_time: Duration::ZERO,
             input_rms,
             output_rms: dsp::rms(prepared),
             model_output_samples: prepared.len(),
+            voiced_ratio: 0.0,
+            pitch_frames: 0,
         })
     }
 }
@@ -1794,6 +1819,16 @@ impl RuntimeModel {
             Self::PassthroughOnly(_) => None,
             Self::Switchable { name, .. } => Some(name.clone()),
             Self::Pool { names, active, .. } => names.get(*active).cloned(),
+        }
+    }
+
+    fn active_speaker_count(&mut self) -> Option<usize> {
+        match self {
+            Self::PassthroughOnly(_) => None,
+            Self::Switchable { rvc, .. } => rvc.model_mut().speaker_count(),
+            Self::Pool { models, active, .. } => models
+                .get_mut(*active)
+                .and_then(|model| model.model_mut().speaker_count()),
         }
     }
 
@@ -2031,7 +2066,7 @@ impl RealtimeSession {
             &current_live,
         )?;
         let passthrough_live_switchable = config.has_complete_model_set();
-        let model = if passthrough_live_switchable {
+        let mut model = if passthrough_live_switchable {
             let report_progress = |progress| {
                 set_status(
                     status,
@@ -2077,6 +2112,7 @@ impl RealtimeSession {
             RuntimeModel::PassthroughOnly(passthrough_processor)
         };
 
+        let speaker_count = model.active_speaker_count();
         let output_capacity = output_chunk * OUTPUT_QUEUE_CHUNKS;
         let input_capacity = input_chunk * INPUT_QUEUE_CHUNKS;
         let running = Arc::new(AtomicBool::new(true));
@@ -2180,6 +2216,7 @@ impl RealtimeSession {
                                             entry.pool_index = Some(model.model_count() - 1);
                                         }
                                         st.active_model = model.active_model_name();
+                                        st.speaker_count = model.active_speaker_count();
                                         if was_passthrough_only {
                                             st.passthrough_live_switchable = true;
                                         }
@@ -2187,6 +2224,16 @@ impl RealtimeSession {
                                 }
                                 WorkerCommand::RemoveModel { slot } => {
                                     model = model.remove_model(slot);
+                                    // Removing the active pool slot may fall back to a
+                                    // model with a different embedding table (for example
+                                    // MXGF 308-speaker -> stock 109-speaker). Publish the
+                                    // new range with the active model name atomically from
+                                    // the worker so GUI/host automation cannot use stale
+                                    // bounds after a pool edit.
+                                    if let Ok(mut st) = worker_status.lock() {
+                                        st.active_model = model.active_model_name();
+                                        st.speaker_count = model.active_speaker_count();
+                                    }
                                 }
                                 WorkerCommand::SetDenoiser { mode } => {
                                     let live_params = live.load();
@@ -2248,12 +2295,25 @@ impl RealtimeSession {
                             last_active_slot = requested;
                             if let Ok(mut st) = worker_status.lock() {
                                 st.active_model = model.active_model_name();
+                                st.speaker_count = model.active_speaker_count();
                             }
                         }
                         worker_telemetry.chunks.fetch_add(1, Ordering::Relaxed);
                         worker_telemetry
                             .inference_us
                             .store(stats.inference_time.as_micros() as u64, Ordering::Relaxed);
+                        worker_telemetry
+                            .embedder_us
+                            .store(stats.embedder_time.as_micros() as u64, Ordering::Relaxed);
+                        worker_telemetry
+                            .pitch_us
+                            .store(stats.pitch_time.as_micros() as u64, Ordering::Relaxed);
+                        worker_telemetry
+                            .rvc_us
+                            .store(stats.rvc_time.as_micros() as u64, Ordering::Relaxed);
+                        worker_telemetry
+                            .f0_voiced_ratio_bits
+                            .store(stats.voiced_ratio.to_bits(), Ordering::Relaxed);
                         worker_telemetry
                             .input_rms_bits
                             .store(stats.input_rms.to_bits(), Ordering::Relaxed);
@@ -2364,6 +2424,7 @@ impl RealtimeSession {
                     0
                 },
                 passthrough_live_switchable,
+                speaker_count,
                 active_model: if passthrough_live_switchable {
                     Some(
                         config

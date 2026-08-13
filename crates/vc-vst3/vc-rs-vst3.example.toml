@@ -42,7 +42,8 @@ gpu_device_id = 0
 # automatable). Set them from the plugin's controls in your DAW.
 
 # --- Detection thresholds ---
-f0_threshold = 0.3
+f0_threshold = 0.03
+f0_continuity = true
 silence_threshold = 0.0001
 
 # --- Latency / chunking (milliseconds) ---

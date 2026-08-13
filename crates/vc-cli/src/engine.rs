@@ -12,7 +12,8 @@ use vc_app::{
 use vc_core::dsp;
 use vc_core::model_rvc::{
     set_process_gpu_priority, set_process_power_throttling, ChunkConverter, ChunkOutputConfig,
-    F0Config, GpuPriority, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
+    F0Config, F0PostprocessConfig, GpuPriority, NoiseGateShaping, OutputDynamicsConfig,
+    RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
 
@@ -66,7 +67,7 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         f0: F0Config {
             f0_threshold: args.f0_threshold,
             silence_threshold: args.silence_threshold,
-            ..F0Config::default()
+            postprocess: F0PostprocessConfig::continuity(args.f0_continuity),
         },
         denoiser_mode,
         gtcrn_model_dir: args.gtcrn_model,
@@ -175,7 +176,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             f0_threshold: args.f0_threshold,
             // WAV mode treats nothing as silence so the whole clip converts.
             silence_threshold: 0.0,
-            ..F0Config::default()
+            postprocess: F0PostprocessConfig::continuity(args.f0_continuity),
         },
         input_gain: pipeline_input_gain,
         noise_gate_enabled: denoiser_mode == Denoiser::NoiseGate,
@@ -226,6 +227,12 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
 
     let mut fixed_chunk_pad = Vec::new();
     let mut chunk_out = Vec::new();
+    let mut total_inference = Duration::ZERO;
+    let mut total_embedder = Duration::ZERO;
+    let mut total_pitch = Duration::ZERO;
+    let mut total_rvc = Duration::ZERO;
+    let mut total_pitch_frames = 0usize;
+    let mut weighted_voiced_frames = 0.0f64;
     for chunk in samples.chunks(chunk_samples) {
         let model_input = wav_model_input_chunk(chunk, chunk_samples, &mut fixed_chunk_pad);
         let stats = converter.process_chunk(
@@ -235,11 +242,20 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             &mut chunk_out,
         )?;
         debug!(
-            "wav chunk={} input_samples={} output_samples={}",
+            "wav chunk={} input_samples={} output_samples={} embedder_us={} pitch_us={} rvc_us={}",
             chunks,
             chunk.len(),
-            stats.model_output_samples
+            stats.model_output_samples,
+            stats.embedder_time.as_micros(),
+            stats.pitch_time.as_micros(),
+            stats.rvc_time.as_micros(),
         );
+        total_inference += stats.inference_time;
+        total_embedder += stats.embedder_time;
+        total_pitch += stats.pitch_time;
+        total_rvc += stats.rvc_time;
+        total_pitch_frames += stats.pitch_frames;
+        weighted_voiced_frames += f64::from(stats.voiced_ratio) * stats.pitch_frames as f64;
         output.extend_from_slice(&chunk_out);
         if let Some(report) = join_report.as_mut() {
             // Record after appending so the seam against the previous chunk is in
@@ -261,11 +277,20 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
     output.resize(samples.len(), 0.0);
     write_wav_mono(&args.output, &output, spec.sample_rate)?;
     info!(
-        "wrote {} samples at {} Hz to {} (chunks={})",
+        "wrote {} samples at {} Hz to {} (chunks={}, avg_inference_ms={:.3}, avg_contentvec_ms={:.3}, avg_rmvpe_ms={:.3}, avg_rvc_ms={:.3}, f0_voiced_ratio={:.4})",
         output.len(),
         spec.sample_rate,
         args.output.display(),
-        chunks
+        chunks,
+        total_inference.as_secs_f64() * 1_000.0 / chunks.max(1) as f64,
+        total_embedder.as_secs_f64() * 1_000.0 / chunks.max(1) as f64,
+        total_pitch.as_secs_f64() * 1_000.0 / chunks.max(1) as f64,
+        total_rvc.as_secs_f64() * 1_000.0 / chunks.max(1) as f64,
+        if total_pitch_frames == 0 {
+            0.0
+        } else {
+            weighted_voiced_frames / total_pitch_frames as f64
+        }
     );
     if let (Some(report), Some(path)) = (join_report, args.join_report.as_ref()) {
         report.write_csv(path)?;

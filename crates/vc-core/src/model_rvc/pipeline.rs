@@ -25,6 +25,11 @@ use super::shape::{
     tensor_rt_model_input_samples_16k, RVC_SAMPLE_RATE,
 };
 use super::stream::RvcStreamState;
+
+/// RMVPE confidence threshold used by upstream realtime RVC and MXGF. The old
+/// vc-rs default of 0.3 discarded substantially more low-confidence voiced
+/// frames and made large upward pitch shifts sound intermittent or grainy.
+pub const DEFAULT_F0_THRESHOLD: f32 = 0.03;
 use super::tensorrt::{
     derive_rvc_feature_len, provider_uses_fixed_shape, tensor_rt_model_cache_key, ModelRole,
     TensorRtRunMode, TensorRtSessionProfile, TensorRtSessionPurpose, CUDA_GRAPH_ENV,
@@ -106,6 +111,10 @@ pub struct RvcPipeline {
     rvc: RvcModelSession,
     #[cfg(feature = "ort")]
     shared_waveform: Option<TensorRtSharedWaveform>,
+    // Derived once from the generator's `emb_g.weight` initializer. Live host
+    // automation is clamped against it before inference so an out-of-range ID
+    // cannot tear down a realtime session.
+    speaker_count: Option<usize>,
     speaker_id: i64,
     pitch_shift: f32,
     f0_threshold: f32,
@@ -216,11 +225,9 @@ impl Default for NoiseGateShaping {
 ///
 /// Same grouping rationale as [`OutputDynamicsConfig`]: these knobs travel
 /// together from every front-end through `RealtimeConfig` into
-/// `RvcPipelineConfig`. `f0_postprocess` is plumbed but inert by default
-/// (`F0PostprocessConfig::default()` has `enabled: false`); exposing it to the
-/// front-ends is a separate, behaviour-changing task. Keeping it in this struct
-/// means that wiring becomes "fill in a field" rather than threading a new knob
-/// through every boundary.
+/// `RvcPipelineConfig`. Front-ends expose the narrowly scoped continuity mode;
+/// the remaining corrective filters stay available to callers through the
+/// shared config without becoming front-end-specific conversion paths.
 #[derive(Clone, Debug)]
 pub struct F0Config {
     /// RMVPE voiced/unvoiced confidence threshold.
@@ -233,9 +240,9 @@ pub struct F0Config {
 impl Default for F0Config {
     fn default() -> Self {
         Self {
-            f0_threshold: 0.3,
+            f0_threshold: DEFAULT_F0_THRESHOLD,
             silence_threshold: 0.0001,
-            postprocess: F0PostprocessConfig::default(),
+            postprocess: F0PostprocessConfig::continuity(true),
         }
     }
 }
@@ -360,6 +367,14 @@ fn native_engine_build_progress(cached: bool, role: LoadModelRole) -> Option<Loa
     (!cached).then_some(LoadProgress::BuildingEngine { role })
 }
 
+fn normalize_speaker_id(speaker_id: i64, speaker_count: Option<usize>) -> i64 {
+    let max = speaker_count
+        .and_then(|count| count.checked_sub(1))
+        .and_then(|max| i64::try_from(max).ok())
+        .unwrap_or(i64::MAX);
+    speaker_id.clamp(0, max)
+}
+
 impl RvcPipeline {
     #[cfg(feature = "rnnoise")]
     pub fn load_with_rnnoise(config: RvcPipelineConfig<'_>) -> Result<Self> {
@@ -423,6 +438,18 @@ impl RvcPipeline {
         // all sizing math runs in the model's actual rate domain.
         let rvc_info = inspect_rvc_model(config.model)?;
         let rvc_sample_rate = rvc_info.rvc_sample_rate.unwrap_or(RVC_SAMPLE_RATE);
+        let speaker_count = rvc_info.speaker_count;
+        let speaker_id = normalize_speaker_id(config.speaker_id, speaker_count);
+        if speaker_id != config.speaker_id {
+            info!(
+                "clamped initial speaker ID from {} to {} for model speaker_count={}",
+                config.speaker_id,
+                speaker_id,
+                speaker_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
         // CLI-facing configuration is milliseconds for consistency with other latency knobs.
         // The RVC shape and trimming code below use the model's sample-rate domain, so keep the
         // conversion at load time and leave the per-chunk processing path in samples.
@@ -490,7 +517,8 @@ impl RvcPipeline {
             rvc,
             #[cfg(feature = "ort")]
             shared_waveform: None,
-            speaker_id: config.speaker_id,
+            speaker_count,
+            speaker_id,
             pitch_shift: config.pitch_shift,
             f0_threshold: config.f0.f0_threshold,
             silence_threshold: config.f0.silence_threshold,
@@ -557,6 +585,18 @@ impl RvcPipeline {
             }
         );
         let rvc_info = inspect_rvc_model(config.model)?;
+        let speaker_count = rvc_info.speaker_count;
+        let speaker_id = normalize_speaker_id(config.speaker_id, speaker_count);
+        if speaker_id != config.speaker_id {
+            info!(
+                "clamped initial speaker ID from {} to {} for model speaker_count={}",
+                config.speaker_id,
+                speaker_id,
+                speaker_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
         let expected_feat_channels = rvc_info.expected_feat_channels;
         let expected_feat_channels_usize = usize::try_from(expected_feat_channels)
             .context("RVC expected feature channel count does not fit in usize")?;
@@ -697,7 +737,7 @@ impl RvcPipeline {
                 let rvc_output_shape = rvc_probe.warmup_output_shape(
                     feature_len,
                     rvc_info.expected_feat_channels,
-                    config.speaker_id,
+                    speaker_id,
                 )?;
                 drop(rvc_probe);
 
@@ -742,7 +782,7 @@ impl RvcPipeline {
                     TensorRtSessionPurpose::Final,
                     rvc_info.io_names.clone(),
                 )?;
-                rvc.enable_tensorrt_binding(&rvc_output_shape, config.speaker_id)?;
+                rvc.enable_tensorrt_binding(&rvc_output_shape, speaker_id)?;
                 (embedder, pitch, rvc)
             }
         } else if config.provider.is_tensorrt() {
@@ -803,11 +843,7 @@ impl RvcPipeline {
             // Validates the engine frame/channel counts against the runtime
             // profile; native engines self-report their output shape and use no
             // ORT IoBinding, so the returned shape is intentionally discarded.
-            rvc.warmup_output_shape(
-                feature_len,
-                rvc_info.expected_feat_channels,
-                config.speaker_id,
-            )?;
+            rvc.warmup_output_shape(feature_len, rvc_info.expected_feat_channels, speaker_id)?;
 
             report_native_load_progress(&config, &rmvpe_profile, LoadModelRole::Rmvpe);
             let mut pitch = RmvpePitchSession::load(
@@ -922,9 +958,9 @@ impl RvcPipeline {
                 let rvc_output_shape = rvc.warmup_output_shape(
                     feature_len,
                     rvc_info.expected_feat_channels,
-                    config.speaker_id,
+                    speaker_id,
                 )?;
-                rvc.enable_tensorrt_binding(&rvc_output_shape, config.speaker_id)?;
+                rvc.enable_tensorrt_binding(&rvc_output_shape, speaker_id)?;
                 (embedder, pitch, rvc)
             }
         };
@@ -935,7 +971,8 @@ impl RvcPipeline {
             rvc,
             #[cfg(feature = "ort")]
             shared_waveform,
-            speaker_id: config.speaker_id,
+            speaker_count,
+            speaker_id,
             pitch_shift: config.pitch_shift,
             f0_threshold: config.f0.f0_threshold,
             silence_threshold: config.f0.silence_threshold,
@@ -978,7 +1015,14 @@ impl RvcPipeline {
     }
 
     pub fn set_speaker_id(&mut self, speaker_id: i64) {
-        self.speaker_id = speaker_id;
+        // This runs once per worker chunk for live automation. Keep it a pure
+        // integer clamp: no allocation, logging, or model inspection belongs on
+        // the latency-sensitive inference path.
+        self.speaker_id = normalize_speaker_id(speaker_id, self.speaker_count);
+    }
+
+    pub fn speaker_count(&self) -> Option<usize> {
+        self.speaker_count
     }
 
     pub fn set_input_gain(&mut self, input_gain: f32) {
@@ -1473,6 +1517,7 @@ impl RvcPipeline {
 impl std::fmt::Debug for RvcPipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RvcPipeline")
+            .field("speaker_count", &self.speaker_count)
             .field("speaker_id", &self.speaker_id)
             .field("pitch_shift", &self.pitch_shift)
             .field("f0_threshold", &self.f0_threshold)
@@ -1505,5 +1550,13 @@ mod progress_tests {
                 role: LoadModelRole::Rvc
             })
         );
+    }
+
+    #[test]
+    fn speaker_id_is_clamped_to_exported_embedding_table() {
+        assert_eq!(normalize_speaker_id(-1, Some(308)), 0);
+        assert_eq!(normalize_speaker_id(307, Some(308)), 307);
+        assert_eq!(normalize_speaker_id(308, Some(308)), 307);
+        assert_eq!(normalize_speaker_id(500, None), 500);
     }
 }

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use vc_app::{
     AudioHost, DenoiserMode, DeviceSpec, EngineController, EngineState, EngineStatusSnapshot,
-    F0Config, LiveParams, ModelLoadState, NoiseGateShaping, OutputDynamicsConfig, RealtimeConfig,
-    Smoother, TelemetrySnapshot,
+    F0Config, F0PostprocessConfig, LiveParams, ModelLoadState, NoiseGateShaping,
+    OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot, DEFAULT_F0_THRESHOLD,
 };
 use vc_core::gpu::{list_cuda_devices, GpuDevice};
 use vc_core::validation::CONVERSION_TIMING_LIMITS;
@@ -22,6 +22,8 @@ const TELEMETRY_REFRESH: Duration = Duration::from_millis(250);
 const GUI_CROSSFADE_MS: u32 = 85;
 const GUI_SOLA_SEARCH_MS: u32 = 12;
 const GUI_MIN_EXTRA_CONVERT_MS: u32 = 100;
+const QUALITY_PRESET_CHUNK_MS: u32 = 450;
+const QUALITY_PRESET_EXTRA_CONVERT_MS: u32 = 2_120;
 const RMS_HEALTHY_MIN: f32 = 0.01;
 const RMS_HEALTHY_MAX: f32 = 0.10;
 const RMS_HIGH_MAX: f32 = 0.25;
@@ -152,6 +154,7 @@ struct GuiSettings {
     rvc_output_tail_discard_ms: u32,
     extra_convert_ms: u32,
     f0_threshold: f32,
+    f0_continuity: bool,
     silence_threshold: f32,
     pitch_shift: f32,
     speaker_id: i64,
@@ -206,7 +209,8 @@ impl Default for GuiSettings {
             smoother: "sola".to_string(),
             rvc_output_tail_discard_ms: 10,
             extra_convert_ms: 100,
-            f0_threshold: 0.3,
+            f0_threshold: DEFAULT_F0_THRESHOLD,
+            f0_continuity: true,
             silence_threshold: 0.0001,
             pitch_shift: 0.0,
             speaker_id: 0,
@@ -251,6 +255,12 @@ impl GuiSettings {
         self.crossfade_ms = GUI_CROSSFADE_MS;
         self.sola_search_ms = GUI_SOLA_SEARCH_MS;
         self.extra_convert_ms = self.extra_convert_ms.max(GUI_MIN_EXTRA_CONVERT_MS);
+        // 0.3 was the vc-rs default before the RMVPE audit. Migrate that exact
+        // value so existing GUI installs receive the corrected upstream/MXGF
+        // threshold while preserving any other value the user deliberately set.
+        if self.f0_threshold.to_bits() == 0.3_f32.to_bits() {
+            self.f0_threshold = DEFAULT_F0_THRESHOLD;
+        }
         if !provider_names().contains(&self.provider.as_str()) {
             self.provider = default_provider_name().to_string();
         }
@@ -318,7 +328,7 @@ impl GuiSettings {
             f0: F0Config {
                 f0_threshold: self.f0_threshold,
                 silence_threshold: self.silence_threshold,
-                ..F0Config::default()
+                postprocess: F0PostprocessConfig::continuity(self.f0_continuity),
             },
             denoiser_mode: parse_denoiser(&self.denoiser)?,
             gtcrn_model_dir: if self.gtcrn_model_dir.is_empty() {
@@ -513,6 +523,17 @@ impl eframe::App for VcGui {
         }
         self.last_state = status.state;
         self.advance_pending_activation(&status);
+        // Keep the persisted knob inside the active model's actual embedding
+        // table. The shared core also clamps on the worker, but clamping here
+        // keeps the GUI slider and the generated audio in agreement after a
+        // model-pool switch (e.g. 308-speaker MXGF -> stock 109-speaker RVC).
+        if let Some(count) = status.speaker_count {
+            let max_id = count.saturating_sub(1).min(307) as i64;
+            if self.settings.speaker_id > max_id {
+                self.settings.speaker_id = max_id;
+                self.changed();
+            }
+        }
         if self.telemetry_updated_at.elapsed() >= TELEMETRY_REFRESH {
             self.telemetry = latest_telemetry;
             self.telemetry_updated_at = Instant::now();
@@ -836,6 +857,13 @@ impl eframe::App for VcGui {
 
             ui.separator();
             ui.heading("Engine configuration (Apply to restart)");
+            if ui.button("High quality preset").clicked() {
+                self.settings.chunk_ms = QUALITY_PRESET_CHUNK_MS;
+                self.settings.extra_convert_ms = QUALITY_PRESET_EXTRA_CONVERT_MS;
+                self.settings.f0_threshold = DEFAULT_F0_THRESHOLD;
+                self.settings.f0_continuity = true;
+                changed = true;
+            }
             changed |= ui
                 .add(
                     egui::Slider::new(
@@ -845,6 +873,16 @@ impl eframe::App for VcGui {
                     )
                     .text("Chunk ms"),
                 )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.settings.f0_threshold, 0.001..=0.5)
+                        .logarithmic(true)
+                        .text("F0 threshold"),
+                )
+                .changed();
+            changed |= ui
+                .checkbox(&mut self.settings.f0_continuity, "F0 continuity")
                 .changed();
             changed |= ui
                 .add(
@@ -864,8 +902,16 @@ impl eframe::App for VcGui {
                         .text("Pitch shift"),
                 )
                 .changed();
+            let speaker_max = status
+                .speaker_count
+                .and_then(|count| i64::try_from(count.saturating_sub(1)).ok())
+                .unwrap_or(307)
+                .min(307);
             changed |= ui
-                .add(egui::Slider::new(&mut self.settings.speaker_id, 0..=255).text("Speaker ID"))
+                .add(
+                    egui::Slider::new(&mut self.settings.speaker_id, 0..=speaker_max)
+                        .text("Speaker ID"),
+                )
                 .changed();
             changed |= ui
                 .add(
@@ -968,6 +1014,26 @@ impl eframe::App for VcGui {
                 } else {
                     metric(ui, "Inference", format!("{inference_ms} ms"));
                 }
+                metric(
+                    ui,
+                    "ContentVec",
+                    format!("{} ms", (telemetry.embedder_us.saturating_add(500)) / 1_000),
+                );
+                metric(
+                    ui,
+                    "RMVPE",
+                    format!("{} ms", (telemetry.pitch_us.saturating_add(500)) / 1_000),
+                );
+                metric(
+                    ui,
+                    "RVC",
+                    format!("{} ms", (telemetry.rvc_us.saturating_add(500)) / 1_000),
+                );
+                metric(
+                    ui,
+                    "F0 voiced",
+                    format!("{:.0}%", telemetry.f0_voiced_ratio.clamp(0.0, 1.0) * 100.0),
+                );
                 rms_metric(ui, "Input RMS", telemetry.input_rms);
                 rms_metric(ui, "Output RMS", telemetry.output_rms);
                 metric(ui, "Input overruns", telemetry.input_overruns);
@@ -1484,6 +1550,32 @@ mod tests {
         };
         settings.normalize_gui_managed_settings();
         assert_eq!(settings.gpu_priority, "high");
+    }
+
+    #[test]
+    fn gui_defaults_use_audited_rmvpe_continuity() {
+        let settings = GuiSettings::default();
+        assert_eq!(settings.f0_threshold, DEFAULT_F0_THRESHOLD);
+        assert!(settings.f0_continuity);
+        let config = GuiSettings {
+            passthrough: true,
+            ..settings
+        }
+        .realtime()
+        .unwrap();
+        assert!(config.f0.postprocess.enabled);
+        assert!(config.f0.postprocess.interpolate_internal_unvoiced_gaps);
+    }
+
+    #[test]
+    fn gui_migrates_only_the_legacy_f0_default() {
+        let mut legacy: GuiSettings = toml::from_str("f0_threshold = 0.3").unwrap();
+        legacy.normalize_gui_managed_settings();
+        assert_eq!(legacy.f0_threshold, DEFAULT_F0_THRESHOLD);
+
+        let mut custom: GuiSettings = toml::from_str("f0_threshold = 0.2").unwrap();
+        custom.normalize_gui_managed_settings();
+        assert_eq!(custom.f0_threshold, 0.2);
     }
 
     #[test]

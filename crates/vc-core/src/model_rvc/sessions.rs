@@ -224,10 +224,7 @@ impl HubertEmbedderSession {
             return self.extract_with_binding(audio_16k, out);
         }
         if let Some(native) = self.native.as_mut() {
-            // The native TensorRT FFI still returns an owned tensor; copy it into
-            // the reused buffer so the contract matches the ORT paths.
-            let ft = native.extract(audio_16k)?;
-            fill_feature_tensor(out, &ft.shape, &ft.data);
+            native.extract_into(audio_16k, out)?;
             return Ok(());
         }
         #[cfg(feature = "ort")]
@@ -564,11 +561,8 @@ impl RmvpePitchSession {
             return self.extract_with_binding(audio_16k, pitch_shift, threshold);
         }
         if let Some(native) = self.native.as_mut() {
-            // The native TensorRT FFI still returns an owned Vec; copy it into the
-            // reused scratch so the borrowed-slice contract holds across backends.
-            let raw = native.extract(audio_16k, pitch_shift, threshold)?;
             self.pitchf_scratch.clear();
-            self.pitchf_scratch.extend_from_slice(&raw);
+            native.extract_into(audio_16k, pitch_shift, threshold, &mut self.pitchf_scratch)?;
             return Ok(self.pitchf_scratch.as_slice());
         }
         #[cfg(feature = "ort")]
@@ -1193,12 +1187,7 @@ impl RvcModelSession {
             &pitch_shape,
         )?;
         if let Some(native) = self.native_rvc.as_mut() {
-            // The native TensorRT FFI still returns an owned Vec; copy it into the
-            // caller buffer so the reuse contract holds for the ORT paths below.
-            // Refactoring the native shim to write in place is out of scope here.
-            let converted = native.infer(feats, pitch, pitchf, speaker_id)?;
-            out.clear();
-            out.extend_from_slice(&converted);
+            native.infer_into(feats, pitch, pitchf, speaker_id, out)?;
             return Ok(());
         }
         #[cfg(feature = "ort")]

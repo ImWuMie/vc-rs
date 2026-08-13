@@ -15,8 +15,8 @@ use nice_plug::prelude::util;
 use rtrb::{Consumer, Producer, RingBuffer};
 use vc_core::dsp::chunk_samples_for_rate;
 use vc_core::model_rvc::{
-    ChunkConverter, ChunkOutputConfig, F0Config, LiveParams, LoadProgress, NoiseGateShaping,
-    OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
+    ChunkConverter, ChunkOutputConfig, F0Config, F0PostprocessConfig, LiveParams, LoadProgress,
+    NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
 use vc_core::validation::CONVERSION_TIMING_LIMITS;
@@ -611,7 +611,7 @@ impl WorkerCtx {
             f0: F0Config {
                 f0_threshold: settings.f0_threshold,
                 silence_threshold: settings.silence_threshold,
-                ..F0Config::default()
+                postprocess: F0PostprocessConfig::continuity(settings.f0_continuity),
             },
             input_gain: 1.0,
             // Gate on/off + threshold are DAW parameters applied per chunk

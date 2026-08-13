@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use vc_core::model_rvc::GpuPriority;
+use vc_core::model_rvc::{GpuPriority, DEFAULT_F0_THRESHOLD};
 use vc_core::validation::{
     validate_conversion_timing, validate_non_negative_f32, validate_unit_interval,
     ConversionTiming, ConversionTimingLimits, CONVERSION_TIMING_LIMITS,
@@ -45,6 +45,7 @@ pub struct PluginConfig {
     /// CUDA device ID used by CUDA and native TensorRT backends.
     pub gpu_device_id: u32,
     pub f0_threshold: f32,
+    pub f0_continuity: bool,
     pub silence_threshold: f32,
     /// Noise gate attack/release/floor. Static (applied at Load/Reload); the
     /// gate's on/off and threshold are DAW parameters (see `VcRvcParams`).
@@ -77,7 +78,8 @@ impl Default for PluginConfig {
             provider: default_provider().to_string(),
             gpu_priority: "high".to_string(),
             gpu_device_id: 0,
-            f0_threshold: 0.3,
+            f0_threshold: DEFAULT_F0_THRESHOLD,
+            f0_continuity: true,
             silence_threshold: 0.0001,
             noise_gate_attack_ms: 5.0,
             noise_gate_release_ms: 50.0,
@@ -318,6 +320,16 @@ mod tests {
         assert_eq!(config.gpu_priority(), GpuPriority::Normal);
         let config: PluginConfig = toml::from_str("gpu_device_id = 2").unwrap();
         assert_eq!(config.gpu_device_id, 2);
+    }
+
+    #[test]
+    fn defaults_enable_audited_rmvpe_continuity() {
+        let config = PluginConfig::default();
+        assert_eq!(config.f0_threshold, DEFAULT_F0_THRESHOLD);
+        assert!(config.f0_continuity);
+        let parsed: PluginConfig = toml::from_str("").unwrap();
+        assert_eq!(parsed.f0_threshold, DEFAULT_F0_THRESHOLD);
+        assert!(parsed.f0_continuity);
     }
 
     #[test]

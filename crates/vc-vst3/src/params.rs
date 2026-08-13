@@ -53,7 +53,10 @@ impl Default for VcRvcParams {
             )
             .with_unit(" st")
             .with_step_size(0.5),
-            speaker_id: IntParam::new("Speaker", 0, IntRange::Linear { min: 0, max: 255 }),
+            // RVC v2's stock table has 109 rows; MXGF-f048k exports 308. Keep
+            // the DAW parameter range at the larger static contract and let
+            // vc-core clamp IDs for smaller or unusual models at load time.
+            speaker_id: IntParam::new("Speaker", 0, IntRange::Linear { min: 0, max: 307 }),
             input_gain_db: FloatParam::new(
                 "Input Gain",
                 0.0,

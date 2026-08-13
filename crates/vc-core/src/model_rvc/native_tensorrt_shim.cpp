@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -253,15 +254,32 @@ bool parse_profile_shapes(char const* profile_shapes, std::map<std::string, nvin
     return true;
 }
 
-bool read_file(char const* path, std::vector<char>& data, Message& msg, char const* label) {
+bool path_from_utf16(uint16_t const* raw, std::filesystem::path& path, Message& msg, char const* label) {
+    if (raw == nullptr || raw[0] == 0) {
+        msg.append("%s path is empty\n", label);
+        return false;
+    }
+    // Rust passes Windows paths as UTF-16. `std::filesystem::path` preserves
+    // that representation on Windows rather than interpreting UTF-8 through
+    // the active ANSI code page; non-Windows implementations transcode it to
+    // their native UTF-8 representation.
+    std::u16string text;
+    for (auto const* current = raw; *current != 0; ++current) {
+        text.push_back(static_cast<char16_t>(*current));
+    }
+    path = std::filesystem::path(std::move(text));
+    return true;
+}
+
+bool read_file(std::filesystem::path const& path, std::vector<char>& data, Message& msg, char const* label) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
-        msg.append("failed to open %s: %s\n", label, path);
+        msg.append("failed to open %s\n", label);
         return false;
     }
     data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
     if (data.empty()) {
-        msg.append("%s is empty: %s\n", label, path);
+        msg.append("%s is empty\n", label);
         return false;
     }
     return true;
@@ -426,7 +444,7 @@ void try_capture_graph(NativeEngine& native, Message& msg) {
 } // namespace
 
 extern "C" NativeEngine* vc_rs_trt_engine_create(
-    char const* engine_path,
+    uint16_t const* engine_path,
     char const* profile_shapes,
     char const* output_name,
     int32_t high_priority,
@@ -451,8 +469,12 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
     if (!parse_profile_shapes(profile_shapes, profile, msg)) {
         return nullptr;
     }
+    std::filesystem::path engine_file;
+    if (!path_from_utf16(engine_path, engine_file, msg, "TensorRT engine")) {
+        return nullptr;
+    }
     std::vector<char> plan;
-    if (!read_file(engine_path, plan, msg, "TensorRT engine")) {
+    if (!read_file(engine_file, plan, msg, "TensorRT engine")) {
         return nullptr;
     }
 
@@ -468,7 +490,7 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
     }
     native->engine.reset(native->runtime->deserializeCudaEngine(plan.data(), plan.size()));
     if (!native->engine) {
-        msg.append("deserializeCudaEngine failed for %s\n", engine_path);
+        msg.append("deserializeCudaEngine failed\n");
         return nullptr;
     }
     native->context.reset(native->engine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kSTATIC));
@@ -566,7 +588,7 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
     // the inference sequence can be captured once into a CUDA graph and replayed.
     try_capture_graph(*native, msg);
 
-    msg.append("loaded native TensorRT engine=%s output=%s output_len=%zu profile=%s\n", engine_path, output_name, native->output_len, profile_shapes);
+    msg.append("loaded native TensorRT engine output=%s output_len=%zu profile=%s\n", output_name, native->output_len, profile_shapes);
     return native.release();
 }
 
@@ -777,25 +799,35 @@ FARPROC WINAPI vc_rs_trt_delay_hook(unsigned dli_notify, PDelayLoadInfo pdli) {
         return nullptr;
     }
     HMODULE self = nullptr;
-    if (!GetModuleHandleExA(
+    if (!GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(&vc_rs_trt_delay_hook), &self)) {
+            reinterpret_cast<LPCWSTR>(&vc_rs_trt_delay_hook), &self)) {
         return nullptr;
     }
-    char path[MAX_PATH];
-    DWORD len = GetModuleFileNameA(self, path, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) {
+    std::vector<wchar_t> path(260);
+    DWORD len = 0;
+    for (;;) {
+        len = GetModuleFileNameW(self, path.data(), static_cast<DWORD>(path.size()));
+        if (len == 0) {
+            return nullptr;
+        }
+        if (len < path.size()) {
+            break;
+        }
+        path.resize(path.size() * 2);
+    }
+    std::wstring full(path.data(), len);
+    std::size_t slash = full.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) {
         return nullptr;
     }
-    std::string dir(path, len);
-    std::size_t slash = dir.find_last_of("\\/");
-    if (slash == std::string::npos) {
-        return nullptr;
+    full.resize(slash + 1);
+    for (char const* current = dll; *current != '\0'; ++current) {
+        full.push_back(static_cast<wchar_t>(*current));
     }
-    std::string full = dir.substr(0, slash + 1) + dll;
     // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR also resolves the loaded DLL's own
     // dependencies from `full`'s directory (the bundle).
-    HMODULE mod = LoadLibraryExA(full.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
+    HMODULE mod = LoadLibraryExW(full.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
     return reinterpret_cast<FARPROC>(mod);
 }
 

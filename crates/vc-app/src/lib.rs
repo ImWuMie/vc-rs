@@ -12,4 +12,7 @@ pub use realtime::{
     EngineStatusSnapshot, ModelLoadState, ModelLoadStatus, RealtimeConfig, Smoother,
     TelemetrySnapshot,
 };
-pub use vc_core::model_rvc::{F0Config, LiveParams, NoiseGateShaping, OutputDynamicsConfig};
+pub use vc_core::model_rvc::{
+    F0Config, F0PostprocessConfig, LiveParams, NoiseGateShaping, OutputDynamicsConfig,
+    DEFAULT_F0_THRESHOLD,
+};

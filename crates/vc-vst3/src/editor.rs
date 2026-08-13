@@ -234,6 +234,19 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
         state.params.settings.write().unwrap().extra_convert_ms = v;
         mark_dirty(state);
     }
+    let (f0_threshold, f0_continuity) = {
+        let s = state.params.settings.read().unwrap();
+        (s.f0_threshold, s.f0_continuity)
+    };
+    if let Some(v) = f32_slider(ui, "F0 threshold", f0_threshold, 0.001, 0.5, "") {
+        state.params.settings.write().unwrap().f0_threshold = v;
+        mark_dirty(state);
+    }
+    let mut continuity = f0_continuity;
+    if ui.checkbox(&mut continuity, "F0 continuity").changed() {
+        state.params.settings.write().unwrap().f0_continuity = continuity;
+        mark_dirty(state);
+    }
     ui.small("Chunk = latency vs. context. Extra convert = extra model context.");
 
     ui.separator();

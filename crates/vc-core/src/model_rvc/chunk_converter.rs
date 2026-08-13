@@ -20,9 +20,20 @@ pub struct ChunkOutputConfig {
 pub struct ChunkStats {
     pub silent: bool,
     pub inference_time: Duration,
+    /// Time in the ContentVec stage, including its associated GPU transfer.
+    pub embedder_time: Duration,
+    /// Time in the RMVPE/F0 stage before F0 post-processing.
+    pub pitch_time: Duration,
+    /// Time in the RVC generator stage before output-domain processing.
+    pub rvc_time: Duration,
     pub input_rms: f32,
     pub output_rms: f32,
     pub model_output_samples: usize,
+    /// Fraction of the RVC-aligned F0 window classified as voiced.
+    pub voiced_ratio: f32,
+    /// Denominator used by `voiced_ratio`; retained so offline diagnostics can
+    /// compute a frame-weighted aggregate across differently sized windows.
+    pub pitch_frames: usize,
 }
 
 /// Owns the stateful model-to-fixed-output conversion shared by WAV and the
@@ -109,7 +120,7 @@ impl<M: VoiceModel> ChunkConverter<M> {
             &mut self.model_audio,
             &mut self.model_pitchf,
         )?;
-        let stats = chunk_stats(&meta, self.model_audio.len());
+        let stats = chunk_stats(&meta, self.model_audio.len(), &self.model_pitchf);
         let model_sample_rate = meta.sample_rate;
         let output_sample_rate = self.output.output_sample_rate;
         let output_chunk_samples = self.output.output_chunk_samples;
@@ -140,7 +151,7 @@ impl<M: VoiceModel> ChunkConverter<M> {
             &mut self.model_audio,
             &mut self.model_pitchf,
         )?;
-        let stats = chunk_stats(&meta, self.model_audio.len());
+        let stats = chunk_stats(&meta, self.model_audio.len(), &self.model_pitchf);
         self.ensure_smoother(meta.sample_rate);
         let smoother = &mut self.smoother.as_mut().expect("smoother set above").1;
         smoother.prime_model_output(&self.model_audio, &self.model_pitchf);
@@ -168,15 +179,33 @@ impl<M: VoiceModel> ChunkConverter<M> {
     }
 }
 
-fn chunk_stats(meta: &ModelOutput, model_output_samples: usize) -> ChunkStats {
+fn chunk_stats(
+    meta: &ModelOutput,
+    model_output_samples: usize,
+    output_pitchf: &[f32],
+) -> ChunkStats {
+    let voiced_frames = output_pitchf.iter().filter(|&&f0| f0 > 0.0).count();
     ChunkStats {
         silent: meta.silent,
         inference_time: meta.inference_time,
+        embedder_time: meta.embedder_time,
+        pitch_time: meta.pitch_time,
+        rvc_time: meta.rvc_time,
         input_rms: meta.input_rms,
         output_rms: meta.output_rms,
         // This is the length immediately before smoothing, not the pipeline's
         // separately reported `raw_output_samples` diagnostic.
         model_output_samples,
+        // Use the pitch tail paired with the audio candidate handed to the
+        // smoother, not the full rolling inference window. Otherwise increasing
+        // history/context counts old frames repeatedly and makes cross-preset
+        // F0 diagnostics incomparable.
+        voiced_ratio: if output_pitchf.is_empty() {
+            0.0
+        } else {
+            voiced_frames as f32 / output_pitchf.len() as f32
+        },
+        pitch_frames: output_pitchf.len(),
     }
 }
 
@@ -255,6 +284,20 @@ mod tests {
         (audio, meta)
     }
 
+    fn output_with_stage_times(
+        audio: Vec<f32>,
+        sample_rate: u32,
+        embedder_time: Duration,
+        pitch_time: Duration,
+        rvc_time: Duration,
+    ) -> (Vec<f32>, ModelOutput) {
+        let (audio, mut meta) = output(audio, sample_rate);
+        meta.embedder_time = embedder_time;
+        meta.pitch_time = pitch_time;
+        meta.rvc_time = rvc_time;
+        (audio, meta)
+    }
+
     #[test]
     fn processes_once_and_returns_fixed_audio_and_stats() {
         let mut converter =
@@ -272,6 +315,30 @@ mod tests {
         assert_eq!(stats.input_rms, 0.25);
         assert_eq!(stats.output_rms, 0.75);
         assert_eq!(stats.model_output_samples, 8);
+    }
+
+    #[test]
+    fn stats_preserve_stage_timings_and_tail_voiced_ratio() {
+        let mut converter = ChunkConverter::new(
+            FakeModel::new([Ok(output_with_stage_times(
+                vec![1.0; 8],
+                1_000,
+                Duration::from_micros(11),
+                Duration::from_micros(22),
+                Duration::from_micros(33),
+            ))]),
+            config(),
+        );
+        let mut out = Vec::new();
+        let stats = converter
+            .process_chunk(&[0.0; 4], 1_000, None, &mut out)
+            .unwrap();
+
+        assert_eq!(stats.embedder_time, Duration::from_micros(11));
+        assert_eq!(stats.pitch_time, Duration::from_micros(22));
+        assert_eq!(stats.rvc_time, Duration::from_micros(33));
+        assert_eq!(stats.pitch_frames, 0);
+        assert_eq!(stats.voiced_ratio, 0.0);
     }
 
     #[test]

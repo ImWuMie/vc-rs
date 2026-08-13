@@ -34,6 +34,13 @@ pub struct F0PostprocessConfig {
     pub fill_short_unvoiced_gaps: bool,
     pub max_unvoiced_gap_frames: usize,
 
+    /// Fill every internal zero run bounded by voiced frames, using linear-Hz
+    /// interpolation. This matches the continuity treatment used by MXGF while
+    /// deliberately leaving leading/trailing zero runs unvoiced: their missing
+    /// off-window bound makes extrapolation likely to turn breaths and
+    /// consonants into artificial voiced sound.
+    pub interpolate_internal_unvoiced_gaps: bool,
+
     pub fix_octave_jumps: bool,
 
     pub median_filter: bool,
@@ -60,6 +67,7 @@ impl Default for F0PostprocessConfig {
 
             fill_short_unvoiced_gaps: true,
             max_unvoiced_gap_frames: 2,
+            interpolate_internal_unvoiced_gaps: false,
 
             fix_octave_jumps: true,
 
@@ -67,6 +75,24 @@ impl Default for F0PostprocessConfig {
             median_filter_radius: 1,
 
             clamp_after_pitch_shift: false,
+        }
+    }
+}
+
+impl F0PostprocessConfig {
+    /// The narrowly scoped F0-continuity treatment used by the realtime quality
+    /// preset. Keep the other corrective filters off: they are independent
+    /// policy choices and must not silently alter vibrato or genuine octave
+    /// transitions when a front-end asks only for dropout interpolation.
+    pub fn continuity(enabled: bool) -> Self {
+        Self {
+            enabled,
+            remove_short_voiced_islands: false,
+            fill_short_unvoiced_gaps: false,
+            interpolate_internal_unvoiced_gaps: true,
+            fix_octave_jumps: false,
+            median_filter: false,
+            ..Self::default()
         }
     }
 }
@@ -127,7 +153,9 @@ impl F0Postprocessor {
             if self.config.remove_short_voiced_islands {
                 self.remove_short_voiced_islands(output);
             }
-            if self.config.fill_short_unvoiced_gaps {
+            if self.config.interpolate_internal_unvoiced_gaps {
+                self.interpolate_internal_unvoiced_gaps(output);
+            } else if self.config.fill_short_unvoiced_gaps {
                 self.fill_short_unvoiced_gaps(output);
             }
             if self.config.fix_octave_jumps {
@@ -224,6 +252,37 @@ impl F0Postprocessor {
         }
     }
 
+    /// Fill every internal unvoiced run, with no length cap, using the same
+    /// linear-Hz interpolation semantics as `numpy.interp`. Unlike `numpy.interp`
+    /// we do not extend the nearest voiced value over an edge run because a
+    /// streaming window cannot know whether that edge is breath, silence, or a
+    /// pitch dropout. Most chunk boundaries are already internal here because
+    /// this pass runs over the shared rolling F0 window on the worker thread.
+    fn interpolate_internal_unvoiced_gaps(&self, pitchf: &mut [f32]) {
+        let n = pitchf.len();
+        let mut i = 0;
+        while i < n {
+            if pitchf[i] <= UNVOICED {
+                let start = i;
+                while i < n && pitchf[i] <= UNVOICED {
+                    i += 1;
+                }
+                let end = i;
+                if start > 0 && end < n {
+                    let left = pitchf[start - 1];
+                    let right = pitchf[end];
+                    let steps = (end - start + 1) as f32;
+                    for (k, value) in pitchf[start..end].iter_mut().enumerate() {
+                        let t = (k + 1) as f32 / steps;
+                        *value = left + (right - left) * t;
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// Step 6: correct isolated single-frame ~2x / ~0.5x octave jumps only.
     /// Requires left/center/right all voiced and left close to right, so a
     /// genuine sustained octave change (two adjacent shifted frames) is kept.
@@ -303,6 +362,7 @@ mod tests {
             enabled: true,
             remove_short_voiced_islands: false,
             fill_short_unvoiced_gaps: false,
+            interpolate_internal_unvoiced_gaps: false,
             fix_octave_jumps: false,
             median_filter: false,
             ..F0PostprocessConfig::default()
@@ -410,6 +470,22 @@ mod tests {
         let edge = run(cfg, &[0.0, 220.0, 240.0, 0.0], 0.0);
         assert_eq!(edge[0], 0.0);
         assert_eq!(edge[3], 0.0);
+    }
+
+    #[test]
+    fn continuity_fills_all_internal_gaps_linearly_but_not_edges() {
+        let cfg = F0PostprocessConfig::continuity(true);
+        let out = run(cfg, &[0.0, 100.0, 0.0, 0.0, 0.0, 500.0, 0.0], 0.0);
+        assert_eq!(out, vec![0.0, 100.0, 200.0, 300.0, 400.0, 500.0, 0.0]);
+    }
+
+    #[test]
+    fn disabled_continuity_is_an_identity_without_pitch_shift() {
+        let input = [100.0, 0.0, 500.0];
+        assert_eq!(
+            run(F0PostprocessConfig::continuity(false), &input, 0.0),
+            input
+        );
     }
 
     // 6. octave jump correction, only for isolated near-2x/0.5x with close sides.

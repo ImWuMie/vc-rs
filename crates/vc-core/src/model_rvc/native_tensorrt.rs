@@ -24,7 +24,7 @@ mod ffi {
 
     unsafe extern "C" {
         pub(super) fn vc_rs_trt_engine_create(
-            engine_path: *const c_char,
+            engine_path: *const u16,
             profile_shapes: *const c_char,
             output_name: *const c_char,
             high_priority: i32,
@@ -103,7 +103,10 @@ mod ffi {
 pub(super) struct NativeContentVecEngine {
     #[cfg(native_tensorrt)]
     handle: std::ptr::NonNull<c_void>,
-    input_name: String,
+    #[cfg(native_tensorrt)]
+    input_name_c: CString,
+    #[cfg(native_tensorrt)]
+    message: MessageBuffer,
     input_len: NonZeroUsize,
     expected_channels: NonZeroUsize,
     output_len: NonZeroUsize,
@@ -114,6 +117,8 @@ pub(super) struct NativeRmvpeEngine {
     handle: std::ptr::NonNull<c_void>,
     waveform_len: NonZeroUsize,
     output_len: NonZeroUsize,
+    #[cfg(native_tensorrt)]
+    message: MessageBuffer,
 }
 
 #[cfg_attr(not(native_tensorrt), allow(dead_code))]
@@ -125,6 +130,8 @@ pub(crate) struct NativeGtcrnEngine {
     tra_len: NonZeroUsize,
     inter_len: NonZeroUsize,
     enh_len: NonZeroUsize,
+    #[cfg(native_tensorrt)]
+    message: MessageBuffer,
 }
 
 // The model's RVC input tensor names as NUL-terminated C strings, resolved once
@@ -164,6 +171,8 @@ pub(super) struct NativeRvcEngine {
     // `None` when the export samples its own noise (no `rnd` input).
     #[cfg(native_tensorrt)]
     rnd: Option<NativeRvcRnd>,
+    #[cfg(native_tensorrt)]
+    message: MessageBuffer,
 }
 
 // Native TensorRT handles own CUDA streams, execution contexts, and fixed device
@@ -214,7 +223,11 @@ impl NativeContentVecEngine {
         Ok(Self {
             #[cfg(native_tensorrt)]
             handle,
-            input_name: input_name.to_string(),
+            #[cfg(native_tensorrt)]
+            input_name_c: CString::new(input_name)
+                .context("ContentVec input name contains an interior NUL byte")?,
+            #[cfg(native_tensorrt)]
+            message: MessageBuffer::new(),
             input_len,
             expected_channels,
             output_len,
@@ -239,7 +252,11 @@ impl NativeContentVecEngine {
         Ok(self.output_len.get() / self.expected_channels.get())
     }
 
-    pub(super) fn extract(&mut self, audio_16k: &[f32]) -> Result<FeatureTensor> {
+    pub(super) fn extract_into(
+        &mut self,
+        audio_16k: &[f32],
+        out: &mut FeatureTensor,
+    ) -> Result<()> {
         if audio_16k.len() != self.input_len.get() {
             bail!(
                 "native TensorRT ContentVec input length mismatch: got {}, expected {}",
@@ -247,8 +264,10 @@ impl NativeContentVecEngine {
                 self.input_len.get()
             );
         }
-        let output = infer_contentvec(self, audio_16k)?;
-        if output.len() % self.expected_channels.get() != 0 {
+        out.data.resize(self.output_len.get(), 0.0);
+        infer_contentvec(self, audio_16k, &mut out.data)?;
+        let output = out.data.as_slice();
+        if !output.len().is_multiple_of(self.expected_channels.get()) {
             bail!(
                 "native TensorRT ContentVec output length {} is not divisible by expected channels {}",
                 output.len(),
@@ -256,10 +275,10 @@ impl NativeContentVecEngine {
             );
         }
         let frames = output.len() / self.expected_channels.get();
-        Ok(FeatureTensor {
-            data: output,
-            shape: vec![1, frames as i64, self.expected_channels.get() as i64],
-        })
+        out.shape.clear();
+        out.shape
+            .extend_from_slice(&[1, frames as i64, self.expected_channels.get() as i64]);
+        Ok(())
     }
 }
 
@@ -292,6 +311,8 @@ impl NativeRmvpeEngine {
             handle,
             waveform_len,
             output_len,
+            #[cfg(native_tensorrt)]
+            message: MessageBuffer::new(),
         })
     }
 
@@ -299,12 +320,13 @@ impl NativeRmvpeEngine {
         vec![1, self.output_len.get() as i64]
     }
 
-    pub(super) fn extract(
+    pub(super) fn extract_into(
         &mut self,
         audio_16k: &[f32],
         pitch_shift: f32,
         threshold: f32,
-    ) -> Result<Vec<f32>> {
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
         if audio_16k.len() != self.waveform_len.get() {
             bail!(
                 "native TensorRT RMVPE waveform length mismatch: got {}, expected {}",
@@ -312,12 +334,12 @@ impl NativeRmvpeEngine {
                 self.waveform_len.get()
             );
         }
-        let mut output = infer_rmvpe(self, audio_16k, threshold)?;
+        infer_rmvpe(self, audio_16k, threshold, out)?;
         let factor = 2.0f32.powf(pitch_shift / 12.0);
-        for value in &mut output {
+        for value in out.iter_mut() {
             *value *= factor;
         }
-        Ok(output)
+        Ok(())
     }
 }
 
@@ -367,6 +389,8 @@ impl NativeGtcrnEngine {
             tra_len,
             inter_len,
             enh_len,
+            #[cfg(native_tensorrt)]
+            message: MessageBuffer::new(),
         })
     }
 
@@ -467,16 +491,19 @@ impl NativeRvcEngine {
             input_names: native_rvc_input_names(names)?,
             #[cfg(native_tensorrt)]
             rnd: native_rvc_rnd(names)?,
+            #[cfg(native_tensorrt)]
+            message: MessageBuffer::new(),
         })
     }
 
-    pub(super) fn infer(
+    pub(super) fn infer_into(
         &mut self,
         feats: &[f32],
         pitch: &[i64],
         pitchf: &[f32],
         speaker_id: i64,
-    ) -> Result<Vec<f32>> {
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
         if feats.len() != self.frames.get() * self.channels.get() {
             bail!(
                 "native TensorRT RVC feats length mismatch: got {}, expected {}",
@@ -492,7 +519,9 @@ impl NativeRvcEngine {
                 self.frames.get()
             );
         }
-        infer_rvc(self, feats, pitch, pitchf, speaker_id)
+        #[cfg(native_tensorrt)]
+        out.resize(self.output_len.get(), 0.0);
+        infer_rvc(self, feats, pitch, pitchf, speaker_id, out)
     }
 
     pub(super) fn frames(&self) -> usize {
@@ -963,14 +992,14 @@ fn load_engine(
 ) -> Result<std::ptr::NonNull<c_void>> {
     let gpu_device_id = i32::try_from(gpu_device_id)
         .map_err(|_| anyhow!("GPU device ID {gpu_device_id} exceeds the supported i32 range"))?;
-    let c_engine = path_cstring(engine_path, "TensorRT engine path")?;
+    let engine_path_utf16 = path_utf16(engine_path, "TensorRT engine path")?;
     let c_profile = CString::new(profile_shapes)
         .context("TensorRT profile shape string contains an interior NUL byte")?;
     let c_output = CString::new(output_name).context("TensorRT output name contains NUL byte")?;
     let mut message = MessageBuffer::new();
     let handle = unsafe {
         ffi::vc_rs_trt_engine_create(
-            c_engine.as_ptr(),
+            engine_path_utf16.as_ptr(),
             c_profile.as_ptr(),
             c_output.as_ptr(),
             i32::from(gpu_priority == super::GpuPriority::High),
@@ -1009,34 +1038,39 @@ fn engine_output_len(_handle: ()) -> Result<NonZeroUsize> {
 }
 
 #[cfg(native_tensorrt)]
-fn infer_contentvec(engine: &mut NativeContentVecEngine, audio: &[f32]) -> Result<Vec<f32>> {
-    let mut output = vec![0.0f32; engine.output_len.get()];
-    let input_name = CString::new(engine.input_name.as_str())
-        .context("ContentVec input name contains an interior NUL byte")?;
-    let mut message = MessageBuffer::new();
+fn infer_contentvec(
+    engine: &mut NativeContentVecEngine,
+    audio: &[f32],
+    output: &mut [f32],
+) -> Result<()> {
+    engine.message.reset();
     let status = unsafe {
         ffi::vc_rs_trt_contentvec_infer(
             engine.handle.as_ptr(),
-            input_name.as_ptr(),
+            engine.input_name_c.as_ptr(),
             audio.as_ptr(),
             audio.len(),
             output.as_mut_ptr(),
             output.len(),
-            message.as_mut_ptr(),
-            message.len(),
+            engine.message.as_mut_ptr(),
+            engine.message.len(),
         )
     };
     if status != 0 {
         bail!(
             "native TensorRT ContentVec inference failed: {}",
-            message.text()
+            engine.message.text()
         );
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(not(native_tensorrt))]
-fn infer_contentvec(_engine: &mut NativeContentVecEngine, _audio: &[f32]) -> Result<Vec<f32>> {
+fn infer_contentvec(
+    _engine: &mut NativeContentVecEngine,
+    _audio: &[f32],
+    _output: &mut [f32],
+) -> Result<()> {
     bail!("native TensorRT ContentVec inference is unavailable in this binary")
 }
 
@@ -1045,9 +1079,10 @@ fn infer_rmvpe(
     engine: &mut NativeRmvpeEngine,
     waveform: &[f32],
     threshold: f32,
-) -> Result<Vec<f32>> {
-    let mut output = vec![0.0f32; engine.output_len.get()];
-    let mut message = MessageBuffer::new();
+    output: &mut Vec<f32>,
+) -> Result<()> {
+    output.resize(engine.output_len.get(), 0.0);
+    engine.message.reset();
     let status = unsafe {
         ffi::vc_rs_trt_rmvpe_infer(
             engine.handle.as_ptr(),
@@ -1056,14 +1091,17 @@ fn infer_rmvpe(
             threshold,
             output.as_mut_ptr(),
             output.len(),
-            message.as_mut_ptr(),
-            message.len(),
+            engine.message.as_mut_ptr(),
+            engine.message.len(),
         )
     };
     if status != 0 {
-        bail!("native TensorRT RMVPE inference failed: {}", message.text());
+        bail!(
+            "native TensorRT RMVPE inference failed: {}",
+            engine.message.text()
+        );
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(not(native_tensorrt))]
@@ -1071,7 +1109,8 @@ fn infer_rmvpe(
     _engine: &mut NativeRmvpeEngine,
     _waveform: &[f32],
     _threshold: f32,
-) -> Result<Vec<f32>> {
+    _output: &mut [f32],
+) -> Result<()> {
     bail!("native TensorRT RMVPE inference is unavailable in this binary")
 }
 
@@ -1126,8 +1165,8 @@ fn infer_rvc(
     pitch: &[i64],
     pitchf: &[f32],
     speaker_id: i64,
-) -> Result<Vec<f32>> {
-    let mut output = vec![0.0f32; engine.output_len.get()];
+    output: &mut [f32],
+) -> Result<()> {
     // Refresh latent noise (when this export takes it) into the reused scratch;
     // pass null pointers / zero length otherwise so the shim skips the input.
     // The raw pointers derived here stay valid through the FFI call below because
@@ -1146,7 +1185,7 @@ fn infer_rvc(
         }
         None => (std::ptr::null(), std::ptr::null(), 0usize),
     };
-    let mut message = MessageBuffer::new();
+    engine.message.reset();
     let status = unsafe {
         ffi::vc_rs_trt_rvc_infer(
             engine.handle.as_ptr(),
@@ -1167,14 +1206,17 @@ fn infer_rvc(
             speaker_id,
             output.as_mut_ptr(),
             output.len(),
-            message.as_mut_ptr(),
-            message.len(),
+            engine.message.as_mut_ptr(),
+            engine.message.len(),
         )
     };
     if status != 0 {
-        bail!("native TensorRT RVC inference failed: {}", message.text());
+        bail!(
+            "native TensorRT RVC inference failed: {}",
+            engine.message.text()
+        );
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(not(native_tensorrt))]
@@ -1184,7 +1226,8 @@ fn infer_rvc(
     _pitch: &[i64],
     _pitchf: &[f32],
     _speaker_id: i64,
-) -> Result<Vec<f32>> {
+    _output: &mut Vec<f32>,
+) -> Result<()> {
     bail!("native TensorRT RVC inference is unavailable in this binary")
 }
 
@@ -1197,7 +1240,7 @@ fn infer_gtcrn(
     inter: &mut [f32],
     enh: &mut [f32],
 ) -> Result<()> {
-    let mut message = MessageBuffer::new();
+    engine.message.reset();
     let status = unsafe {
         ffi::vc_rs_trt_gtcrn_infer(
             engine.handle.as_ptr(),
@@ -1211,12 +1254,15 @@ fn infer_gtcrn(
             inter.len(),
             enh.as_mut_ptr(),
             enh.len(),
-            message.as_mut_ptr(),
-            message.len(),
+            engine.message.as_mut_ptr(),
+            engine.message.len(),
         )
     };
     if status != 0 {
-        bail!("native TensorRT GTCRN inference failed: {}", message.text());
+        bail!(
+            "native TensorRT GTCRN inference failed: {}",
+            engine.message.text()
+        );
     }
     Ok(())
 }
@@ -1234,9 +1280,29 @@ fn infer_gtcrn(
 }
 
 #[cfg(native_tensorrt)]
-fn path_cstring(path: &Path, label: &str) -> Result<CString> {
-    CString::new(path.to_string_lossy().as_bytes())
-        .with_context(|| format!("{label} contains an interior NUL byte"))
+fn path_utf16(path: &Path, label: &str) -> Result<Vec<u16>> {
+    // The native TensorRT C++ layer uses `std::filesystem::path`, whose Windows
+    // constructor accepts UTF-16. Do not narrow this through the active ANSI
+    // code page: a model/cache path such as `D:\\模型\\voice.onnx` must load on
+    // every Windows locale. Rust's `Path` has no interior NUL by construction;
+    // retain the explicit check so the FFI contract is still clear.
+    #[cfg(windows)]
+    let mut wide = {
+        use std::os::windows::ffi::OsStrExt;
+
+        path.as_os_str().encode_wide().collect::<Vec<_>>()
+    };
+    #[cfg(not(windows))]
+    let mut wide = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    if wide.contains(&0) {
+        bail!("{label} contains an interior NUL character");
+    }
+    wide.push(0);
+    Ok(wide)
 }
 
 #[cfg(native_tensorrt)]
@@ -1254,6 +1320,12 @@ impl MessageBuffer {
 
     fn as_mut_ptr(&mut self) -> *mut c_char {
         self.data.as_mut_ptr()
+    }
+
+    fn reset(&mut self) {
+        if let Some(first) = self.data.first_mut() {
+            *first = 0;
+        }
     }
 
     fn len(&self) -> usize {
@@ -1303,5 +1375,15 @@ mod tests {
             candidates.first(),
             Some(&module_dir.join("vc-tensorrt-builder.exe"))
         );
+    }
+
+    #[test]
+    fn native_engine_path_preserves_non_ascii_windows_code_units() {
+        let path = PathBuf::from("C:\\voice\u{6a21}\u{578b}\\engine.engine");
+        let wide = path_utf16(&path, "test path").expect("path should encode");
+
+        assert!(wide.ends_with(&[0]));
+        assert!(wide.contains(&0x6a21));
+        assert!(wide.contains(&0x578b));
     }
 }

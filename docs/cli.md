@@ -23,7 +23,8 @@ the CLI reproduce identically in the GUI.
    `vc-gui.exe` / `vc-rs.exe`**).
 2. Open PowerShell in that folder.
 3. Fetch the embedder + F0 models (below). Supply your own RVC voice-conversion
-   model (`.onnx`) separately (`.pth` is not supported).
+   model as `.onnx`, or export a compatible trained RVC `.pth` checkpoint with
+   `export-pth` before loading it.
 
 ```powershell
 pwsh .\download-models.ps1
@@ -45,6 +46,7 @@ This downloads `.\assets\content_vec_500.onnx` and `.\assets\rmvpe.onnx`.
 | `doctor` | Diagnose runtime dependencies and device visibility needed to run |
 | `devices` | List audio input/output devices |
 | `inspect` | Show ONNX model inputs, outputs, and metadata (backend-independent) |
+| `export-pth` | Offline-export a compatible trained RVC `.pth` generator checkpoint to ONNX |
 | `run` | Real-time microphone-to-speaker conversion |
 | `wav` | WAV-file to WAV-file conversion (same pipeline, deterministic testing) |
 | `windowsml-eps` | List/install Windows ML catalog EPs (windowsml package only) |
@@ -77,6 +79,32 @@ the running platform/build are reported as such.
 
 `inspect` is backend-independent and prints the ONNX model's inputs, outputs,
 and metadata.
+
+### Export a trained PTH checkpoint
+
+RVC `.pth` files are PyTorch checkpoints and are not used directly by the
+real-time engine. `export-pth` runs once outside the audio pipeline, exports a
+standard ONNX generator, and validates its RVC inputs, output, F0 metadata, and
+speaker embedding contract before making the output available.
+
+```powershell
+.\vc-rs.exe export-pth `
+    --model .\voice.pth `
+    --output .\voice.onnx `
+    --rvc-root D:\path\to\your\trusted-rvc-installation `
+    --python D:\path\to\your\trusted-rvc-installation\runtime\python.exe `
+    --trust-rvc-root
+```
+
+`--rvc-root` must contain `infer\lib\infer_pack\models_onnx.py` and match the
+checkpoint's RVC architecture. `--trust-rvc-root` is required because exporting
+imports that local installation's Python model code. Use only models and RVC
+installations you trust and are licensed to use. PyTorch loads the checkpoint
+with `weights_only=True`.
+
+The MXGF `f0G...pth` / `f0D...pth` files are **training base checkpoints**, not
+target voice models, so the command rejects them. Train a voice from the base
+first, then export the resulting compact `assets\weights\*.pth` checkpoint.
 
 ### Real-time conversion
 
