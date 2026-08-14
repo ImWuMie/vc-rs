@@ -10,7 +10,7 @@ mod realtime;
 pub use realtime::{
     write_wav_mono, AudioHost, DenoiserMode, DeviceList, DeviceSpec, EngineController, EngineState,
     EngineStatusSnapshot, ModelLoadState, ModelLoadStatus, RealtimeConfig, Smoother,
-    TelemetrySnapshot,
+    TelemetrySnapshot, VoiceCalibrationSnapshot, VoiceCalibrationState,
 };
 pub use vc_core::model_rvc::{
     F0Config, F0PostprocessConfig, LiveParams, NoiseGateShaping, OutputDynamicsConfig,

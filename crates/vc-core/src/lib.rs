@@ -32,5 +32,6 @@ pub mod gpu;
 pub mod model_rvc;
 pub mod sola;
 pub mod validation;
+pub mod voice_calibration;
 
 pub use provider::Provider;

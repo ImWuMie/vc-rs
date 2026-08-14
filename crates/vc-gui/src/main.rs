@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 use vc_app::{
     AudioHost, DenoiserMode, DeviceSpec, EngineController, EngineState, EngineStatusSnapshot,
     F0Config, F0PostprocessConfig, LiveParams, ModelLoadState, NoiseGateShaping,
-    OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot,
+    OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot, VoiceCalibrationState,
     DEFAULT_DENOISER_CONTENT_MIX, DEFAULT_DENOISER_RMVPE_MIX, DEFAULT_F0_THRESHOLD,
     DEFAULT_PROTECT, DEFAULT_PROTECT_TRANSITION_MS, MAX_DENOISER_CONTENT_MIX,
     MAX_DENOISER_RMVPE_MIX, MAX_PROTECT, MAX_PROTECT_TRANSITION_MS,
@@ -22,6 +22,7 @@ use vc_core::denoise_config::{
 };
 use vc_core::gpu::{list_cuda_devices, GpuDevice};
 use vc_core::validation::CONVERSION_TIMING_LIMITS;
+use vc_core::voice_calibration::{VoiceCalibrationProfile, DEFAULT_VOICE_CALIBRATION_DURATION_MS};
 use vc_core::Provider;
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -32,6 +33,9 @@ const GUI_MIN_EXTRA_CONVERT_MS: u32 = 100;
 const QUALITY_PRESET_CHUNK_MS: u32 = 450;
 const QUALITY_PRESET_EXTRA_CONVERT_MS: u32 = 2_120;
 const QUALITY_PRESET_PROTECT_TRANSITION_MS: u32 = 20;
+const CALIBRATION_INFERENCE_HEADROOM_NUMERATOR: u64 = 3;
+const CALIBRATION_INFERENCE_HEADROOM_DENOMINATOR: u64 = 2;
+const CALIBRATION_INFERENCE_JITTER_MS: u64 = 20;
 const RMS_HEALTHY_MIN: f32 = 0.01;
 const RMS_HEALTHY_MAX: f32 = 0.10;
 const RMS_HIGH_MAX: f32 = 0.25;
@@ -468,6 +472,11 @@ struct VcGui {
     // Pool model path to auto-activate once it finishes loading after a fresh
     // session; consumed when reached, cleared by a manual switch.
     pending_active_model: Option<String>,
+    // A completed calibration is auto-applied exactly once. Its worker-side
+    // generation is cleared by the quality-session restart, so retain the
+    // aggregate profile separately for the GUI status readout.
+    last_applied_calibration_generation: u64,
+    last_voice_calibration: Option<VoiceCalibrationProfile>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -475,6 +484,74 @@ struct GpuDeviceDiscovery {
     started: bool,
     devices: Option<Vec<GpuDevice>>,
     error: Option<String>,
+}
+
+fn apply_high_quality_preset(settings: &mut GuiSettings) {
+    settings.chunk_ms = QUALITY_PRESET_CHUNK_MS;
+    settings.extra_convert_ms = QUALITY_PRESET_EXTRA_CONVERT_MS;
+    settings.f0_threshold = DEFAULT_F0_THRESHOLD;
+    settings.f0_continuity = true;
+    // This is a vc-rs extension rather than an MXGF setting. It remains live
+    // after restart, but keeping it with the preset makes the quality profile
+    // reproducible across GUI launches.
+    settings.protect_transition_ms = QUALITY_PRESET_PROTECT_TRANSITION_MS;
+}
+
+fn apply_voice_calibration_to_settings(
+    settings: &mut GuiSettings,
+    profile: VoiceCalibrationProfile,
+    telemetry: TelemetrySnapshot,
+) {
+    let recommendation = profile.recommendation(!settings.index_path.trim().is_empty());
+    settings.chunk_ms = calibration_chunk_ms_with_inference_headroom(
+        recommendation.chunk_ms,
+        telemetry.inference_us,
+    );
+    settings.extra_convert_ms = recommendation.extra_convert_ms.clamp(
+        GUI_MIN_EXTRA_CONVERT_MS,
+        CONVERSION_TIMING_LIMITS.max_extra_convert_ms,
+    );
+    settings.f0_threshold = recommendation.f0_threshold;
+    settings.f0_continuity = true;
+    settings.input_gain = recommendation.input_gain;
+    settings.noise_gate_threshold = recommendation.gate_threshold;
+    settings.denoiser_content_mix = recommendation.denoiser_content_mix;
+    settings.denoiser_rmvpe_mix = recommendation.denoiser_rmvpe_mix;
+    settings.index_rate = recommendation.index_rate;
+    settings.protect = recommendation.protect;
+    settings.protect_transition_ms = recommendation.protect_transition_ms;
+    if settings.denoiser == "off" && recommendation.prefer_noise_gate {
+        settings.denoiser = "noise-gate".to_string();
+    }
+    if settings.denoiser == "noise-gate" {
+        // A slightly longer release lets short low-energy consonants keep their
+        // preceding voiced envelope instead of abruptly closing.
+        settings.noise_gate_attack_ms = 5.0;
+        settings.noise_gate_release_ms = 100.0;
+        settings.noise_gate_floor = 0.0;
+    }
+}
+
+fn calibration_chunk_ms_with_inference_headroom(
+    recommended_chunk_ms: u32,
+    inference_us: u64,
+) -> u32 {
+    // The measurement is the latest shared-pipeline chunk, not a synthetic
+    // benchmark. Preserve 1.5x of its observed inference time plus a small
+    // scheduling margin so calibration never lowers a timing budget that the
+    // current device has already shown it cannot meet. The core's quality tier
+    // still decides the baseline; this is only a realtime safety floor.
+    let minimum_from_inference_ms = inference_us
+        .saturating_mul(CALIBRATION_INFERENCE_HEADROOM_NUMERATOR)
+        .saturating_add(CALIBRATION_INFERENCE_HEADROOM_DENOMINATOR * 1_000 - 1)
+        / (CALIBRATION_INFERENCE_HEADROOM_DENOMINATOR * 1_000);
+    let minimum_chunk_ms = minimum_from_inference_ms
+        .saturating_add(CALIBRATION_INFERENCE_JITTER_MS)
+        .min(u64::from(u32::MAX)) as u32;
+    recommended_chunk_ms.max(minimum_chunk_ms).clamp(
+        CONVERSION_TIMING_LIMITS.min_chunk_ms,
+        CONVERSION_TIMING_LIMITS.max_chunk_ms,
+    )
 }
 
 impl VcGui {
@@ -494,6 +571,8 @@ impl VcGui {
             gpu_devices: Arc::new(Mutex::new(GpuDeviceDiscovery::default())),
             last_state: EngineState::Stopped,
             pending_active_model: None,
+            last_applied_calibration_generation: 0,
+            last_voice_calibration: None,
         }
     }
 
@@ -584,12 +663,41 @@ impl VcGui {
             self.applied_chunk_ms = None;
         }
     }
+
+    /// Apply a worker-measured microphone profile to the existing shared RVC
+    /// knobs, then restart because the quality/F0 settings are load-time state.
+    /// Pitch shift is deliberately left untouched: an ONNX RVC export does not
+    /// describe the target voice's natural register, so source-only analysis
+    /// cannot choose a musically correct target shift.
+    fn apply_voice_calibration(
+        &mut self,
+        profile: VoiceCalibrationProfile,
+        telemetry: TelemetrySnapshot,
+    ) {
+        apply_voice_calibration_to_settings(&mut self.settings, profile, telemetry);
+        self.last_voice_calibration = Some(profile);
+        self.changed();
+        self.apply_or_start();
+    }
 }
 
 impl eframe::App for VcGui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.maybe_save();
         let (status, latest_telemetry, devices) = self.controller.snapshot();
+        let completed_calibration = self.controller.voice_calibration_snapshot();
+        if completed_calibration.state == VoiceCalibrationState::Ready
+            && completed_calibration.generation != self.last_applied_calibration_generation
+        {
+            if let Some(profile) = completed_calibration.profile {
+                self.last_applied_calibration_generation = completed_calibration.generation;
+                // The completed profile has been copied into the GUI. Clear the
+                // worker-control state before restart so a validation failure
+                // cannot leave a stale "Applying" state on screen.
+                self.controller.cancel_voice_calibration();
+                self.apply_voice_calibration(profile, latest_telemetry);
+            }
+        }
         // A transition into Running means a fresh session (first Apply, or one
         // recreated by a device restart). The pool is lazy — models load on
         // Switch, not at startup — so a fresh session starts with only the base
@@ -941,14 +1049,7 @@ impl eframe::App for VcGui {
             ui.separator();
             ui.heading("Engine configuration (Apply to restart)");
             if ui.button("High quality preset").clicked() {
-                self.settings.chunk_ms = QUALITY_PRESET_CHUNK_MS;
-                self.settings.extra_convert_ms = QUALITY_PRESET_EXTRA_CONVERT_MS;
-                self.settings.f0_threshold = DEFAULT_F0_THRESHOLD;
-                self.settings.f0_continuity = true;
-                // This is a vc-rs extension, separate from the MXGF settings
-                // the rest of the preset was audited against. It remains a live
-                // parameter so users can A/B it without rebuilding the engine.
-                self.settings.protect_transition_ms = QUALITY_PRESET_PROTECT_TRANSITION_MS;
+                apply_high_quality_preset(&mut self.settings);
                 changed = true;
             }
             changed |= ui
@@ -980,6 +1081,54 @@ impl eframe::App for VcGui {
                     .text("Extra convert ms"),
                 )
                 .changed();
+
+            ui.separator();
+            ui.heading("Voice calibration");
+            let calibration = self.controller.voice_calibration_snapshot();
+            match calibration.state {
+                VoiceCalibrationState::Requested | VoiceCalibrationState::Collecting => {
+                    let target_ms = calibration.target_ms.max(1);
+                    let progress = calibration.captured_ms as f32 / target_ms as f32;
+                    ui.add(
+                        egui::ProgressBar::new(progress.clamp(0.0, 1.0)).text(format!(
+                            "Calibrating {:.1} / {:.1} s",
+                            calibration.captured_ms as f32 / 1_000.0,
+                            target_ms as f32 / 1_000.0,
+                        )),
+                    );
+                    if ui.button("Cancel calibration").clicked() {
+                        self.controller.cancel_voice_calibration();
+                    }
+                }
+                VoiceCalibrationState::Ready => {
+                    ui.label("Applying voice calibration...");
+                }
+                VoiceCalibrationState::Idle => {
+                    let response = ui.add_enabled(
+                        status.state == EngineState::Running,
+                        egui::Button::new(format!(
+                            "Auto tune my voice ({} s)",
+                            DEFAULT_VOICE_CALIBRATION_DURATION_MS / 1_000
+                        )),
+                    );
+                    if response
+                        .on_hover_text("Speak normally and leave a short pause.")
+                        .clicked()
+                    {
+                        if let Err(err) = self.controller.start_voice_calibration() {
+                            self.ui_error = Some(format!("{err:#}"));
+                        }
+                    }
+                }
+            }
+            if let Some(profile) = self.last_voice_calibration {
+                ui.label(format!(
+                    "Last: SNR {:.0} dB | input peak {:.0}% | voiced {:.0}%",
+                    profile.signal_to_noise_db,
+                    profile.peak.clamp(0.0, 1.0) * 100.0,
+                    profile.f0_voiced_ratio * 100.0,
+                ));
+            }
 
             ui.separator();
             ui.heading("Live parameters");
@@ -1837,6 +1986,73 @@ mod tests {
         let mut custom: GuiSettings = toml::from_str("f0_threshold = 0.2").unwrap();
         custom.normalize_gui_managed_settings();
         assert_eq!(custom.f0_threshold, 0.2);
+    }
+
+    #[test]
+    fn voice_calibration_maps_noisy_input_without_changing_target_pitch() {
+        let mut settings = GuiSettings {
+            index_path: "target.index".to_string(),
+            pitch_shift: -5.0,
+            ..GuiSettings::default()
+        };
+        let profile = VoiceCalibrationProfile {
+            speech_frame_ratio: 0.7,
+            noise_floor_rms: 0.02,
+            speech_rms: 0.08,
+            signal_to_noise_db: 11.0,
+            peak: 0.99,
+            ..VoiceCalibrationProfile::default()
+        };
+
+        apply_voice_calibration_to_settings(&mut settings, profile, TelemetrySnapshot::default());
+
+        assert_eq!(settings.chunk_ms, 600);
+        assert_eq!(settings.extra_convert_ms, 2_500);
+        assert_eq!(settings.protect_transition_ms, 40);
+        assert_eq!(settings.denoiser, "noise-gate");
+        assert_eq!(settings.index_rate, 0.45);
+        assert_eq!(settings.protect, 0.22);
+        assert_eq!(settings.denoiser_rmvpe_mix, 1.0);
+        assert_eq!(settings.f0_threshold, 0.05);
+        assert_eq!(settings.pitch_shift, -5.0);
+    }
+
+    #[test]
+    fn voice_calibration_keeps_index_disabled_when_no_index_is_selected() {
+        let mut settings = GuiSettings {
+            index_rate: 1.0,
+            ..GuiSettings::default()
+        };
+        let profile = VoiceCalibrationProfile {
+            speech_rms: 0.06,
+            peak: 0.2,
+            signal_to_noise_db: 30.0,
+            ..VoiceCalibrationProfile::default()
+        };
+
+        apply_voice_calibration_to_settings(&mut settings, profile, TelemetrySnapshot::default());
+
+        assert_eq!(settings.index_rate, 0.0);
+    }
+
+    #[test]
+    fn voice_calibration_keeps_inference_headroom_when_the_current_chunk_is_slow() {
+        let mut settings = GuiSettings::default();
+        let profile = VoiceCalibrationProfile {
+            speech_rms: 0.06,
+            peak: 0.2,
+            signal_to_noise_db: 30.0,
+            ..VoiceCalibrationProfile::default()
+        };
+        let telemetry = TelemetrySnapshot {
+            inference_us: 450_000,
+            ..TelemetrySnapshot::default()
+        };
+
+        apply_voice_calibration_to_settings(&mut settings, profile, telemetry);
+
+        assert_eq!(settings.chunk_ms, 695);
+        assert_eq!(settings.extra_convert_ms, 2_120);
     }
 
     #[test]

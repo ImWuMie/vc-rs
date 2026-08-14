@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
@@ -19,6 +21,9 @@ use vc_core::validation::{
     validate_conversion_timing, validate_non_negative_f32, validate_unit_interval,
     ConversionTiming, CONVERSION_TIMING_LIMITS,
 };
+use vc_core::voice_calibration::{
+    VoiceCalibrationAccumulator, VoiceCalibrationProfile, DEFAULT_VOICE_CALIBRATION_DURATION_MS,
+};
 use vc_core::Provider;
 
 use crate::audio::{self, AudioStream, RealtimeAudio};
@@ -26,6 +31,10 @@ use crate::audio::{self, AudioStream, RealtimeAudio};
 const INPUT_QUEUE_CHUNKS: usize = 4;
 const OUTPUT_QUEUE_CHUNKS: usize = 4;
 const COMMAND_CAPACITY: usize = 8;
+const CALIBRATION_IDLE: u8 = 0;
+const CALIBRATION_REQUESTED: u8 = 1;
+const CALIBRATION_COLLECTING: u8 = 2;
+const CALIBRATION_READY: u8 = 3;
 
 /// OS audio host / API. Modelled on cpal's `HostId` (the canonical serialized
 /// tokens match: `wasapi`/`asio`/`coreaudio`/`alsa`/`jack`), so the same enum
@@ -566,6 +575,130 @@ impl Telemetry {
     }
 }
 
+/// Lifecycle state for a short microphone calibration pass. The profile is
+/// published only after the worker has consumed the requested number of input
+/// samples, never from an audio callback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VoiceCalibrationState {
+    #[default]
+    Idle,
+    Requested,
+    Collecting,
+    Ready,
+}
+
+/// Frontend-readable state of the current or most recent calibration request.
+/// The profile contains aggregate signal statistics only; raw microphone audio
+/// remains worker-local and is dropped after each chunk.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VoiceCalibrationSnapshot {
+    pub generation: u64,
+    pub state: VoiceCalibrationState,
+    pub captured_ms: u32,
+    pub target_ms: u32,
+    pub profile: Option<VoiceCalibrationProfile>,
+}
+
+/// Cross-thread control plane for one worker-owned calibration accumulator.
+///
+/// The GUI starts a generation through atomics; the inference worker notices it
+/// between chunks, so the audio callbacks retain their lock-free, sample-moving
+/// role. A mutex is used only once at completion to publish the tiny summary,
+/// never while audio callbacks are executing.
+#[derive(Default)]
+struct VoiceCalibrationControl {
+    next_generation: AtomicU64,
+    requested_generation: AtomicU64,
+    duration_ms: AtomicU32,
+    state: AtomicU8,
+    captured_ms: AtomicU32,
+    profile: Mutex<Option<VoiceCalibrationProfile>>,
+}
+
+impl VoiceCalibrationControl {
+    fn start(&self, duration_ms: u32) -> u64 {
+        let duration_ms = duration_ms.clamp(
+            vc_core::voice_calibration::MIN_VOICE_CALIBRATION_DURATION_MS,
+            vc_core::voice_calibration::MAX_VOICE_CALIBRATION_DURATION_MS,
+        );
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut profile) = self.profile.lock() {
+            *profile = None;
+        }
+        self.duration_ms.store(duration_ms, Ordering::Relaxed);
+        self.captured_ms.store(0, Ordering::Relaxed);
+        self.state.store(CALIBRATION_REQUESTED, Ordering::Relaxed);
+        // Publish this last. The worker's Acquire load of the generation sees
+        // the duration/result reset that belongs to this specific request.
+        self.requested_generation
+            .store(generation, Ordering::Release);
+        generation
+    }
+
+    fn cancel(&self) {
+        self.requested_generation.store(0, Ordering::Release);
+        self.state.store(CALIBRATION_IDLE, Ordering::Relaxed);
+        self.captured_ms.store(0, Ordering::Relaxed);
+        if let Ok(mut profile) = self.profile.lock() {
+            *profile = None;
+        }
+    }
+
+    fn request(&self) -> Option<(u64, u32)> {
+        let generation = self.requested_generation.load(Ordering::Acquire);
+        (generation != 0).then(|| (generation, self.duration_ms.load(Ordering::Relaxed)))
+    }
+
+    fn mark_collecting(&self, generation: u64, captured_ms: u32) {
+        if self.requested_generation.load(Ordering::Acquire) == generation {
+            self.captured_ms.store(captured_ms, Ordering::Relaxed);
+            self.state.store(CALIBRATION_COLLECTING, Ordering::Relaxed);
+        }
+    }
+
+    fn finish(&self, generation: u64, profile: VoiceCalibrationProfile) {
+        if self.requested_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if let Ok(mut result) = self.profile.lock() {
+            // Re-check while holding the result lock so a new request cannot be
+            // overwritten by an old worker that was just finishing its chunk.
+            if self.requested_generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            *result = Some(profile);
+            self.captured_ms
+                .store(profile.captured_ms, Ordering::Relaxed);
+            self.state.store(CALIBRATION_READY, Ordering::Release);
+        }
+    }
+
+    fn snapshot(&self) -> VoiceCalibrationSnapshot {
+        let generation = self.requested_generation.load(Ordering::Acquire);
+        if generation == 0 {
+            return VoiceCalibrationSnapshot::default();
+        }
+        let state = match self.state.load(Ordering::Acquire) {
+            CALIBRATION_REQUESTED => VoiceCalibrationState::Requested,
+            CALIBRATION_COLLECTING => VoiceCalibrationState::Collecting,
+            CALIBRATION_READY => VoiceCalibrationState::Ready,
+            _ => VoiceCalibrationState::Idle,
+        };
+        let profile = if state == VoiceCalibrationState::Ready {
+            self.profile.lock().ok().and_then(|profile| *profile)
+        } else {
+            None
+        };
+        VoiceCalibrationSnapshot {
+            generation,
+            state,
+            captured_ms: self.captured_ms.load(Ordering::Relaxed),
+            target_ms: self.duration_ms.load(Ordering::Relaxed),
+            profile,
+        }
+    }
+}
+
 // Boxing the large `Apply` payload is intentionally declined: these commands
 // flow at control-message cadence (model/config changes), not per audio block,
 // so the size disparity costs nothing worth an extra heap allocation + indirection
@@ -686,6 +819,7 @@ pub struct EngineController {
     status: Arc<Mutex<EngineStatusSnapshot>>,
     devices: Arc<Mutex<DeviceList>>,
     telemetry: Arc<Telemetry>,
+    voice_calibration: Arc<VoiceCalibrationControl>,
     live: Arc<AtomicLiveParams>,
     passthrough: Arc<AtomicBool>,
     active_model: Arc<AtomicUsize>,
@@ -698,6 +832,7 @@ impl EngineController {
         let status = Arc::new(Mutex::new(EngineStatusSnapshot::default()));
         let devices = Arc::new(Mutex::new(DeviceList::default()));
         let telemetry = Arc::new(Telemetry::default());
+        let voice_calibration = Arc::new(VoiceCalibrationControl::default());
         let live = Arc::new(AtomicLiveParams::new(initial_live));
         let passthrough = Arc::new(AtomicBool::new(false));
         let active_model = Arc::new(AtomicUsize::new(0));
@@ -706,6 +841,7 @@ impl EngineController {
             let status = Arc::clone(&status);
             let devices = Arc::clone(&devices);
             let telemetry = Arc::clone(&telemetry);
+            let voice_calibration = Arc::clone(&voice_calibration);
             let live = Arc::clone(&live);
             let passthrough = Arc::clone(&passthrough);
             let active_model = Arc::clone(&active_model);
@@ -719,6 +855,7 @@ impl EngineController {
                         status,
                         devices,
                         telemetry,
+                        voice_calibration,
                         live,
                         passthrough,
                         active_model,
@@ -731,6 +868,7 @@ impl EngineController {
             status,
             devices,
             telemetry,
+            voice_calibration,
             live,
             passthrough,
             active_model,
@@ -797,6 +935,34 @@ impl EngineController {
         self.passthrough.store(enabled, Ordering::Relaxed);
     }
 
+    /// Begin a bounded microphone calibration using the currently running
+    /// session. The worker performs the analysis before model input gain or
+    /// denoising; the callback remains untouched.
+    pub fn start_voice_calibration(&self) -> Result<()> {
+        let state = self
+            .status
+            .lock()
+            .map(|status| status.state)
+            .unwrap_or(EngineState::Error);
+        if state != EngineState::Running {
+            bail!("start the realtime engine before calibrating the microphone");
+        }
+        self.voice_calibration
+            .start(DEFAULT_VOICE_CALIBRATION_DURATION_MS);
+        Ok(())
+    }
+
+    /// Query progress/result for [`Self::start_voice_calibration`].
+    pub fn voice_calibration_snapshot(&self) -> VoiceCalibrationSnapshot {
+        self.voice_calibration.snapshot()
+    }
+
+    /// Discard a pending or published calibration result without touching the
+    /// running audio session.
+    pub fn cancel_voice_calibration(&self) {
+        self.voice_calibration.cancel();
+    }
+
     pub fn snapshot(&self) -> (EngineStatusSnapshot, TelemetrySnapshot, DeviceList) {
         let status = self.status.lock().map(|s| s.clone()).unwrap_or_default();
         let devices = self.devices.lock().map(|d| d.clone()).unwrap_or_default();
@@ -827,6 +993,7 @@ fn control_loop(
     status: Arc<Mutex<EngineStatusSnapshot>>,
     devices: Arc<Mutex<DeviceList>>,
     telemetry: Arc<Telemetry>,
+    voice_calibration: Arc<VoiceCalibrationControl>,
     live: Arc<AtomicLiveParams>,
     passthrough: Arc<AtomicBool>,
     active_model: Arc<AtomicUsize>,
@@ -847,6 +1014,7 @@ fn control_loop(
                     config,
                     &status,
                     &telemetry,
+                    &voice_calibration,
                     &live,
                     &passthrough,
                     &active_model,
@@ -870,6 +1038,7 @@ fn control_loop(
                             config,
                             &status,
                             &telemetry,
+                            &voice_calibration,
                             &live,
                             &passthrough,
                             &active_model,
@@ -994,6 +1163,7 @@ fn control_loop(
                 handle_set_denoiser(session.as_ref(), &status, mode);
             }
             Ok(Command::Stop) => {
+                voice_calibration.cancel();
                 set_status(&status, EngineState::Stopping, "Stopping");
                 drop(session.take());
                 set_status(&status, EngineState::Stopped, "Stopped");
@@ -1011,10 +1181,12 @@ fn control_loop(
             .as_ref()
             .is_some_and(|s| !s.running.load(Ordering::Relaxed))
         {
+            voice_calibration.cancel();
             drop(session.take());
             set_status(&status, EngineState::Error, "Realtime worker stopped");
         }
     }
+    voice_calibration.cancel();
     drop(session);
 }
 
@@ -1605,11 +1777,16 @@ fn restart_session(
     config: RealtimeConfig,
     status: &Arc<Mutex<EngineStatusSnapshot>>,
     telemetry: &Arc<Telemetry>,
+    voice_calibration: &Arc<VoiceCalibrationControl>,
     live: &Arc<AtomicLiveParams>,
     passthrough: &Arc<AtomicBool>,
     active_model: &Arc<AtomicUsize>,
     stopping_message: &str,
 ) {
+    // A calibration belongs to one microphone/session timeline. Do not let a
+    // worker completing just as a device/model restart occurs publish a profile
+    // measured from the old stream into the new configuration.
+    voice_calibration.cancel();
     passthrough.store(config.passthrough, Ordering::Relaxed);
     set_status(status, EngineState::Stopping, stopping_message);
     drop(session.take());
@@ -1618,6 +1795,7 @@ fn restart_session(
     match RealtimeSession::start(
         config,
         Arc::clone(telemetry),
+        Arc::clone(voice_calibration),
         Arc::clone(live),
         Arc::clone(passthrough),
         Arc::clone(active_model),
@@ -2473,6 +2651,7 @@ impl RealtimeSession {
     fn start(
         config: RealtimeConfig,
         telemetry: Arc<Telemetry>,
+        voice_calibration: Arc<VoiceCalibrationControl>,
         live: Arc<AtomicLiveParams>,
         passthrough_live: Arc<AtomicBool>,
         active_model: Arc<AtomicUsize>,
@@ -2608,6 +2787,7 @@ impl RealtimeSession {
         let worker_running = Arc::clone(&running);
         let worker_wake = Arc::clone(&wake);
         let worker_telemetry = Arc::clone(&telemetry);
+        let worker_voice_calibration = Arc::clone(&voice_calibration);
         let worker_debug_input = Arc::clone(&debug_input);
         let worker_debug_output = Arc::clone(&debug_output);
         // The worker owns the model pool, so it is the source of truth for pool
@@ -2633,11 +2813,31 @@ impl RealtimeSession {
                     let mut input_acc = Vec::<f32>::with_capacity(input_chunk * 2);
                     let mut prepared = Vec::<f32>::with_capacity(output_chunk * 2);
                     let mut monitor_prepared = Vec::<f32>::with_capacity(monitor_chunk * 2);
+                    // The accumulator is worker-owned and contains only fixed
+                    // histogram/F0 counters. Never move this into a device
+                    // callback: calibration is a setup task, not RT I/O.
+                    let mut calibration_generation = 0u64;
+                    let mut calibration: Option<VoiceCalibrationAccumulator> = None;
                     // Last pool slot reported to the shared status, so a live
                     // model switch is propagated without re-looking-up the name
                     // (and allocating) on every chunk.
                     let mut last_active_slot = 0usize;
                     while worker_running.load(Ordering::SeqCst) {
+                        match worker_voice_calibration.request() {
+                            Some((generation, duration_ms))
+                                if generation != calibration_generation =>
+                            {
+                                calibration_generation = generation;
+                                calibration =
+                                    Some(VoiceCalibrationAccumulator::new(input_rate, duration_ms));
+                                worker_voice_calibration.mark_collecting(generation, 0);
+                            }
+                            Some(_) => {}
+                            None => {
+                                calibration_generation = 0;
+                                calibration = None;
+                            }
+                        }
                         // Drain worker commands at the top of every iteration so a
                         // live change (device rebind, later model/denoiser swaps)
                         // applies promptly even while parked waiting for input.
@@ -2751,6 +2951,16 @@ impl RealtimeSession {
                                 samples.extend_from_slice(&input_acc[..input_chunk]);
                             }
                         }
+                        // Capture raw device input before `LiveParams::input_gain`
+                        // or a denoiser changes its level. The return count makes
+                        // the final partial chunk's F0 contribution proportional
+                        // to the actual microphone duration that was sampled.
+                        let calibration_observation = calibration.as_mut().map(|collector| {
+                            let observed = collector.observe_audio(&input_acc[..input_chunk]);
+                            worker_voice_calibration
+                                .mark_collecting(calibration_generation, collector.captured_ms());
+                            (observed, collector.is_complete())
+                        });
                         let live_params = live.load();
                         let stats = model.process_chunk(
                             &input_acc[..input_chunk],
@@ -2764,6 +2974,24 @@ impl RealtimeSession {
                             worker_running.store(false, Ordering::SeqCst);
                             break;
                         };
+                        if let Some((observed_samples, complete)) = calibration_observation {
+                            let profile = if observed_samples > 0 {
+                                calibration.as_mut().and_then(|collector| {
+                                    collector.observe_f0(
+                                        stats.voiced_ratio,
+                                        stats.pitch_frames,
+                                        observed_samples as f32 / input_chunk as f32,
+                                    );
+                                    complete.then(|| collector.finish())
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(profile) = profile {
+                                worker_voice_calibration.finish(calibration_generation, profile);
+                                calibration = None;
+                            }
+                        }
                         // Reflect a live model switch in the shared status.
                         // `EngineController::set_active_model` writes the
                         // `active_model` atomic that `Pool::process_chunk` picks
@@ -3313,6 +3541,34 @@ mod tests {
         assert_eq!(out.protect_transition_ms, params.protect_transition_ms);
         assert_eq!(out.denoiser_content_mix, params.denoiser_content_mix);
         assert_eq!(out.denoiser_rmvpe_mix, params.denoiser_rmvpe_mix);
+    }
+
+    #[test]
+    fn calibration_control_rejects_a_result_from_a_replaced_request() {
+        let control = VoiceCalibrationControl::default();
+        let first = control.start(2_000);
+        control.mark_collecting(first, 750);
+        assert_eq!(control.snapshot().state, VoiceCalibrationState::Collecting);
+
+        let second = control.start(2_000);
+        let stale = VoiceCalibrationProfile {
+            captured_ms: 2_000,
+            speech_rms: 0.05,
+            ..VoiceCalibrationProfile::default()
+        };
+        control.finish(first, stale);
+        let pending = control.snapshot();
+        assert_eq!(pending.generation, second);
+        assert_eq!(pending.state, VoiceCalibrationState::Requested);
+        assert!(pending.profile.is_none());
+
+        control.finish(second, stale);
+        let complete = control.snapshot();
+        assert_eq!(complete.state, VoiceCalibrationState::Ready);
+        assert_eq!(complete.profile, Some(stale));
+
+        control.cancel();
+        assert_eq!(control.snapshot().state, VoiceCalibrationState::Idle);
     }
 
     #[test]

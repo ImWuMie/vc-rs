@@ -144,12 +144,20 @@ still supply your own RVC voice model (`.onnx`).
    convert ms** (see *Tuning real-time settings*). These, like the base model
    path and Provider, need **Apply / Start** to take effect.
 6. Press **Apply / Start** to apply and start. **Stop** stops the engine.
-7. **Live parameters** (Pitch shift / Speaker ID / Input gain / Output gain /
+7. **Voice calibration** — while the engine is running, choose **Auto tune my
+   voice (12 s)** and speak normally with a brief pause. It measures input level,
+   room-noise margin, clipping, and F0 availability, then adjusts input gain,
+   gate, Index rate, Protect and its transition, both denoiser mixes, F0
+   threshold, Chunk ms, and Extra convert ms before restarting. It retains
+   realtime headroom from the current inference measurement and leaves **Pitch
+   shift** unchanged because a standard RVC export does not provide the target
+   voice's natural pitch range.
+8. **Live parameters** (Pitch shift / Speaker ID / Input gain / Output gain /
    Monitor gain) apply in real time.
-8. **Input denoiser** — switch **live while running** between `off` /
+9. **Input denoiser** — switch **live while running** between `off` /
    `noise-gate` / `rnnoise` / `gtcrn` (see below); the noise-gate threshold and
    shaping also apply live.
-9. **Telemetry** shows inference time, input/output RMS, and overruns/underruns
+10. **Telemetry** shows inference time, input/output RMS, and overruns/underruns
    so you can watch for dropouts and load (inference time is color-flagged when
    it exceeds the chunk budget).
 
