@@ -80,6 +80,11 @@ Runs `cargo test --workspace` then `cargo xtask bundle vc-vst3`. Flags:
 - `-SkipBundle` — tests only.
 - `-NoNativeTensorRT` — skip the GPU stack and run tests fast.
 
+The default package checks include RNNoise, GTCRN, and the in-tree WebRTC
+suppressor. DeepFilterNet3 is intentionally excluded from release verification:
+enable its opt-in feature for a local build and provide an external archive from
+`download-models.ps1 -DeepFilterNet3`; model weights are never bundled.
+
 ## Local VST3 validator
 
 For VST3 smoke tests, build Steinberg's command-line validator into the
@@ -159,6 +164,10 @@ drives all four into `dist\`:
 cargo install cargo-about --features cli # one-time packaging prerequisite
 pwsh scripts/package-all.ps1
 ```
+
+Pass `-DeepFilterNet3` to build separately named WebRTC + DFN3 variants. This
+adds the DFN3 implementation and exact license notices only; download its model
+archive separately with `download-models.ps1 -DeepFilterNet3`.
 
 Packaging requires `cargo-about` so each staged binary receives a notice for its
 exact package and backend feature set. Ordinary builds, tests, validation, and

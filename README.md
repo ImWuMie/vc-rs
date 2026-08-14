@@ -125,7 +125,8 @@ pwsh .\download-models.ps1
 6. 按下 **Apply / Start** 应用并开始。通过 **Stop** 停止。
 7. **Live parameters**(Pitch shift / Speaker ID / Input gain / Output gain /
    Monitor gain)实时生效。
-8. **Input denoiser** — 在 `off` / `noise-gate` / `rnnoise` / `gtcrn` 之间
+8. **Input denoiser** — 在 `off` / `noise-gate` / `rnnoise` / `webrtc` / `gtcrn` /
+   `deep-filter-net3` 之间
    **运行中实时切换**(详见下文);noise-gate 的阈值等参数也实时生效。
 9. **Telemetry** 显示推理时间、输入输出 RMS、overrun/underrun,可确认断音和负载
    状况(推理时间超过 chunk 预算时会以颜色警告)。
@@ -136,10 +137,11 @@ pwsh .\download-models.ps1
 中无法实时切换到 RVC。
 
 输入噪声抑制可在 **Input denoiser** 中**运行中实时切换** `off` /
-`noise-gate` / `rnnoise` / `gtcrn`:前三种在后台即时构建并热切换;GTCRN 首次切换
+`noise-gate` / `rnnoise` / `webrtc` / `gtcrn` / `deep-filter-net3`:轻量模式在后台即时构建并热切换;GTCRN 与 DFN3 首次切换
 时在后台加载引擎(加载期间继续使用之前的降噪器),完成后自动热切换。Passthrough
-也应用 Input gain、当前选择的输入噪声抑制、Output gain。RNNoise 使用内嵌模型,
-无需额外模型。VST3 版不包含这些输入噪声抑制。
+也应用 Input gain、当前选择的输入噪声抑制、Output gain。RNNoise 与 WebRTC
+使用内嵌实现,无需额外模型。VST3 版包含 WebRTC；RNNoise、GTCRN 与 DFN3 仅在
+对应 feature 打开时可用。
 
 输入噪声抑制的定位:
 
@@ -147,13 +149,18 @@ pwsh .\download-models.ps1
 | --- | --- | --- | --- |
 | Noise Gate | 极小 | 仅阈值门限 | 内嵌 |
 | RNNoise | 低 | 保守 | 内嵌、48 kHz |
+| **WebRTC** | **低** | **自然** | **内嵌、device-rate、适合实时麦克风** |
 | **GTCRN** | **低** | **良好** | **仅 standalone 版、16 kHz、需要模型** |
+| **DeepFilterNet3** | 中 | **最强抑噪** | **可选外置官方模型、固定算法延迟** |
 
 GTCRN 是超轻量(约 48K 参数)的语音增强模型,CPU 上也能实时运行。**standalone
 (CLI/GUI)版**可用,Windows ML 版以 ONNX Runtime CPU、TensorRT 版以 native
 TensorRT 运行。VST3 版不包含。固定延迟约 48 ms(16 kHz 的 STFT 重构 + 适配器
 FIFO)。模型可通过 `download-models.ps1 -Gtcrn` 获取到 `assets\gtcrn\`,在 GUI 的
 **GTCRN model dir** 或 CLI 的 `--gtcrn-model <dir>` 中指定。
+WebRTC 不需要额外文件；DeepFilterNet3 可通过 `download-models.ps1 -DeepFilterNet3`
+获取官方归档，再在 GUI 或 CLI 的 `--deepfilternet3-model <archive>` 中指定。
+DFN3 模型不会打包进发行版。
 
 ## 实时设置的调整
 
@@ -239,7 +246,8 @@ A. 请参阅"实时设置的调整"。先加大 Chunk ms 止住断音,再压低�
 `download-models.ps1` 是可选辅助脚本。它会从
 [`wok000/weights_gpl`](https://huggingface.co/wok000/weights_gpl) 下载第三方参考
 用 ONNX 模型(ContentVec / RMVPE)。获取的模型不包含在 `vc-rs` 本体内,也不适用本
-仓库的 MIT License(分发方标注 GPL-3.0)。
+仓库的 MIT License(分发方标注 GPL-3.0)。同一脚本可按需获取 MIT/Apache-2.0 双许可
+的官方 DeepFilterNet3 归档；该归档同样不会进入发行包。
 
 ## Acknowledgements
 

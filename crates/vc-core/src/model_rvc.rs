@@ -3,6 +3,7 @@ mod cache;
 mod chunk_converter;
 mod f0_postprocess;
 mod feature;
+mod feature_index;
 mod inspect;
 pub(crate) mod native_tensorrt;
 mod noise;
@@ -40,8 +41,11 @@ pub use chunk_converter::{ChunkConverter, ChunkOutputConfig, ChunkStats};
 pub use f0_postprocess::F0PostprocessConfig;
 pub use inspect::{inspect_model, validate_rvc_model};
 pub use pipeline::{
-    F0Config, InputDenoiserMode, LiveParams, LoadModelRole, LoadProgress, NoiseGateShaping,
-    OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig, DEFAULT_F0_THRESHOLD,
+    F0Config, FeatureRetrievalConfig, InputDenoiserMode, LiveParams, LoadModelRole, LoadProgress,
+    NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
+    DEFAULT_DENOISER_CONTENT_MIX, DEFAULT_DENOISER_RMVPE_MIX, DEFAULT_F0_THRESHOLD,
+    DEFAULT_PROTECT, DEFAULT_PROTECT_TRANSITION_MS, MAX_DENOISER_CONTENT_MIX,
+    MAX_DENOISER_RMVPE_MIX, MAX_PROTECT, MAX_PROTECT_TRANSITION_MS,
 };
 pub use process_priority::{set_process_gpu_priority, set_process_power_throttling};
 pub use shape::EMBEDDER_SAMPLE_RATE;

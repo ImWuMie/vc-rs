@@ -182,6 +182,7 @@ pub(super) enum ModelRole {
     ContentVec,
     Rmvpe,
     Rvc,
+    #[cfg(feature = "gtcrn")]
     Gtcrn,
     Inspect,
 }
@@ -192,6 +193,7 @@ impl ModelRole {
             ModelRole::ContentVec => "contentvec",
             ModelRole::Rmvpe => "rmvpe",
             ModelRole::Rvc => "rvc",
+            #[cfg(feature = "gtcrn")]
             ModelRole::Gtcrn => "gtcrn",
             ModelRole::Inspect => "inspect",
         }
@@ -1157,6 +1159,7 @@ pub(super) fn tensor_rt_benchmark_profile(role: ModelRole) -> Result<TensorRtSes
                 },
             ],
         )),
+        #[cfg(feature = "gtcrn")]
         ModelRole::Gtcrn => Ok(TensorRtSessionProfile::new(
             role,
             vec![

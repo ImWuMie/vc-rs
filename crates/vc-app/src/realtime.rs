@@ -11,8 +11,8 @@ use thread_priority::{set_current_thread_priority, ThreadPriority};
 use vc_core::dsp;
 use vc_core::model_rvc::{
     set_process_gpu_priority, set_process_power_throttling, ChunkConverter, ChunkOutputConfig,
-    ChunkStats, F0Config, GpuPriority, LiveParams, LoadProgress, NoiseGateShaping,
-    OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
+    ChunkStats, F0Config, FeatureRetrievalConfig, GpuPriority, LiveParams, LoadProgress,
+    NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
 use vc_core::validation::{
@@ -94,6 +94,8 @@ pub enum DenoiserMode {
     NoiseGate,
     Rnnoise,
     Gtcrn,
+    WebRtc,
+    DeepFilterNet3,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +104,10 @@ pub struct RealtimeConfig {
     pub embedder: Option<PathBuf>,
     pub embedder_output: Option<String>,
     pub f0_model: Option<PathBuf>,
+    /// Optional target-speaker FAISS `added_IVF*_Flat_*.index`. It is immutable
+    /// for a live session because decoding it is model-load work; `index_rate`
+    /// and `protect` remain lock-free live parameters in [`LiveParams`].
+    pub feature_index: Option<PathBuf>,
     pub provider: Provider,
     pub gpu_priority: GpuPriority,
     pub gpu_device_id: u32,
@@ -131,6 +137,14 @@ pub struct RealtimeConfig {
     // GTCRN model directory (holds gtcrn_stream.onnx). Required only when
     // `denoiser_mode == Gtcrn`; ignored otherwise.
     pub gtcrn_model_dir: Option<PathBuf>,
+    /// WebRTC-style spectral suppression level. Used when `denoiser_mode` is
+    /// `WebRtc`; the backend itself remains model-free and loads on the worker.
+    pub webrtc_suppression_level: vc_core::denoise_config::WebRtcSuppressionLevel,
+    /// Official DeepFilterNet3 `.tar.gz` model archive. Required only for the
+    /// `DeepFilterNet3` mode and never embedded in a vc-rs distribution.
+    pub deepfilternet3_model: Option<PathBuf>,
+    pub dfn3_attenuation_limit_db: f32,
+    pub dfn3_post_filter_beta: f32,
     // Denoiser mode and gate attack/release/floor are static (set at load);
     // the gate threshold is live (see `LiveParams`).
     pub noise_gate_shaping: NoiseGateShaping,
@@ -147,6 +161,7 @@ impl Default for RealtimeConfig {
             embedder: None,
             embedder_output: None,
             f0_model: None,
+            feature_index: None,
             provider: Provider::Cpu,
             gpu_priority: GpuPriority::default(),
             gpu_device_id: 0,
@@ -168,6 +183,10 @@ impl Default for RealtimeConfig {
             f0: F0Config::default(),
             denoiser_mode: DenoiserMode::Off,
             gtcrn_model_dir: None,
+            webrtc_suppression_level: vc_core::denoise_config::WebRtcSuppressionLevel::default(),
+            deepfilternet3_model: None,
+            dfn3_attenuation_limit_db: vc_core::denoise_config::DEFAULT_DFN3_ATTENUATION_LIMIT_DB,
+            dfn3_post_filter_beta: vc_core::denoise_config::DEFAULT_DFN3_POST_FILTER_BETA,
             noise_gate_shaping: NoiseGateShaping::default(),
             output_dynamics: OutputDynamicsConfig::default(),
             passthrough: false,
@@ -220,6 +239,44 @@ impl RealtimeConfig {
         }
         if self.denoiser_mode == DenoiserMode::Gtcrn && self.gtcrn_model_dir.is_none() {
             bail!("GTCRN denoiser requires a model directory (gtcrn_model_dir)");
+        }
+        if self.denoiser_mode == DenoiserMode::WebRtc {
+            #[cfg(not(feature = "webrtc"))]
+            bail!("WebRTC denoising support is not enabled in this build");
+        }
+        if self.denoiser_mode == DenoiserMode::DeepFilterNet3 {
+            #[cfg(not(feature = "deepfilternet3"))]
+            bail!("DeepFilterNet3 support is not enabled in this build");
+            #[cfg(feature = "deepfilternet3")]
+            {
+                let model = self.deepfilternet3_model.as_deref().ok_or_else(|| {
+                    anyhow!("DeepFilterNet3 requires a model archive (deepfilternet3_model)")
+                })?;
+                if !model.is_file() {
+                    bail!(
+                        "DeepFilterNet3 model archive not found: {}",
+                        model.display()
+                    );
+                }
+                if !self.dfn3_attenuation_limit_db.is_finite()
+                    || !(0.0..=vc_core::denoise_config::MAX_DFN3_ATTENUATION_LIMIT_DB)
+                        .contains(&self.dfn3_attenuation_limit_db)
+                {
+                    bail!(
+                        "DeepFilterNet3 attenuation limit must be in 0..={} dB",
+                        vc_core::denoise_config::MAX_DFN3_ATTENUATION_LIMIT_DB
+                    );
+                }
+                if !self.dfn3_post_filter_beta.is_finite()
+                    || !(0.0..=vc_core::denoise_config::MAX_DFN3_POST_FILTER_BETA)
+                        .contains(&self.dfn3_post_filter_beta)
+                {
+                    bail!(
+                        "DeepFilterNet3 post-filter beta must be in 0..={}",
+                        vc_core::denoise_config::MAX_DFN3_POST_FILTER_BETA
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -277,9 +334,17 @@ impl RealtimeConfig {
             speaker_id: live.speaker_id,
             pitch_shift: live.pitch_shift,
             f0: self.f0.clone(),
+            retrieval: FeatureRetrievalConfig {
+                index_path: self.feature_index.as_deref(),
+                index_rate: live.index_rate,
+                protect: live.protect,
+                protect_transition_ms: live.protect_transition_ms,
+            },
             input_gain: live.input_gain,
             noise_gate_enabled: self.denoiser_mode == DenoiserMode::NoiseGate,
             noise_gate_threshold: live.noise_gate_threshold,
+            denoiser_content_mix: live.denoiser_content_mix,
+            denoiser_rmvpe_mix: live.denoiser_rmvpe_mix,
             noise_gate_shaping: self.noise_gate_shaping,
             output_extra_ms,
             volume_excluded_ms: self.crossfade_ms,
@@ -303,6 +368,11 @@ struct AtomicLiveParams {
     monitor_gain: AtomicU32,
     noise_gate_enabled: AtomicBool,
     noise_gate_threshold: AtomicU32,
+    index_rate: AtomicU32,
+    protect: AtomicU32,
+    protect_transition_ms: AtomicU32,
+    denoiser_content_mix: AtomicU32,
+    denoiser_rmvpe_mix: AtomicU32,
 }
 
 impl AtomicLiveParams {
@@ -326,6 +396,16 @@ impl AtomicLiveParams {
             .store(value.noise_gate_enabled, Ordering::Relaxed);
         self.noise_gate_threshold
             .store(value.noise_gate_threshold.to_bits(), Ordering::Relaxed);
+        self.index_rate
+            .store(value.index_rate.to_bits(), Ordering::Relaxed);
+        self.protect
+            .store(value.protect.to_bits(), Ordering::Relaxed);
+        self.protect_transition_ms
+            .store(value.protect_transition_ms, Ordering::Relaxed);
+        self.denoiser_content_mix
+            .store(value.denoiser_content_mix.to_bits(), Ordering::Relaxed);
+        self.denoiser_rmvpe_mix
+            .store(value.denoiser_rmvpe_mix.to_bits(), Ordering::Relaxed);
     }
 
     fn load(&self) -> LiveParams {
@@ -337,6 +417,11 @@ impl AtomicLiveParams {
             monitor_gain: f32::from_bits(self.monitor_gain.load(Ordering::Relaxed)),
             noise_gate_enabled: self.noise_gate_enabled.load(Ordering::Relaxed),
             noise_gate_threshold: f32::from_bits(self.noise_gate_threshold.load(Ordering::Relaxed)),
+            index_rate: f32::from_bits(self.index_rate.load(Ordering::Relaxed)),
+            protect: f32::from_bits(self.protect.load(Ordering::Relaxed)),
+            protect_transition_ms: self.protect_transition_ms.load(Ordering::Relaxed),
+            denoiser_content_mix: f32::from_bits(self.denoiser_content_mix.load(Ordering::Relaxed)),
+            denoiser_rmvpe_mix: f32::from_bits(self.denoiser_rmvpe_mix.load(Ordering::Relaxed)),
         }
     }
 }
@@ -513,7 +598,8 @@ enum Command {
     RemoveModel {
         request_id: u64,
     },
-    // Live denoiser hot-swap (off/gate/rnnoise on the worker; gtcrn pre-built).
+    // Live denoiser hot-swap (off/gate/rnnoise/WebRTC on the worker; model
+    // denoisers are pre-built off-thread before being swapped in).
     SetDenoiser(DenoiserMode),
     Stop,
     // (input_host, output_host): inputs are enumerated from the input host and
@@ -562,9 +648,12 @@ enum WorkerCommand {
     RemoveModel {
         slot: usize,
     },
-    // Hot-swap the denoiser variant (off/gate/rnnoise built on the worker).
+    // Hot-swap the denoiser variant (off/gate/rnnoise/WebRTC built on the
+    // worker). WebRTC level is static state, so it travels with the command
+    // rather than reading mutable frontend config from the worker.
     SetDenoiser {
         mode: DenoiserMode,
+        webrtc_suppression_level: vc_core::denoise_config::WebRtcSuppressionLevel,
     },
     // Pre-built GTCRN denoisers (one per model + passthrough), swapped in after
     // an off-thread engine load.
@@ -572,6 +661,14 @@ enum WorkerCommand {
     SwapGtcrn {
         model_denoisers: Vec<vc_core::denoise::GtcrnDenoiser>,
         passthrough_denoiser: Option<vc_core::denoise::GtcrnDenoiser>,
+    },
+    // Official DFN3 graph/archive construction is expensive and must never run
+    // on the worker's audio deadline. Instances arrive from a loader thread and
+    // transfer exclusive ownership to the worker.
+    #[cfg(feature = "deepfilternet3")]
+    SwapDeepFilterNet3 {
+        model_denoisers: Vec<vc_core::denoise::DeepFilterNet3Denoiser>,
+        passthrough_denoiser: Option<vc_core::denoise::DeepFilterNet3Denoiser>,
     },
 }
 
@@ -1016,9 +1113,9 @@ fn handle_add_model(
     }
 }
 
-/// Live denoiser switch: off / noise-gate / rnnoise are sent straight to the
-/// worker (built there, cheap); gtcrn loads its engine on a background thread
-/// and hot-swaps in when ready.
+/// Live denoiser switch: off / noise-gate / RNNoise / WebRTC are sent straight
+/// to the worker (their construction is bounded and model-free); GTCRN and DFN3
+/// load on a background thread and hot-swap in when ready.
 fn handle_set_denoiser(
     session: Option<&RealtimeSession>,
     status: &Arc<Mutex<EngineStatusSnapshot>>,
@@ -1028,9 +1125,15 @@ fn handle_set_denoiser(
         return;
     };
     match mode {
-        DenoiserMode::Off | DenoiserMode::NoiseGate | DenoiserMode::Rnnoise => {
+        DenoiserMode::Off
+        | DenoiserMode::NoiseGate
+        | DenoiserMode::Rnnoise
+        | DenoiserMode::WebRtc => {
             if s.worker_tx
-                .send(WorkerCommand::SetDenoiser { mode })
+                .send(WorkerCommand::SetDenoiser {
+                    mode,
+                    webrtc_suppression_level: s.config.webrtc_suppression_level,
+                })
                 .is_err()
             {
                 set_error(status, &anyhow!("worker command channel closed"));
@@ -1110,6 +1213,89 @@ fn handle_set_denoiser(
                 set_note(status, "GTCRN support is not enabled in this build");
             }
         }
+        DenoiserMode::DeepFilterNet3 => {
+            #[cfg(feature = "deepfilternet3")]
+            {
+                let model_count = {
+                    let st = status.lock().unwrap_or_else(|e| e.into_inner());
+                    st.model_loads
+                        .iter()
+                        .filter(|m| matches!(m.state, ModelLoadState::Loaded))
+                        .count()
+                };
+                let Some(model_path) = s.config.deepfilternet3_model.clone() else {
+                    set_note(
+                        status,
+                        "DeepFilterNet3 requires a model archive; set it and Apply first",
+                    );
+                    return;
+                };
+                let attenuation_limit_db = s.config.dfn3_attenuation_limit_db;
+                let post_filter_beta = s.config.dfn3_post_filter_beta;
+                let input_rate = s.input_rate;
+                let worker_tx = s.worker_tx.clone();
+                let wake = Arc::clone(&s.wake);
+                let running_message = s.status().message.clone();
+                let loader_status = Arc::clone(status);
+                let spawn = thread::Builder::new()
+                    .name("vc-app-dfn3-loader".to_string())
+                    .stack_size(64 * 1024 * 1024)
+                    .spawn(move || {
+                        let result = load_deepfilternet3_denoisers(
+                            &model_path,
+                            attenuation_limit_db,
+                            post_filter_beta,
+                            input_rate,
+                            model_count,
+                        );
+                        if let Ok(mut st) = loader_status.lock() {
+                            st.message = running_message.clone();
+                        }
+                        match result {
+                            Ok((model_denoisers, passthrough_denoiser)) => {
+                                if worker_tx
+                                    .send(WorkerCommand::SwapDeepFilterNet3 {
+                                        model_denoisers,
+                                        passthrough_denoiser,
+                                    })
+                                    .is_err()
+                                {
+                                    if let Ok(mut st) = loader_status.lock() {
+                                        st.detail = Some(
+                                            "worker stopped; DeepFilterNet3 swap failed"
+                                                .to_string(),
+                                        );
+                                    }
+                                } else {
+                                    wake.wake();
+                                }
+                            }
+                            Err(err) => {
+                                if let Ok(mut st) = loader_status.lock() {
+                                    st.detail =
+                                        Some(format!("DeepFilterNet3 load failed: {err:#}"));
+                                }
+                            }
+                        }
+                    });
+                match spawn {
+                    Ok(_) => set_status(
+                        status,
+                        EngineState::Running,
+                        "Loading DeepFilterNet3 denoiser...",
+                    ),
+                    Err(err) => set_error(
+                        status,
+                        &anyhow!("failed to spawn DeepFilterNet3 loader: {err}"),
+                    ),
+                }
+            }
+            #[cfg(not(feature = "deepfilternet3"))]
+            set_note(
+                status,
+                "DeepFilterNet3 support is not enabled in this build",
+            );
+        }
     }
 }
 
@@ -1119,6 +1305,40 @@ type GtcrnDenoiserSet = (
     Vec<vc_core::denoise::GtcrnDenoiser>,
     Option<vc_core::denoise::GtcrnDenoiser>,
 );
+
+#[cfg(feature = "deepfilternet3")]
+type DeepFilterNet3DenoiserSet = (
+    Vec<vc_core::denoise::DeepFilterNet3Denoiser>,
+    Option<vc_core::denoise::DeepFilterNet3Denoiser>,
+);
+
+/// Build a private DFN3 instance for every RVC model plus passthrough. Each
+/// instance contains mutable recurrent state and is therefore never shared by
+/// the model pool or the two processing routes.
+#[cfg(feature = "deepfilternet3")]
+fn load_deepfilternet3_denoisers(
+    model_path: &Path,
+    attenuation_limit_db: f32,
+    post_filter_beta: f32,
+    input_rate: u32,
+    model_count: usize,
+) -> Result<DeepFilterNet3DenoiserSet> {
+    let config = vc_core::denoise::DeepFilterNet3Config {
+        model_path,
+        attenuation_limit_db,
+        post_filter_beta,
+    };
+    let mut model_denoisers = Vec::with_capacity(model_count);
+    for _ in 0..model_count {
+        model_denoisers.push(vc_core::denoise::DeepFilterNet3Denoiser::new(
+            config, input_rate,
+        )?);
+    }
+    let passthrough_denoiser = Some(vc_core::denoise::DeepFilterNet3Denoiser::new(
+        config, input_rate,
+    )?);
+    Ok((model_denoisers, passthrough_denoiser))
+}
 
 /// Build one GTCRN denoiser per loaded model (at the 16 kHz model seam) plus one
 /// device-rate instance for the passthrough path. Runs off the worker thread —
@@ -1162,6 +1382,47 @@ fn update_model_load_status(
     }
 }
 
+/// Static denoiser selection shared by the RVC and passthrough worker paths.
+///
+/// It deliberately owns model paths so a background model-pool load cannot
+/// borrow the live session config. Construction and graph loading stay off the
+/// audio callback; this type is only copied into worker-owned processors.
+#[derive(Clone, Debug)]
+struct DenoiserLoadSettings {
+    mode: DenoiserMode,
+    #[cfg_attr(not(feature = "gtcrn"), allow(dead_code))]
+    gtcrn_model_dir: Option<PathBuf>,
+    #[cfg_attr(not(feature = "webrtc"), allow(dead_code))]
+    webrtc_suppression_level: vc_core::denoise_config::WebRtcSuppressionLevel,
+    #[cfg_attr(not(feature = "deepfilternet3"), allow(dead_code))]
+    deepfilternet3_model: Option<PathBuf>,
+    #[cfg_attr(not(feature = "deepfilternet3"), allow(dead_code))]
+    dfn3_attenuation_limit_db: f32,
+    #[cfg_attr(not(feature = "deepfilternet3"), allow(dead_code))]
+    dfn3_post_filter_beta: f32,
+    #[cfg(feature = "gtcrn")]
+    gtcrn_backend: vc_core::denoise::GtcrnBackend,
+}
+
+impl DenoiserLoadSettings {
+    fn from_realtime(config: &RealtimeConfig, mode: DenoiserMode) -> Self {
+        Self {
+            mode,
+            gtcrn_model_dir: config.gtcrn_model_dir.clone(),
+            webrtc_suppression_level: config.webrtc_suppression_level,
+            deepfilternet3_model: config.deepfilternet3_model.clone(),
+            dfn3_attenuation_limit_db: config.dfn3_attenuation_limit_db,
+            dfn3_post_filter_beta: config.dfn3_post_filter_beta,
+            #[cfg(feature = "gtcrn")]
+            gtcrn_backend: vc_core::denoise::GtcrnBackend::for_provider(
+                config.provider,
+                config.gpu_priority,
+                config.gpu_device_id,
+            ),
+        }
+    }
+}
+
 /// Owned snapshot of the model-side config needed to build a `ChunkConverter`
 /// for a new voice model off the worker thread (the loader has no access to the
 /// running session's borrowed config).
@@ -1170,6 +1431,7 @@ struct ModelLoadContext {
     embedder: PathBuf,
     embedder_output: Option<String>,
     f0_model: PathBuf,
+    feature_index: Option<PathBuf>,
     provider: Provider,
     gpu_priority: GpuPriority,
     gpu_device_id: u32,
@@ -1177,6 +1439,11 @@ struct ModelLoadContext {
     chunk_samples: usize,
     speaker_id: i64,
     pitch_shift: f32,
+    index_rate: f32,
+    protect: f32,
+    protect_transition_ms: u32,
+    denoiser_content_mix: f32,
+    denoiser_rmvpe_mix: f32,
     input_gain: f32,
     output_gain: f32,
     f0: F0Config,
@@ -1193,10 +1460,7 @@ struct ModelLoadContext {
     crossfade_ms: u32,
     sola_search_ms: u32,
     tail_discard_ms: u32,
-    denoiser_mode: DenoiserMode,
-    gtcrn_model_dir: Option<PathBuf>,
-    #[cfg(feature = "gtcrn")]
-    gtcrn_backend: vc_core::denoise::GtcrnBackend,
+    denoiser: DenoiserLoadSettings,
 }
 
 impl ModelLoadContext {
@@ -1217,9 +1481,17 @@ impl ModelLoadContext {
             speaker_id: self.speaker_id,
             pitch_shift: self.pitch_shift,
             f0: self.f0.clone(),
+            retrieval: FeatureRetrievalConfig {
+                index_path: self.feature_index.as_deref(),
+                index_rate: self.index_rate,
+                protect: self.protect,
+                protect_transition_ms: self.protect_transition_ms,
+            },
             input_gain: self.input_gain,
             noise_gate_enabled: self.noise_gate_enabled,
             noise_gate_threshold: self.noise_gate_threshold,
+            denoiser_content_mix: self.denoiser_content_mix,
+            denoiser_rmvpe_mix: self.denoiser_rmvpe_mix,
             noise_gate_shaping: self.noise_gate_shaping,
             output_extra_ms: self.output_extra_ms,
             volume_excluded_ms: self.volume_excluded_ms,
@@ -1231,43 +1503,71 @@ impl ModelLoadContext {
     }
 }
 
-/// Load an `RvcPipeline` honoring the denoiser mode, shared between the session
-/// start path and the background model-pool loader.
-fn load_rvc_pipeline(
-    config: RvcPipelineConfig<'_>,
-    denoiser_mode: DenoiserMode,
-    #[cfg(feature = "gtcrn")] gtcrn_model_dir: Option<&Path>,
-    #[cfg(feature = "gtcrn")] gtcrn_backend: vc_core::denoise::GtcrnBackend,
-) -> Result<RvcPipeline> {
-    match denoiser_mode {
-        DenoiserMode::Off | DenoiserMode::NoiseGate => RvcPipeline::load(config),
-        DenoiserMode::Rnnoise => {
-            #[cfg(feature = "rnnoise")]
-            {
-                RvcPipeline::load_with_rnnoise(config)
+impl DenoiserLoadSettings {
+    /// Load an `RvcPipeline` honoring this static denoiser selection. Shared by
+    /// initial session startup and the background model-pool loader so every
+    /// front-end route keeps identical denoiser behavior and delay accounting.
+    fn load_pipeline(&self, config: RvcPipelineConfig<'_>) -> Result<RvcPipeline> {
+        match self.mode {
+            DenoiserMode::Off | DenoiserMode::NoiseGate => RvcPipeline::load(config),
+            DenoiserMode::Rnnoise => {
+                #[cfg(feature = "rnnoise")]
+                {
+                    RvcPipeline::load_with_rnnoise(config)
+                }
+                #[cfg(not(feature = "rnnoise"))]
+                {
+                    bail!("RNNoise support is not enabled in this build")
+                }
             }
-            #[cfg(not(feature = "rnnoise"))]
-            {
-                bail!("RNNoise support is not enabled in this build")
+            DenoiserMode::WebRtc => {
+                #[cfg(feature = "webrtc")]
+                {
+                    RvcPipeline::load_with_webrtc(config, self.webrtc_suppression_level)
+                }
+                #[cfg(not(feature = "webrtc"))]
+                {
+                    bail!("WebRTC denoising support is not enabled in this build")
+                }
             }
-        }
-        DenoiserMode::Gtcrn => {
-            #[cfg(feature = "gtcrn")]
-            {
-                let model_dir = gtcrn_model_dir.ok_or_else(|| {
-                    anyhow!("GTCRN denoiser requires a model directory (gtcrn_model_dir)")
-                })?;
-                RvcPipeline::load_with_gtcrn(
-                    config,
-                    vc_core::denoise::GtcrnConfig {
-                        model_dir,
-                        backend: gtcrn_backend,
-                    },
-                )
+            DenoiserMode::DeepFilterNet3 => {
+                #[cfg(feature = "deepfilternet3")]
+                {
+                    let model_path = self.deepfilternet3_model.as_deref().ok_or_else(|| {
+                        anyhow!("DeepFilterNet3 requires a model archive (deepfilternet3_model)")
+                    })?;
+                    RvcPipeline::load_with_deepfilternet3(
+                        config,
+                        vc_core::denoise::DeepFilterNet3Config {
+                            model_path,
+                            attenuation_limit_db: self.dfn3_attenuation_limit_db,
+                            post_filter_beta: self.dfn3_post_filter_beta,
+                        },
+                    )
+                }
+                #[cfg(not(feature = "deepfilternet3"))]
+                {
+                    bail!("DeepFilterNet3 support is not enabled in this build")
+                }
             }
-            #[cfg(not(feature = "gtcrn"))]
-            {
-                bail!("GTCRN support is not enabled in this build")
+            DenoiserMode::Gtcrn => {
+                #[cfg(feature = "gtcrn")]
+                {
+                    let model_dir = self.gtcrn_model_dir.as_deref().ok_or_else(|| {
+                        anyhow!("GTCRN denoiser requires a model directory (gtcrn_model_dir)")
+                    })?;
+                    RvcPipeline::load_with_gtcrn(
+                        config,
+                        vc_core::denoise::GtcrnConfig {
+                            model_dir,
+                            backend: self.gtcrn_backend,
+                        },
+                    )
+                }
+                #[cfg(not(feature = "gtcrn"))]
+                {
+                    bail!("GTCRN support is not enabled in this build")
+                }
             }
         }
     }
@@ -1280,14 +1580,9 @@ fn load_model_converter(
     ctx: &ModelLoadContext,
     progress: impl Fn(LoadProgress),
 ) -> Result<ChunkConverter<RvcPipeline>> {
-    let pipeline = load_rvc_pipeline(
-        ctx.build_pipeline_config(&progress),
-        ctx.denoiser_mode,
-        #[cfg(feature = "gtcrn")]
-        ctx.gtcrn_model_dir.as_deref(),
-        #[cfg(feature = "gtcrn")]
-        ctx.gtcrn_backend,
-    )?;
+    let pipeline = ctx
+        .denoiser
+        .load_pipeline(ctx.build_pipeline_config(&progress))?;
     Ok(ChunkConverter::new(
         pipeline,
         ChunkOutputConfig {
@@ -1424,10 +1719,14 @@ enum PassthroughDenoiser {
     Gate(dsp::NoiseGate),
     #[cfg(feature = "rnnoise")]
     Rnnoise(Box<vc_core::denoise::RnnoiseDenoiser>),
+    #[cfg(feature = "webrtc")]
+    WebRtc(Box<vc_core::denoise::WebRtcDenoiser>),
     // Device-rate GTCRN instance, independent of the RVC-path 16 kHz one; its
     // adapter resamplers engage (device <-> 16 kHz). Boxed like the others.
     #[cfg(feature = "gtcrn")]
     Gtcrn(Box<vc_core::denoise::GtcrnDenoiser>),
+    #[cfg(feature = "deepfilternet3")]
+    DeepFilterNet3(Box<vc_core::denoise::DeepFilterNet3Denoiser>),
 }
 
 struct PassthroughProcessor {
@@ -1439,6 +1738,16 @@ struct PassthroughProcessor {
     // Read only on the `gtcrn`-gated reset arm; inert without that feature.
     #[cfg_attr(not(feature = "gtcrn"), allow(dead_code))]
     gtcrn_model_dir: Option<PathBuf>,
+    // DFN3 archive and controls are retained for session construction only.
+    // Live DFN3 switching uses pre-built worker-owned instances instead of
+    // parsing this archive on the audio deadline.
+    #[cfg_attr(not(feature = "deepfilternet3"), allow(dead_code))]
+    deepfilternet3_model: Option<PathBuf>,
+    #[cfg_attr(not(feature = "deepfilternet3"), allow(dead_code))]
+    dfn3_attenuation_limit_db: f32,
+    #[cfg_attr(not(feature = "deepfilternet3"), allow(dead_code))]
+    dfn3_post_filter_beta: f32,
+    webrtc_suppression_level: vc_core::denoise_config::WebRtcSuppressionLevel,
     #[cfg(feature = "gtcrn")]
     gtcrn_backend: vc_core::denoise::GtcrnBackend,
     denoiser: PassthroughDenoiser,
@@ -1448,22 +1757,24 @@ struct PassthroughProcessor {
 
 impl PassthroughProcessor {
     fn new(
-        mode: DenoiserMode,
         shaping: NoiseGateShaping,
         input_rate: u32,
         output_rate: u32,
-        gtcrn_model_dir: Option<PathBuf>,
-        #[cfg(feature = "gtcrn")] gtcrn_backend: vc_core::denoise::GtcrnBackend,
+        denoiser_settings: DenoiserLoadSettings,
         live: &LiveParams,
     ) -> Result<Self> {
         let mut processor = Self {
-            mode,
+            mode: denoiser_settings.mode,
             shaping,
             input_rate,
             output_rate,
-            gtcrn_model_dir,
+            gtcrn_model_dir: denoiser_settings.gtcrn_model_dir,
+            deepfilternet3_model: denoiser_settings.deepfilternet3_model,
+            dfn3_attenuation_limit_db: denoiser_settings.dfn3_attenuation_limit_db,
+            dfn3_post_filter_beta: denoiser_settings.dfn3_post_filter_beta,
+            webrtc_suppression_level: denoiser_settings.webrtc_suppression_level,
             #[cfg(feature = "gtcrn")]
-            gtcrn_backend,
+            gtcrn_backend: denoiser_settings.gtcrn_backend,
             denoiser: PassthroughDenoiser::Off,
             resampler: dsp::StreamingResampleMono::new(input_rate as usize, output_rate as usize)?,
             input_scratch: Vec::new(),
@@ -1475,6 +1786,37 @@ impl PassthroughProcessor {
     fn reset(&mut self, live: &LiveParams) -> Result<()> {
         self.resampler =
             dsp::StreamingResampleMono::new(self.input_rate as usize, self.output_rate as usize)?;
+        // Route re-entry resets state but must not rebuild a loaded DFN3 graph
+        // (or an already initialized recurrent denoiser) on the worker. A new
+        // mode takes the construction path below; a continuing mode reuses its
+        // private instance and merely clears its streaming history.
+        match (&mut self.denoiser, self.mode) {
+            #[cfg(feature = "rnnoise")]
+            (PassthroughDenoiser::Rnnoise(denoiser), DenoiserMode::Rnnoise) => {
+                denoiser.reset()?;
+                self.update_live_denoiser(live);
+                return Ok(());
+            }
+            #[cfg(feature = "webrtc")]
+            (PassthroughDenoiser::WebRtc(denoiser), DenoiserMode::WebRtc) => {
+                denoiser.reset()?;
+                self.update_live_denoiser(live);
+                return Ok(());
+            }
+            #[cfg(feature = "gtcrn")]
+            (PassthroughDenoiser::Gtcrn(denoiser), DenoiserMode::Gtcrn) => {
+                denoiser.reset()?;
+                self.update_live_denoiser(live);
+                return Ok(());
+            }
+            #[cfg(feature = "deepfilternet3")]
+            (PassthroughDenoiser::DeepFilterNet3(denoiser), DenoiserMode::DeepFilterNet3) => {
+                denoiser.reset()?;
+                self.update_live_denoiser(live);
+                return Ok(());
+            }
+            _ => {}
+        }
         self.denoiser = match self.mode {
             DenoiserMode::Rnnoise => {
                 #[cfg(feature = "rnnoise")]
@@ -1507,6 +1849,41 @@ impl PassthroughProcessor {
                     bail!("GTCRN support is not enabled in this build")
                 }
             }
+            DenoiserMode::WebRtc => {
+                #[cfg(feature = "webrtc")]
+                {
+                    PassthroughDenoiser::WebRtc(Box::new(vc_core::denoise::WebRtcDenoiser::new(
+                        self.input_rate,
+                        self.webrtc_suppression_level,
+                    )?))
+                }
+                #[cfg(not(feature = "webrtc"))]
+                {
+                    bail!("WebRTC denoising support is not enabled in this build")
+                }
+            }
+            DenoiserMode::DeepFilterNet3 => {
+                #[cfg(feature = "deepfilternet3")]
+                {
+                    let model_path = self.deepfilternet3_model.as_deref().ok_or_else(|| {
+                        anyhow!("DeepFilterNet3 requires a model archive (deepfilternet3_model)")
+                    })?;
+                    PassthroughDenoiser::DeepFilterNet3(Box::new(
+                        vc_core::denoise::DeepFilterNet3Denoiser::new(
+                            vc_core::denoise::DeepFilterNet3Config {
+                                model_path,
+                                attenuation_limit_db: self.dfn3_attenuation_limit_db,
+                                post_filter_beta: self.dfn3_post_filter_beta,
+                            },
+                            self.input_rate,
+                        )?,
+                    ))
+                }
+                #[cfg(not(feature = "deepfilternet3"))]
+                {
+                    bail!("DeepFilterNet3 support is not enabled in this build")
+                }
+            }
             DenoiserMode::Off | DenoiserMode::NoiseGate => PassthroughDenoiser::Off,
         };
         self.update_live_denoiser(live);
@@ -1516,8 +1893,14 @@ impl PassthroughProcessor {
     /// Hot-swap the passthrough denoiser variant (off / gate / rnnoise). Unlike
     /// `reset`, the resampler is left untouched — rebuilding it would drop the
     /// phase of the audio already flowing through passthrough.
-    fn set_denoiser_mode(&mut self, mode: DenoiserMode, live: &LiveParams) -> Result<()> {
+    fn set_denoiser_mode(
+        &mut self,
+        mode: DenoiserMode,
+        live: &LiveParams,
+        webrtc_suppression_level: vc_core::denoise_config::WebRtcSuppressionLevel,
+    ) -> Result<()> {
         self.mode = mode;
+        self.webrtc_suppression_level = webrtc_suppression_level;
         self.denoiser = match mode {
             DenoiserMode::Off => PassthroughDenoiser::Off,
             DenoiserMode::NoiseGate => PassthroughDenoiser::Gate(dsp::NoiseGate::new(
@@ -1539,8 +1922,22 @@ impl PassthroughProcessor {
                     bail!("RNNoise support is not enabled in this build")
                 }
             }
-            // GTCRN attaches via `set_gtcrn`; clear the device-rate stage.
-            DenoiserMode::Gtcrn => PassthroughDenoiser::Off,
+            DenoiserMode::WebRtc => {
+                #[cfg(feature = "webrtc")]
+                {
+                    PassthroughDenoiser::WebRtc(Box::new(vc_core::denoise::WebRtcDenoiser::new(
+                        self.input_rate,
+                        self.webrtc_suppression_level,
+                    )?))
+                }
+                #[cfg(not(feature = "webrtc"))]
+                {
+                    bail!("WebRTC denoising support is not enabled in this build")
+                }
+            }
+            // Graph-backed modes attach via their pre-built swap command; clear
+            // the device-rate stage while their loader owns construction.
+            DenoiserMode::Gtcrn | DenoiserMode::DeepFilterNet3 => PassthroughDenoiser::Off,
         };
         self.update_live_denoiser(live);
         Ok(())
@@ -1559,10 +1956,29 @@ impl PassthroughProcessor {
             .unwrap_or(PassthroughDenoiser::Off);
     }
 
+    /// Hot-swap the device-rate DFN3 instance constructed on a loader thread.
+    #[cfg(feature = "deepfilternet3")]
+    fn set_deepfilternet3(&mut self, denoiser: Option<vc_core::denoise::DeepFilterNet3Denoiser>) {
+        self.mode = if denoiser.is_some() {
+            DenoiserMode::DeepFilterNet3
+        } else {
+            DenoiserMode::Off
+        };
+        self.denoiser = denoiser
+            .map(|d| PassthroughDenoiser::DeepFilterNet3(Box::new(d)))
+            .unwrap_or(PassthroughDenoiser::Off);
+    }
+
     fn update_live_denoiser(&mut self, live: &LiveParams) {
         // Stateful denoisers are static load-time choices; a live gate toggle must
         // never tear them down.
-        if self.mode == DenoiserMode::Rnnoise || self.mode == DenoiserMode::Gtcrn {
+        if matches!(
+            self.mode,
+            DenoiserMode::Rnnoise
+                | DenoiserMode::Gtcrn
+                | DenoiserMode::WebRtc
+                | DenoiserMode::DeepFilterNet3
+        ) {
             return;
         }
         if !live.noise_gate_enabled {
@@ -1603,8 +2019,16 @@ impl PassthroughProcessor {
             PassthroughDenoiser::Rnnoise(denoiser) => {
                 denoiser.process_in_place(&mut self.input_scratch)?
             }
+            #[cfg(feature = "webrtc")]
+            PassthroughDenoiser::WebRtc(denoiser) => {
+                denoiser.process_in_place(&mut self.input_scratch)?
+            }
             #[cfg(feature = "gtcrn")]
             PassthroughDenoiser::Gtcrn(denoiser) => {
+                denoiser.process_in_place(&mut self.input_scratch)?
+            }
+            #[cfg(feature = "deepfilternet3")]
+            PassthroughDenoiser::DeepFilterNet3(denoiser) => {
                 denoiser.process_in_place(&mut self.input_scratch)?
             }
         }
@@ -1687,7 +2111,9 @@ impl RuntimeModel {
                     rvc.reset_streaming_state();
                     *passthrough_active = false;
                 }
-                rvc.model_mut().apply_live(live);
+                if rvc.model_mut().apply_live(live) {
+                    rvc.reset_streaming_state();
+                }
                 // Write the converted chunk straight into the worker-owned
                 // `prepared` buffer (reused across chunks) instead of moving a
                 // freshly allocated Vec out of the converter.
@@ -1721,7 +2147,9 @@ impl RuntimeModel {
                     *passthrough_active = false;
                 }
                 let model = &mut models[*active];
-                model.model_mut().apply_live(live);
+                if model.model_mut().apply_live(live) {
+                    model.reset_streaming_state();
+                }
                 model.process_chunk(audio, sample_rate, None, prepared)
             }
         }
@@ -1839,24 +2267,38 @@ impl RuntimeModel {
         mode: DenoiserMode,
         input_rate: u32,
         live: &LiveParams,
+        webrtc_suppression_level: vc_core::denoise_config::WebRtcSuppressionLevel,
     ) -> Result<()> {
         let core_mode: vc_core::model_rvc::InputDenoiserMode = mode.into();
         match self {
-            Self::PassthroughOnly(passthrough) => passthrough.set_denoiser_mode(mode, live),
+            Self::PassthroughOnly(passthrough) => {
+                passthrough.set_denoiser_mode(mode, live, webrtc_suppression_level)
+            }
             Self::Switchable {
                 passthrough, rvc, ..
             } => {
-                passthrough.set_denoiser_mode(mode, live)?;
-                rvc.model_mut().set_denoiser_mode(core_mode, input_rate)
+                passthrough.set_denoiser_mode(mode, live, webrtc_suppression_level)?;
+                rvc.model_mut().set_denoiser_mode(
+                    core_mode,
+                    input_rate,
+                    webrtc_suppression_level,
+                )?;
+                rvc.reset_streaming_state();
+                Ok(())
             }
             Self::Pool {
                 passthrough,
                 models,
                 ..
             } => {
-                passthrough.set_denoiser_mode(mode, live)?;
+                passthrough.set_denoiser_mode(mode, live, webrtc_suppression_level)?;
                 for model in models.iter_mut() {
-                    model.model_mut().set_denoiser_mode(core_mode, input_rate)?;
+                    model.model_mut().set_denoiser_mode(
+                        core_mode,
+                        input_rate,
+                        webrtc_suppression_level,
+                    )?;
+                    model.reset_streaming_state();
                 }
                 Ok(())
             }
@@ -1879,6 +2321,7 @@ impl RuntimeModel {
                 passthrough.set_gtcrn(passthrough_denoiser);
                 rvc.model_mut()
                     .set_gtcrn(model_denoisers.into_iter().next());
+                rvc.reset_streaming_state();
             }
             Self::Pool {
                 passthrough,
@@ -1888,6 +2331,42 @@ impl RuntimeModel {
                 passthrough.set_gtcrn(passthrough_denoiser);
                 for (model, denoiser) in models.iter_mut().zip(model_denoisers) {
                     model.model_mut().set_gtcrn(Some(denoiser));
+                    model.reset_streaming_state();
+                }
+            }
+        }
+    }
+
+    /// Hot-swap pre-built DeepFilterNet3 denoisers (one device-rate stream per
+    /// RVC model and one for passthrough). The DFN3 graph is built by the
+    /// background loader, never by this audio-deadline worker.
+    #[cfg(feature = "deepfilternet3")]
+    fn set_deepfilternet3(
+        &mut self,
+        passthrough_denoiser: Option<vc_core::denoise::DeepFilterNet3Denoiser>,
+        model_denoisers: Vec<vc_core::denoise::DeepFilterNet3Denoiser>,
+    ) {
+        match self {
+            Self::PassthroughOnly(passthrough) => {
+                passthrough.set_deepfilternet3(passthrough_denoiser)
+            }
+            Self::Switchable {
+                passthrough, rvc, ..
+            } => {
+                passthrough.set_deepfilternet3(passthrough_denoiser);
+                rvc.model_mut()
+                    .set_deepfilternet3(model_denoisers.into_iter().next());
+                rvc.reset_streaming_state();
+            }
+            Self::Pool {
+                passthrough,
+                models,
+                ..
+            } => {
+                passthrough.set_deepfilternet3(passthrough_denoiser);
+                for (model, denoiser) in models.iter_mut().zip(model_denoisers) {
+                    model.model_mut().set_deepfilternet3(Some(denoiser));
+                    model.reset_streaming_state();
                 }
             }
         }
@@ -1901,6 +2380,8 @@ impl From<DenoiserMode> for vc_core::model_rvc::InputDenoiserMode {
             DenoiserMode::NoiseGate => vc_core::model_rvc::InputDenoiserMode::Gate,
             DenoiserMode::Rnnoise => vc_core::model_rvc::InputDenoiserMode::Rnnoise,
             DenoiserMode::Gtcrn => vc_core::model_rvc::InputDenoiserMode::Gtcrn,
+            DenoiserMode::WebRtc => vc_core::model_rvc::InputDenoiserMode::WebRtc,
+            DenoiserMode::DeepFilterNet3 => vc_core::model_rvc::InputDenoiserMode::DeepFilterNet3,
         }
     }
 }
@@ -2047,22 +2528,14 @@ impl RealtimeSession {
             None
         };
         let current_live = live.load();
-        #[cfg(feature = "gtcrn")]
-        let gtcrn_backend = vc_core::denoise::GtcrnBackend::for_provider(
-            config.provider,
-            config.gpu_priority,
-            config.gpu_device_id,
-        );
+        let denoiser_settings = DenoiserLoadSettings::from_realtime(&config, config.denoiser_mode);
         let debug_input = Arc::new(Mutex::new(Vec::new()));
         let debug_output = Arc::new(Mutex::new(Vec::new()));
         let passthrough_processor = PassthroughProcessor::new(
-            config.denoiser_mode,
             config.noise_gate_shaping,
             input_rate,
             output_rate,
-            config.gtcrn_model_dir.clone(),
-            #[cfg(feature = "gtcrn")]
-            gtcrn_backend,
+            denoiser_settings.clone(),
             &current_live,
         )?;
         let passthrough_live_switchable = config.has_complete_model_set();
@@ -2080,14 +2553,7 @@ impl RealtimeSession {
                 &current_live,
                 Some(&report_progress),
             );
-            let pipeline = load_rvc_pipeline(
-                pipeline_config,
-                config.denoiser_mode,
-                #[cfg(feature = "gtcrn")]
-                config.gtcrn_model_dir.as_deref(),
-                #[cfg(feature = "gtcrn")]
-                gtcrn_backend,
-            )?;
+            let pipeline = denoiser_settings.load_pipeline(pipeline_config)?;
             RuntimeModel::Switchable {
                 passthrough: passthrough_processor,
                 rvc: ChunkConverter::new(
@@ -2235,11 +2701,17 @@ impl RealtimeSession {
                                         st.speaker_count = model.active_speaker_count();
                                     }
                                 }
-                                WorkerCommand::SetDenoiser { mode } => {
+                                WorkerCommand::SetDenoiser {
+                                    mode,
+                                    webrtc_suppression_level,
+                                } => {
                                     let live_params = live.load();
-                                    if let Err(err) =
-                                        model.set_denoiser_mode(mode, input_rate, &live_params)
-                                    {
+                                    if let Err(err) = model.set_denoiser_mode(
+                                        mode,
+                                        input_rate,
+                                        &live_params,
+                                        webrtc_suppression_level,
+                                    ) {
                                         tracing::warn!("failed to switch denoiser: {err}");
                                     }
                                 }
@@ -2249,6 +2721,13 @@ impl RealtimeSession {
                                     passthrough_denoiser,
                                 } => {
                                     model.set_gtcrn(passthrough_denoiser, model_denoisers);
+                                }
+                                #[cfg(feature = "deepfilternet3")]
+                                WorkerCommand::SwapDeepFilterNet3 {
+                                    model_denoisers,
+                                    passthrough_denoiser,
+                                } => {
+                                    model.set_deepfilternet3(passthrough_denoiser, model_denoisers);
                                 }
                             }
                         }
@@ -2592,6 +3071,7 @@ impl RealtimeSession {
             embedder: self.config.embedder.clone().expect("validated"),
             embedder_output: self.config.embedder_output.clone(),
             f0_model: self.config.f0_model.clone().expect("validated"),
+            feature_index: self.config.feature_index.clone(),
             provider: self.config.provider,
             gpu_priority: self.config.gpu_priority,
             gpu_device_id: self.config.gpu_device_id,
@@ -2599,6 +3079,11 @@ impl RealtimeSession {
             chunk_samples: dsp::chunk_samples_for_rate(self.input_rate, self.config.chunk_ms),
             speaker_id: live.speaker_id,
             pitch_shift: live.pitch_shift,
+            index_rate: live.index_rate,
+            protect: live.protect,
+            protect_transition_ms: live.protect_transition_ms,
+            denoiser_content_mix: live.denoiser_content_mix,
+            denoiser_rmvpe_mix: live.denoiser_rmvpe_mix,
             input_gain: live.input_gain,
             output_gain: live.output_gain,
             f0: self.config.f0.clone(),
@@ -2615,14 +3100,7 @@ impl RealtimeSession {
             crossfade_ms: self.config.crossfade_ms,
             sola_search_ms: self.config.sola_search_ms,
             tail_discard_ms: self.config.rvc_output_tail_discard_ms,
-            denoiser_mode,
-            gtcrn_model_dir: self.config.gtcrn_model_dir.clone(),
-            #[cfg(feature = "gtcrn")]
-            gtcrn_backend: vc_core::denoise::GtcrnBackend::for_provider(
-                self.config.provider,
-                self.config.gpu_priority,
-                self.config.gpu_device_id,
-            ),
+            denoiser: DenoiserLoadSettings::from_realtime(&self.config, denoiser_mode),
         }
     }
 }
@@ -2801,6 +3279,10 @@ pub fn write_wav_mono(path: &Path, samples: &[f32], sample_rate: u32) -> Result<
 mod tests {
     use super::*;
 
+    fn test_denoiser_settings(mode: DenoiserMode) -> DenoiserLoadSettings {
+        DenoiserLoadSettings::from_realtime(&RealtimeConfig::default(), mode)
+    }
+
     #[test]
     fn live_params_round_trip_through_atomics() {
         let params = LiveParams {
@@ -2811,6 +3293,11 @@ mod tests {
             monitor_gain: 1.5,
             noise_gate_enabled: true,
             noise_gate_threshold: 0.025,
+            index_rate: 0.7,
+            protect: 0.33,
+            protect_transition_ms: 20,
+            denoiser_content_mix: 0.42,
+            denoiser_rmvpe_mix: 0.58,
         };
         let atomic = AtomicLiveParams::new(params);
         let out = atomic.load();
@@ -2821,6 +3308,11 @@ mod tests {
         assert_eq!(out.monitor_gain, params.monitor_gain);
         assert_eq!(out.noise_gate_enabled, params.noise_gate_enabled);
         assert_eq!(out.noise_gate_threshold, params.noise_gate_threshold);
+        assert_eq!(out.index_rate, params.index_rate);
+        assert_eq!(out.protect, params.protect);
+        assert_eq!(out.protect_transition_ms, params.protect_transition_ms);
+        assert_eq!(out.denoiser_content_mix, params.denoiser_content_mix);
+        assert_eq!(out.denoiser_rmvpe_mix, params.denoiser_rmvpe_mix);
     }
 
     #[test]
@@ -2918,13 +3410,10 @@ mod tests {
             ..Default::default()
         };
         let mut processor = PassthroughProcessor::new(
-            DenoiserMode::Off,
             NoiseGateShaping::default(),
             48_000,
             48_000,
-            None,
-            #[cfg(feature = "gtcrn")]
-            vc_core::denoise::GtcrnBackend::OrtCpu,
+            test_denoiser_settings(DenoiserMode::Off),
             &live,
         )
         .unwrap();
@@ -2947,7 +3436,6 @@ mod tests {
             ..Default::default()
         };
         let mut processor = PassthroughProcessor::new(
-            DenoiserMode::NoiseGate,
             NoiseGateShaping {
                 attack_ms: 0.0,
                 release_ms: 0.0,
@@ -2955,9 +3443,7 @@ mod tests {
             },
             48_000,
             48_000,
-            None,
-            #[cfg(feature = "gtcrn")]
-            vc_core::denoise::GtcrnBackend::OrtCpu,
+            test_denoiser_settings(DenoiserMode::NoiseGate),
             &live,
         )
         .unwrap();
@@ -2975,13 +3461,10 @@ mod tests {
     fn passthrough_processor_runs_rnnoise_and_preserves_chunk_length() {
         let live = LiveParams::default();
         let mut processor = PassthroughProcessor::new(
-            DenoiserMode::Rnnoise,
             NoiseGateShaping::default(),
             48_000,
             48_000,
-            None,
-            #[cfg(feature = "gtcrn")]
-            vc_core::denoise::GtcrnBackend::OrtCpu,
+            test_denoiser_settings(DenoiserMode::Rnnoise),
             &live,
         )
         .unwrap();

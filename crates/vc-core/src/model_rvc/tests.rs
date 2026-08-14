@@ -15,7 +15,7 @@ use super::shape::{
     rmvpe_model_input_samples_for_context_16k, tensor_rt_model_input_samples_16k,
     EMBEDDER_SAMPLE_RATE, RVC_SAMPLE_RATE,
 };
-use super::stream::{RvcStreamState, VOLUME_DECAY};
+use super::stream::{RvcStreamState, StreamInputTiming, VOLUME_DECAY};
 use super::tensorrt::{
     format_usize_shape, i64_shape_to_usize, tensor_rt_benchmark_profile, tensor_rt_cache_key,
     tensor_rt_cache_root_from_override, tensor_rt_model_cache_key, tensor_rt_model_file_hash,
@@ -381,10 +381,130 @@ fn stream_state_keeps_16k_history_for_embedder() {
 
     assert_eq!(state.audio_buffer.len(), 4_800);
     assert_eq!(state.audio_16k_buffer.len(), 1_600);
+    assert_eq!(state.audio_16k_buffer, state.pitch_16k_buffer);
+    assert!(
+        state.pitch_resampler_16k.is_none(),
+        "the no-denoiser path must not run a second 16 kHz resampler"
+    );
     assert!(state
         .audio_16k_buffer
         .iter()
         .any(|sample| sample.abs() > 1e-4));
+}
+
+#[test]
+fn stream_state_keeps_content_and_pitch_branches_aligned() {
+    let mut state = RvcStreamState::new(48_000);
+    let raw = vec![0.8; 4_800];
+    let denoised = vec![0.2; 4_800];
+
+    state
+        .generate_input_with_pitch(
+            &raw,
+            &denoised,
+            StreamInputTiming {
+                sample_rate: 48_000,
+                crossfade_and_search_samples: 0,
+                volume_excluded_samples: 0,
+                extra_convert_samples: 0,
+                denoiser_content_mix: 0.25,
+                denoiser_rmvpe_mix: 1.0,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(state.audio_16k_buffer.len(), state.pitch_16k_buffer.len());
+    assert_eq!(state.audio_16k_buffer.len(), 1_600);
+    // Both independent streaming resamplers have the same filter startup
+    // transient. Verify the resulting linear relation instead of assuming a
+    // constant value before that transient settles: 0.75 * 0.8 + 0.25 * 0.2
+    // equals 3.25 times the pitch branch's 0.2 source.
+    assert!(state
+        .audio_16k_buffer
+        .iter()
+        .zip(&state.pitch_16k_buffer)
+        .all(|(content, pitch)| (*content - *pitch * 3.25).abs() < 1e-4));
+    assert!(state
+        .pitch_16k_buffer
+        .iter()
+        .any(|sample| sample.abs() > 1e-4));
+}
+
+#[test]
+fn stream_state_rmvpe_mix_interpolates_aligned_raw_and_denoised_inputs() {
+    let raw = vec![0.8; 4_800];
+    let denoised = vec![0.2; 4_800];
+    let run = |denoiser_rmvpe_mix| {
+        let mut state = RvcStreamState::new(48_000);
+        state
+            .generate_input_with_pitch(
+                &raw,
+                &denoised,
+                StreamInputTiming {
+                    sample_rate: 48_000,
+                    crossfade_and_search_samples: 0,
+                    volume_excluded_samples: 0,
+                    extra_convert_samples: 0,
+                    denoiser_content_mix: 0.0,
+                    denoiser_rmvpe_mix,
+                },
+            )
+            .unwrap();
+        state.pitch_16k_buffer.clone()
+    };
+
+    let raw_pitch = run(0.0);
+    let mixed_pitch = run(0.5);
+    let denoised_pitch = run(1.0);
+    assert_eq!(raw_pitch.len(), denoised_pitch.len());
+    assert!(raw_pitch
+        .iter()
+        .zip(&denoised_pitch)
+        .zip(&mixed_pitch)
+        .all(|((raw, denoised), mixed)| { (*mixed - (*raw + *denoised) * 0.5).abs() < 1e-5 }));
+    assert!(raw_pitch
+        .iter()
+        .zip(&denoised_pitch)
+        .any(|(raw, denoised)| (raw - denoised).abs() > 1e-4));
+}
+
+#[test]
+fn stream_state_path_change_restarts_both_histories() {
+    let mut state = RvcStreamState::new(48_000);
+    let first = vec![1.0; 160];
+    state.generate_input(&first, 16_000, 0, 0, 480).unwrap();
+
+    let raw = vec![0.8; 160];
+    let denoised = vec![0.2; 160];
+    state
+        .generate_input_with_pitch(
+            &raw,
+            &denoised,
+            StreamInputTiming {
+                sample_rate: 16_000,
+                crossfade_and_search_samples: 0,
+                volume_excluded_samples: 0,
+                extra_convert_samples: 480,
+                denoiser_content_mix: 0.25,
+                denoiser_rmvpe_mix: 1.0,
+            },
+        )
+        .unwrap();
+
+    assert!(state.pitch_resampler_16k.is_some());
+    assert_eq!(state.audio_16k_buffer.len(), 320);
+    assert!(state.audio_16k_buffer[..160]
+        .iter()
+        .all(|sample| *sample == 0.0));
+    assert!(state.pitch_16k_buffer[..160]
+        .iter()
+        .all(|sample| *sample == 0.0));
+    assert!(state.audio_16k_buffer[160..]
+        .iter()
+        .all(|sample| (*sample - 0.65).abs() < 1e-6));
+    assert!(state.pitch_16k_buffer[160..]
+        .iter()
+        .all(|sample| (*sample - 0.2).abs() < 1e-6));
 }
 
 #[test]

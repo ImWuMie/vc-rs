@@ -40,6 +40,10 @@
     (CPAL_ASIO_DIR) on the build machine; see scripts\README.md. VST3 is never
     built with ASIO (it uses the DAW's I/O).
 
+.PARAMETER DeepFilterNet3
+    Include the optional DeepFilterNet3 denoiser implementation. The official
+    model archive remains external and is never copied into the distribution.
+
 .PARAMETER NoZip
     Stage and populate the package but stop before creating the .zip. The
     populated, ready-to-run dist\<stem>\ folder is left in place.
@@ -91,6 +95,10 @@
 .EXAMPLE
     # Smallest TensorRT package (engines built/cached elsewhere):
     pwsh crates\vc-cli\package.ps1 -Variant tensorrt -RuntimeOnly
+
+.EXAMPLE
+    # Windows ML package with WebRTC and optional DeepFilterNet3 support:
+    pwsh crates\vc-cli\package.ps1 -DeepFilterNet3
 #>
 [CmdletBinding()]
 param(
@@ -103,6 +111,9 @@ param(
     # scripts\README.md). Off by default so the windowsml package keeps needing no
     # special toolchain.
     [switch]$Asio,
+    # Include the DFN3 runtime code only. Its official archive remains a
+    # user-selected external model so release ZIPs never redistribute weights.
+    [switch]$DeepFilterNet3,
     [switch]$NoZip,
     # Keep the populated, ready-to-run dist\<stem>\ folder beside the .zip. Kept by
     # default for every variant (handy for testing the unpacked package). -CleanStage
@@ -140,14 +151,18 @@ if (-not (Get-Command cargo-about -ErrorAction SilentlyContinue)) {
 
 # Single-provider feature set per variant. `--no-default-features` drops the
 # other backend so the binary stays lean (a tensorrt build sheds ONNX Runtime).
-# GTCRN ships in both standalone variants: Windows ML uses ORT CPU for the tiny
-# graph, while TensorRT stays ORT-free and runs GTCRN through the native shim.
+# GTCRN and WebRTC ship in both standalone variants: Windows ML uses ORT CPU for
+# the tiny GTCRN graph, while TensorRT stays ORT-free and runs GTCRN through the
+# native shim. DeepFilterNet3 is deliberately opt-in; when selected, both the
+# binary and generated license notices use the same feature set. Its model archive
+# always stays outside the package.
 # -Asio appends the (orthogonal) ASIO audio backend.
 $features = switch ($Variant) {
-    'windowsml' { 'windowsml,rnnoise,gtcrn' }
-    'tensorrt' { 'tensorrt,rnnoise,gtcrn' }
+    'windowsml' { 'windowsml,rnnoise,gtcrn,webrtc' }
+    'tensorrt' { 'tensorrt,rnnoise,gtcrn,webrtc' }
 }
 if ($Asio) { $features += ',asio' }
+if ($DeepFilterNet3) { $features += ',deepfilternet3' }
 $buildFeatureArgs = @('--no-default-features', '--features', $features)
 
 Push-Location $repoRoot
@@ -182,6 +197,9 @@ try {
     #    DLLs beside them (and so we don't pollute target\release). The folder is
     #    named after the archive stem so a kept dir sits next to its .zip.
     $tag = $Variant
+    # A DFN3 binary is feature-distinct from the normal package. Keep its stage
+    # and ZIP separate so it cannot overwrite a normal package with the same backend.
+    if ($DeepFilterNet3) { $tag += '-dfn3' }
     if ($Variant -eq 'tensorrt' -and $RuntimeOnly) { $tag += '-runtime' }
 
     $version = '0.0.0'
@@ -270,6 +288,18 @@ redistribute the ASIO SDK.
     }
     else { '' }
 
+    $dfn3Note = if ($DeepFilterNet3) {
+        @"
+
+This build includes the optional DeepFilterNet3 denoiser implementation. Its
+official model archive is intentionally not included. Download it separately:
+    pwsh .\download-models.ps1 -DeepFilterNet3
+Then select assets\deepfilternet3\DeepFilterNet3_onnx.tar.gz in the GUI or pass
+--deepfilternet3-model to the CLI when using --denoiser deep-filter-net3.
+"@
+    }
+    else { '' }
+
     $install = @"
 vc-rs — RVC voice conversion standalone app ($Variant build, v$version)
 
@@ -280,6 +310,7 @@ The CLI is included for diagnostics, automation, and WAV conversion:
     .\vc-rs.exe --help
     .\vc-rs.exe doctor
     .\vc-rs.exe devices
+$dfn3Note
 
 Models — get the shared embedder + F0 models (optional helper):
     pwsh .\download-models.ps1

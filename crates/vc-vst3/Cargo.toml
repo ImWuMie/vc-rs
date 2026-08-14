@@ -15,12 +15,15 @@ crate-type = ["cdylib", "lib"]
 # Default package: CPU + Windows ML via Windows App SDK Runtime 2.x, which keeps
 # ONNX Runtime/DirectML DLLs out of the bundle. Build CUDA or TensorRT packages
 # explicitly with `--no-default-features --features cuda|tensorrt`.
-default = ["windowsml"]
+default = ["windowsml", "webrtc"]
 # The CUDA build bundles and preloads the ONNX Runtime CUDA provider DLLs, so it
 # needs the `ort` dependency. The TensorRT-only build drops ORT entirely.
 cuda = ["vc-core/cuda", "dep:ort"]
 windowsml = ["vc-core/windowsml", "dep:ort"]
 tensorrt = ["vc-core/tensorrt"]
+rnnoise = ["vc-core/rnnoise"]
+webrtc = ["vc-core/webrtc"]
+deepfilternet3 = ["vc-core/deepfilternet3"]
 
 [dependencies]
 # The VST3 SDK bindings (via nice-plug) are ISC-licensed, so the .vst3 keeps the

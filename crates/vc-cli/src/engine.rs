@@ -12,8 +12,8 @@ use vc_app::{
 use vc_core::dsp;
 use vc_core::model_rvc::{
     set_process_gpu_priority, set_process_power_throttling, ChunkConverter, ChunkOutputConfig,
-    F0Config, F0PostprocessConfig, GpuPriority, NoiseGateShaping, OutputDynamicsConfig,
-    RvcPipeline, RvcPipelineConfig,
+    F0Config, F0PostprocessConfig, FeatureRetrievalConfig, GpuPriority, NoiseGateShaping,
+    OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
 
@@ -35,6 +35,11 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         // so derive it from the selected mode; the unified live path applies it.
         noise_gate_enabled: denoiser_mode == DenoiserMode::NoiseGate,
         noise_gate_threshold: args.noise_gate_threshold,
+        denoiser_content_mix: args.denoiser_content_mix,
+        denoiser_rmvpe_mix: args.denoiser_rmvpe_mix,
+        index_rate: args.index_rate,
+        protect: args.protect,
+        protect_transition_ms: args.protect_transition_ms,
     };
     let wasapi_input_exclusive = args.wasapi_input_exclusive();
     let wasapi_output_exclusive = args.wasapi_output_exclusive();
@@ -46,6 +51,7 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         embedder: args.embedder,
         embedder_output: args.embedder_output,
         f0_model: args.f0_model,
+        feature_index: args.index_path,
         provider: args.provider,
         gpu_priority: args.gpu_priority.into(),
         gpu_device_id: args.gpu_device_id,
@@ -71,6 +77,10 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         },
         denoiser_mode,
         gtcrn_model_dir: args.gtcrn_model,
+        webrtc_suppression_level: args.webrtc_level,
+        deepfilternet3_model: args.deepfilternet3_model,
+        dfn3_attenuation_limit_db: args.dfn3_attenuation_limit_db,
+        dfn3_post_filter_beta: args.dfn3_post_filter_beta,
         noise_gate_shaping: NoiseGateShaping {
             attack_ms: args.noise_gate_attack_ms,
             release_ms: args.noise_gate_release_ms,
@@ -135,17 +145,8 @@ fn smoothing_kind(smoother: Smoother) -> SmoothingKind {
 pub fn run_wav(args: WavArgs) -> Result<()> {
     args.validate_conversion_options()
         .map_err(anyhow::Error::msg)?;
-    let (mut samples, spec) = read_wav_mono(&args.input)?;
+    let (samples, spec) = read_wav_mono(&args.input)?;
     let denoiser_mode = args.denoiser_mode();
-    let pipeline_input_gain = if denoiser_mode == Denoiser::Rnnoise {
-        for sample in &mut samples {
-            *sample = (*sample * args.input_gain.max(0.0)).clamp(-1.0, 1.0);
-        }
-        samples = process_rnnoise_finite(&samples, spec.sample_rate)?;
-        1.0
-    } else {
-        args.input_gain
-    };
     let chunk_samples = dsp::chunk_samples_for_rate(spec.sample_rate, args.chunk_ms);
     // Must cover the SOLA window the joiner actually uses, so the model emits
     // enough extra audio to feed `crossfade_ms` + `sola_search_ms` + tail.
@@ -178,9 +179,17 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             silence_threshold: 0.0,
             postprocess: F0PostprocessConfig::continuity(args.f0_continuity),
         },
-        input_gain: pipeline_input_gain,
+        retrieval: FeatureRetrievalConfig {
+            index_path: args.index_path.as_deref(),
+            index_rate: args.index_rate,
+            protect: args.protect,
+            protect_transition_ms: args.protect_transition_ms,
+        },
+        input_gain: args.input_gain,
         noise_gate_enabled: denoiser_mode == Denoiser::NoiseGate,
         noise_gate_threshold: args.noise_gate_threshold,
+        denoiser_content_mix: args.denoiser_content_mix,
+        denoiser_rmvpe_mix: args.denoiser_rmvpe_mix,
         noise_gate_shaping: NoiseGateShaping {
             attack_ms: args.noise_gate_attack_ms,
             release_ms: args.noise_gate_release_ms,
@@ -199,10 +208,18 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         },
         progress: None,
     };
-    // GTCRN runs at the 16 kHz seam inside the pipeline (load_with_gtcrn), not as
-    // a device-rate pre-pass like RNNoise. Its ~48 ms fixed delay shifts content
-    // slightly at the clip boundaries; output length still matches the input.
-    let model = load_wav_pipeline(denoiser_mode, args.gtcrn_model.as_deref(), pipeline_config)?;
+    // All denoisers load through the same RvcPipeline contract as realtime.
+    // Keeping WAV mode out of an ad-hoc pre-pass preserves ContentVec residual
+    // mixing, fixed-delay alignment, and recurrent-state behavior across fronts.
+    let model = load_wav_pipeline(
+        denoiser_mode,
+        args.gtcrn_model.as_deref(),
+        args.webrtc_level,
+        args.deepfilternet3_model.as_deref(),
+        args.dfn3_attenuation_limit_db,
+        args.dfn3_post_filter_beta,
+        pipeline_config,
+    )?;
     let mut converter = ChunkConverter::new(
         model,
         ChunkOutputConfig {
@@ -304,45 +321,72 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
     Ok(())
 }
 
-/// Load the WAV-mode pipeline, selecting the GTCRN loader when requested. The
-/// disabled-feature path is a runtime error, not a build error.
+/// Load the WAV-mode pipeline through the same shared RVC denoiser variants as
+/// realtime. The disabled-feature paths remain runtime errors, not build errors.
 fn load_wav_pipeline(
     denoiser_mode: Denoiser,
-    gtcrn_model: Option<&std::path::Path>,
+    _gtcrn_model: Option<&std::path::Path>,
+    webrtc_level: vc_core::denoise_config::WebRtcSuppressionLevel,
+    _deepfilternet3_model: Option<&std::path::Path>,
+    _dfn3_attenuation_limit_db: f32,
+    _dfn3_post_filter_beta: f32,
     config: RvcPipelineConfig<'_>,
 ) -> Result<RvcPipeline> {
-    if denoiser_mode == Denoiser::Gtcrn {
-        #[cfg(feature = "gtcrn")]
-        {
-            let model_dir = gtcrn_model
-                .ok_or_else(|| anyhow!("GTCRN denoiser requires --gtcrn-model <dir>"))?;
-            let backend = vc_core::denoise::GtcrnBackend::for_provider(
-                config.provider,
-                config.gpu_priority,
-                config.gpu_device_id,
-            );
-            return RvcPipeline::load_with_gtcrn(
-                config,
-                vc_core::denoise::GtcrnConfig { model_dir, backend },
-            );
+    match denoiser_mode {
+        Denoiser::Off | Denoiser::NoiseGate => RvcPipeline::load(config),
+        Denoiser::Rnnoise => {
+            #[cfg(feature = "rnnoise")]
+            {
+                RvcPipeline::load_with_rnnoise(config)
+            }
+            #[cfg(not(feature = "rnnoise"))]
+            anyhow::bail!("RNNoise support is not enabled in this build")
         }
-        #[cfg(not(feature = "gtcrn"))]
-        {
-            let _ = gtcrn_model;
-            anyhow::bail!("GTCRN support is not enabled in this build");
+        Denoiser::WebRtc => {
+            #[cfg(feature = "webrtc")]
+            {
+                RvcPipeline::load_with_webrtc(config, webrtc_level)
+            }
+            #[cfg(not(feature = "webrtc"))]
+            anyhow::bail!("WebRTC denoising support is not enabled in this build")
+        }
+        Denoiser::DeepFilterNet3 => {
+            #[cfg(feature = "deepfilternet3")]
+            {
+                let model_path = _deepfilternet3_model.ok_or_else(|| {
+                    anyhow!("DeepFilterNet3 requires --deepfilternet3-model <archive>")
+                })?;
+                RvcPipeline::load_with_deepfilternet3(
+                    config,
+                    vc_core::denoise::DeepFilterNet3Config {
+                        model_path,
+                        attenuation_limit_db: _dfn3_attenuation_limit_db,
+                        post_filter_beta: _dfn3_post_filter_beta,
+                    },
+                )
+            }
+            #[cfg(not(feature = "deepfilternet3"))]
+            anyhow::bail!("DeepFilterNet3 support is not enabled in this build")
+        }
+        Denoiser::Gtcrn => {
+            #[cfg(feature = "gtcrn")]
+            {
+                let model_dir = _gtcrn_model
+                    .ok_or_else(|| anyhow!("GTCRN denoiser requires --gtcrn-model <dir>"))?;
+                let backend = vc_core::denoise::GtcrnBackend::for_provider(
+                    config.provider,
+                    config.gpu_priority,
+                    config.gpu_device_id,
+                );
+                RvcPipeline::load_with_gtcrn(
+                    config,
+                    vc_core::denoise::GtcrnConfig { model_dir, backend },
+                )
+            }
+            #[cfg(not(feature = "gtcrn"))]
+            anyhow::bail!("GTCRN support is not enabled in this build")
         }
     }
-    RvcPipeline::load(config)
-}
-
-#[cfg(feature = "rnnoise")]
-fn process_rnnoise_finite(samples: &[f32], sample_rate: u32) -> Result<Vec<f32>> {
-    vc_core::denoise::RnnoiseDenoiser::process_finite(samples, sample_rate)
-}
-
-#[cfg(not(feature = "rnnoise"))]
-fn process_rnnoise_finite(_samples: &[f32], _sample_rate: u32) -> Result<Vec<f32>> {
-    anyhow::bail!("RNNoise support is not enabled in this build")
 }
 
 fn wav_model_input_chunk<'a>(

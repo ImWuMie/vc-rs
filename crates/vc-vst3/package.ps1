@@ -44,6 +44,10 @@
     from a previous variant can no longer linger. Accepted for back-compat; it has
     no additional effect and is ignored with -SkipBuild.
 
+.PARAMETER DeepFilterNet3
+    Include the optional DeepFilterNet3 denoiser implementation. The official
+    model archive remains external and is never copied into the distribution.
+
 .PARAMETER KeepStage
     Keep the staged, install-ready dist\<stem>\ folder beside the .zip. By default
     it is kept for windowsml and removed for tensorrt (which can be multiple GB).
@@ -84,6 +88,10 @@
 .EXAMPLE
     # Self-contained TensorRT package (bundles all GPU builder resources):
     pwsh crates\vc-vst3\package.ps1 -Variant tensorrt
+
+.EXAMPLE
+    # Windows ML plugin with WebRTC and optional DeepFilterNet3 support:
+    pwsh crates\vc-vst3\package.ps1 -DeepFilterNet3
 #>
 [CmdletBinding()]
 param(
@@ -93,6 +101,9 @@ param(
     [switch]$SkipBuild,
     [switch]$NoZip,
     [switch]$Clean,
+    # Include the DFN3 runtime code only. Its official archive remains a
+    # user-selected external model so release ZIPs never redistribute weights.
+    [switch]$DeepFilterNet3,
     # Keep the staged, install-ready dist\<stem>\ folder beside the .zip. By
     # default it is kept for windowsml and removed for tensorrt (which can be
     # multi-GB). -KeepStage forces keep; -CleanStage forces removal.
@@ -125,14 +136,19 @@ if (-not (Get-Command cargo-about -ErrorAction SilentlyContinue)) {
 # Sets CARGO_ENCODED_RUSTFLAGS, inherited by the cargo xtask bundle subprocess
 # below and the tensorrt builder-helper build.
 . (Join-Path $repoRoot 'scripts\rustflags.ps1')
-$installBundleName = "vc-vst3-$Variant.vst3"
+$installBundleStem = "vc-vst3-$Variant"
+if ($DeepFilterNet3) { $installBundleStem += '-dfn3' }
+$installBundleName = "$installBundleStem.vst3"
 
-# Feature flags per variant for `cargo xtask bundle`. windowsml is the default
-# feature set, so it needs no extra flags.
-$bundleFeatureArgs = switch ($Variant) {
-    'windowsml' { @() }
-    'tensorrt' { @('--no-default-features', '--features', 'tensorrt') }
+# Feature flags per variant for `cargo xtask bundle`. WebRTC is included in the
+# default plugin builds. DeepFilterNet3 is opt-in; when selected, the bundle and
+# generated license notice share the feature set. Its model archive is never bundled.
+$bundleFeatures = switch ($Variant) {
+    'windowsml' { 'windowsml,webrtc' }
+    'tensorrt' { 'tensorrt,webrtc' }
 }
+if ($DeepFilterNet3) { $bundleFeatures += ',deepfilternet3' }
+$bundleFeatureArgs = @('--no-default-features', '--features', $bundleFeatures)
 
 Push-Location $repoRoot
 try {
@@ -180,6 +196,8 @@ try {
     }
 
     $tag = $Variant
+    # Keep optional DFN3 packages distinct from normal packages of the same backend.
+    if ($DeepFilterNet3) { $tag += '-dfn3' }
     if ($Variant -eq 'tensorrt' -and $RuntimeOnly) { $tag += '-runtime' }
     $stem = "vc-vst3-$tag-v$version-win-x64"
 
@@ -272,6 +290,17 @@ needed. To override the path: setx VC_RS_TENSORRT_BUILDER_HELPER "<path>\vc-tens
     }
     else { '' }
 
+    $dfn3Note = if ($DeepFilterNet3) {
+        @"
+
+This plugin includes the optional DeepFilterNet3 denoiser implementation. Its
+official model archive is intentionally not included. From this folder, run:
+    pwsh .\download-models.ps1 -DeepFilterNet3
+Then select assets\deepfilternet3\DeepFilterNet3_onnx.tar.gz in the plugin GUI.
+"@
+    }
+    else { '' }
+
     $install = @"
 vc-vst3 — RVC voice conversion plugin ($Variant build, v$version)
 
@@ -285,6 +314,7 @@ ContentVec + RMVPE into .\assets\. In the plugin GUI, browse to
 assets\content_vec_500.onnx (embedder) and assets\rmvpe.onnx (F0), plus your own
 RVC voice model (.onnx). The downloaded models are third-party (GPL-3.0 upstream),
 not covered by this package's MIT license — see download-models.ps1.
+$dfn3Note
 
 Requirements for this ($Variant) build:
 $(switch ($Variant) {

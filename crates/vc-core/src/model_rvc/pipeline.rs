@@ -10,6 +10,7 @@ use crate::Provider;
 use super::api::{ModelOutput, VoiceModel};
 use super::f0_postprocess::{F0PostprocessConfig, F0Postprocessor};
 use super::feature::FeatureTensor;
+use super::feature_index::FeatureIndex;
 use super::inspect::{inspect_contentvec_input_name, inspect_rvc_model};
 use super::native_tensorrt::native_engine_is_cached;
 #[cfg(feature = "gtcrn")]
@@ -24,12 +25,38 @@ use super::shape::{
     onnx_silence_front_feature_frames, rmvpe_model_input_samples_for_context_16k,
     tensor_rt_model_input_samples_16k, RVC_SAMPLE_RATE,
 };
-use super::stream::RvcStreamState;
+use super::stream::{RvcStreamState, SampleDelay, StreamInputTiming};
 
 /// RMVPE confidence threshold used by upstream realtime RVC and MXGF. The old
 /// vc-rs default of 0.3 discarded substantially more low-confidence voiced
 /// frames and made large upward pitch shifts sound intermittent or grainy.
 pub const DEFAULT_F0_THRESHOLD: f32 = 0.03;
+/// Standard RVC protect value. `0.33` keeps roughly two thirds of the original
+/// ContentVec signal on unvoiced frames while leaving voiced frames fully
+/// retrieved; this preserves fricatives and breaths when index retrieval is on.
+pub const DEFAULT_PROTECT: f32 = 0.33;
+/// Standard RVC's `protect` upper bound. A value of `0.5` disables consonant
+/// protection; smaller values retain progressively more original ContentVec on
+/// unvoiced frames.
+pub const MAX_PROTECT: f32 = 0.5;
+/// Optional vc-rs extension: smooth the retrieved/original ContentVec blend on
+/// voiced frames beside an unvoiced boundary. Zero preserves RVC's binary
+/// protect mask exactly.
+pub const DEFAULT_PROTECT_TRANSITION_MS: u32 = 0;
+/// Cap the optional protect-boundary ramp so live automation has a bounded
+/// worker cost and cannot spread consonant protection across an entire chunk.
+pub const MAX_PROTECT_TRANSITION_MS: u32 = 100;
+const RVC_FEATURE_FRAME_MS: u32 = 10;
+/// Default share of the fully denoised signal mixed into ContentVec when a
+/// denoiser is active. RMVPE has its own independent mix control.
+pub const DEFAULT_DENOISER_CONTENT_MIX: f32 = 0.25;
+/// Keep the residual blend bounded: 0 is raw ContentVec input, 1 is the old
+/// single-path fully denoised behavior.
+pub const MAX_DENOISER_CONTENT_MIX: f32 = 1.0;
+/// Default share of the denoised branch sent to RMVPE. Keep this at full
+/// denoise for compatibility with the pre-control pipeline.
+pub const DEFAULT_DENOISER_RMVPE_MIX: f32 = 1.0;
+pub const MAX_DENOISER_RMVPE_MIX: f32 = 1.0;
 use super::tensorrt::{
     derive_rvc_feature_len, provider_uses_fixed_shape, tensor_rt_model_cache_key, ModelRole,
     TensorRtRunMode, TensorRtSessionProfile, TensorRtSessionPurpose, CUDA_GRAPH_ENV,
@@ -39,15 +66,20 @@ use super::tensorrt::{tensor_rt_warmup_feature_len, TensorRtSharedWaveform};
 
 const SKIP_SILENT_CHUNKS: bool = false;
 
-/// Input-side denoising stage, applied to the raw input (after `input_gain`)
-/// before RMS/silence detection and feature/F0 extraction. Keep future denoisers
-/// behind variants and match arms here so the timing-sensitive call site in
-/// `process()` does not change.
+/// Device-rate input denoising stage, applied after `input_gain` to the cleaned
+/// branch. ContentVec and RMVPE each keep a separately delayed raw branch and
+/// receive their own configured denoised share. Keep future denoisers behind
+/// variants and match arms here so the timing-sensitive call site in `process()`
+/// stays centralized.
 enum InputDenoiser {
     Off,
     Gate(dsp::NoiseGate),
     #[cfg(feature = "rnnoise")]
     Rnnoise(Box<crate::denoise::RnnoiseDenoiser>),
+    #[cfg(feature = "webrtc")]
+    WebRtc(Box<crate::denoise::WebRtcDenoiser>),
+    #[cfg(feature = "deepfilternet3")]
+    DeepFilterNet3(Box<crate::denoise::DeepFilterNet3Denoiser>),
 }
 
 /// Input denoiser variant for live hot-swapping on `RvcPipeline`. Distinct from
@@ -59,15 +91,33 @@ pub enum InputDenoiserMode {
     Gate,
     Rnnoise,
     Gtcrn,
+    WebRtc,
+    DeepFilterNet3,
 }
 
 impl InputDenoiser {
+    fn is_stateful(&self) -> bool {
+        match self {
+            Self::Off | Self::Gate(_) => false,
+            #[cfg(feature = "rnnoise")]
+            Self::Rnnoise(_) => true,
+            #[cfg(feature = "webrtc")]
+            Self::WebRtc(_) => true,
+            #[cfg(feature = "deepfilternet3")]
+            Self::DeepFilterNet3(_) => true,
+        }
+    }
+
     fn process_in_place(&mut self, buf: &mut [f32]) -> Result<()> {
         match self {
             InputDenoiser::Off => {}
             InputDenoiser::Gate(gate) => gate.process_in_place(buf),
             #[cfg(feature = "rnnoise")]
             InputDenoiser::Rnnoise(denoiser) => denoiser.process_in_place(buf)?,
+            #[cfg(feature = "webrtc")]
+            InputDenoiser::WebRtc(denoiser) => denoiser.process_in_place(buf)?,
+            #[cfg(feature = "deepfilternet3")]
+            InputDenoiser::DeepFilterNet3(denoiser) => denoiser.process_in_place(buf)?,
         }
         Ok(())
     }
@@ -83,11 +133,38 @@ impl InputDenoiser {
                 shaping.floor,
             )),
             #[cfg(feature = "rnnoise")]
-            InputDenoiser::Rnnoise(_) => InputDenoiser::Rnnoise(Box::new(
-                crate::denoise::RnnoiseDenoiser::new(sample_rate as u32)?,
-            )),
+            InputDenoiser::Rnnoise(denoiser) => {
+                denoiser.reset()?;
+                return Ok(());
+            }
+            #[cfg(feature = "webrtc")]
+            InputDenoiser::WebRtc(denoiser) => {
+                denoiser.reset()?;
+                return Ok(());
+            }
+            #[cfg(feature = "deepfilternet3")]
+            InputDenoiser::DeepFilterNet3(denoiser) => {
+                denoiser.reset()?;
+                return Ok(());
+            }
         };
         Ok(())
+    }
+
+    /// Gate output is sample-aligned; model denoisers are emitted through
+    /// fixed-delay adapters. The raw ContentVec branch must be delayed by the
+    /// same amount before residual mixing, otherwise it contains a second,
+    /// earlier voice.
+    fn content_delay_samples(&self) -> usize {
+        match self {
+            Self::Off | Self::Gate(_) => 0,
+            #[cfg(feature = "rnnoise")]
+            Self::Rnnoise(denoiser) => denoiser.latency_samples(),
+            #[cfg(feature = "webrtc")]
+            Self::WebRtc(denoiser) => denoiser.latency_samples(),
+            #[cfg(feature = "deepfilternet3")]
+            Self::DeepFilterNet3(denoiser) => denoiser.latency_samples(),
+        }
     }
 }
 
@@ -117,6 +194,13 @@ pub struct RvcPipeline {
     speaker_count: Option<usize>,
     speaker_id: i64,
     pitch_shift: f32,
+    /// Optional RVC target-speaker retrieval index. It is loaded before the
+    /// pipeline enters the worker and queried only from that worker, never from
+    /// an audio callback.
+    feature_index: Option<FeatureIndex>,
+    index_rate: f32,
+    protect: f32,
+    protect_transition_ms: u32,
     f0_threshold: f32,
     silence_threshold: f32,
     input_gain: f32,
@@ -124,6 +208,11 @@ pub struct RvcPipeline {
     // disabled); the remaining fields let `set_noise_gate` rebuild the gate
     // when it is toggled back on without a full pipeline reload.
     input_denoiser: InputDenoiser,
+    // Device-rate counterpart to the stream state's GTCRN delay. It aligns raw
+    // speech with model-denoiser output before both branches are resampled.
+    content_raw_delay: SampleDelay,
+    denoiser_content_mix: f32,
+    denoiser_rmvpe_mix: f32,
     noise_gate_threshold: f32,
     noise_gate_attack_ms: f32,
     noise_gate_release_ms: f32,
@@ -149,9 +238,17 @@ pub struct RvcPipeline {
     // denoiser is active. Empty when the zero-copy (gain==1.0, denoiser-off) path
     // is taken.
     input_scratch: Vec<f32>,
+    // Reused denoised copy for the RMVPE branch. Keeping the raw ContentVec
+    // buffer and this copy separate is the point of the dual-path design. The
+    // raw buffer may be delayed in place to match a fixed-delay denoiser.
+    denoiser_scratch: Vec<f32>,
     // Reused embedder output tensor, refilled in place each chunk by
     // `extract_into` so the per-chunk ContentVec output is not reallocated.
     feature_tensor: FeatureTensor,
+    // Original ContentVec features saved only while RVC `protect` is active.
+    // It follows the exact same trim/repeat operations as `feature_tensor`, so
+    // its frames remain aligned with the generator's 10 ms F0 grid.
+    original_feature_tensor: FeatureTensor,
     input_reference_scratch: Vec<f32>,
     rms_mix_scratch: dsp::RmsMixScratch,
     pitchf_untrimmed_scratch: Vec<f32>,
@@ -237,6 +334,34 @@ pub struct F0Config {
     pub postprocess: F0PostprocessConfig,
 }
 
+/// RVC's optional target-speaker feature retrieval and consonant protection.
+///
+/// The index path is immutable for one pipeline because opening/decoding a
+/// FAISS file is load-time work. `index_rate` and `protect` are live values so
+/// front ends can A/B them without reloading models. Both are clamped in the
+/// worker-side `apply_live` path, so hostile automation cannot turn a malformed
+/// float into invalid feature data.
+#[derive(Clone, Debug)]
+pub struct FeatureRetrievalConfig<'a> {
+    pub index_path: Option<&'a Path>,
+    pub index_rate: f32,
+    pub protect: f32,
+    /// Optional vc-rs-only smoothing around RVC protect boundaries. This is
+    /// live-adjustable after loading; zero keeps upstream's binary behavior.
+    pub protect_transition_ms: u32,
+}
+
+impl Default for FeatureRetrievalConfig<'_> {
+    fn default() -> Self {
+        Self {
+            index_path: None,
+            index_rate: 0.0,
+            protect: DEFAULT_PROTECT,
+            protect_transition_ms: DEFAULT_PROTECT_TRANSITION_MS,
+        }
+    }
+}
+
 impl Default for F0Config {
     fn default() -> Self {
         Self {
@@ -271,6 +396,23 @@ pub struct LiveParams {
     pub monitor_gain: f32,
     pub noise_gate_enabled: bool,
     pub noise_gate_threshold: f32,
+    /// Share of the denoised signal mixed into ContentVec when a denoiser is
+    /// active. `0.25` keeps a raw residual for fricatives; `1.0` is legacy
+    /// single-path behavior.
+    pub denoiser_content_mix: f32,
+    /// Share of the denoised signal sent to RMVPE. `0.0` uses the aligned raw
+    /// branch, `1.0` preserves the historical fully denoised RMVPE input.
+    pub denoiser_rmvpe_mix: f32,
+    /// RVC index blend amount. Meaningful only if an index was selected while
+    /// the pipeline was loaded; zero gives an exact no-retrieval fast path.
+    pub index_rate: f32,
+    /// Amount of indexed ContentVec retained on unvoiced (F0 <= 0) frames.
+    /// Standard RVC accepts `0.0..=0.5`; `0.5` disables protection.
+    pub protect: f32,
+    /// Optional vc-rs-only smoothing width around voiced/unvoiced Protect
+    /// boundaries. It is quantized to RVC's 10 ms feature grid; zero keeps the
+    /// standard RVC binary mask.
+    pub protect_transition_ms: u32,
 }
 
 impl Default for LiveParams {
@@ -283,6 +425,11 @@ impl Default for LiveParams {
             monitor_gain: 1.0,
             noise_gate_enabled: false,
             noise_gate_threshold: 0.01,
+            denoiser_content_mix: DEFAULT_DENOISER_CONTENT_MIX,
+            denoiser_rmvpe_mix: DEFAULT_DENOISER_RMVPE_MIX,
+            index_rate: 0.0,
+            protect: DEFAULT_PROTECT,
+            protect_transition_ms: DEFAULT_PROTECT_TRANSITION_MS,
         }
     }
 }
@@ -300,9 +447,12 @@ pub struct RvcPipelineConfig<'a> {
     pub speaker_id: i64,
     pub pitch_shift: f32,
     pub f0: F0Config,
+    pub retrieval: FeatureRetrievalConfig<'a>,
     pub input_gain: f32,
     pub noise_gate_enabled: bool,
     pub noise_gate_threshold: f32,
+    pub denoiser_content_mix: f32,
+    pub denoiser_rmvpe_mix: f32,
     pub noise_gate_shaping: NoiseGateShaping,
     pub output_extra_ms: u32,
     pub volume_excluded_ms: u32,
@@ -375,6 +525,109 @@ fn normalize_speaker_id(speaker_id: i64, speaker_count: Option<usize>) -> i64 {
     speaker_id.clamp(0, max)
 }
 
+fn normalized_unit_value(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn normalized_protect(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, MAX_PROTECT)
+    } else {
+        DEFAULT_PROTECT
+    }
+}
+
+fn normalized_protect_transition_ms(value: u32) -> u32 {
+    value.min(MAX_PROTECT_TRANSITION_MS)
+}
+
+fn normalized_denoiser_content_mix(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, MAX_DENOISER_CONTENT_MIX)
+    } else {
+        DEFAULT_DENOISER_CONTENT_MIX
+    }
+}
+
+fn normalized_denoiser_rmvpe_mix(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, MAX_DENOISER_RMVPE_MIX)
+    } else {
+        DEFAULT_DENOISER_RMVPE_MIX
+    }
+}
+
+fn protect_transition_frames(transition_ms: u32) -> usize {
+    // The generator's F0 and repeated ContentVec tensors are both on a 10 ms
+    // grid. Round a nonzero user value up so requesting any transition cannot
+    // silently become the exact binary path.
+    usize::try_from(
+        normalized_protect_transition_ms(transition_ms).saturating_add(RVC_FEATURE_FRAME_MS - 1)
+            / RVC_FEATURE_FRAME_MS,
+    )
+    .expect("protect transition frame count fits usize")
+}
+
+fn retrieval_is_active(feature_index: &Option<FeatureIndex>, index_rate: f32) -> bool {
+    feature_index.is_some() && index_rate > 0.0
+}
+
+fn protect_is_active(feature_index: &Option<FeatureIndex>, index_rate: f32, protect: f32) -> bool {
+    retrieval_is_active(feature_index, index_rate) && protect < MAX_PROTECT
+}
+
+/// Apply the timing conversion required by RVC's generator to one ContentVec
+/// tensor. The saved original tensor must take this same path before `protect`
+/// blends it back; changing only one side would silently misalign consonants.
+fn prepare_rvc_feature_frames(
+    feature_tensor: &mut FeatureTensor,
+    silence_front_frames: usize,
+    feature_len_before_trim: usize,
+) -> Result<()> {
+    if silence_front_frames > 0 && silence_front_frames < feature_len_before_trim {
+        if silence_front_frames.is_multiple_of(2) {
+            // `silence_front_frames` is on RVC's repeated 10 ms grid. Drop the
+            // equivalent ContentVec frames before repeat so discarded context is
+            // not duplicated and shifted every chunk.
+            feature_tensor.trim_front_frames(silence_front_frames / 2)?;
+            feature_tensor.repeat_frames(2)?;
+        } else {
+            feature_tensor.repeat_frames(2)?;
+            feature_tensor.trim_front_frames(silence_front_frames)?;
+        }
+    } else {
+        feature_tensor.repeat_frames(2)?;
+    }
+    Ok(())
+}
+
+fn load_feature_index(
+    path: Option<&Path>,
+    expected_dimensions: usize,
+) -> Result<Option<FeatureIndex>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let index = FeatureIndex::load(path, expected_dimensions)?;
+    let summary = index.summary();
+    info!(
+        "loaded RVC feature index: {} dimensions={} vectors={} lists={} nprobe={}",
+        path.display(),
+        summary.dimensions,
+        summary.vectors,
+        summary.lists,
+        summary.probes
+    );
+    Ok(Some(index))
+}
+
 impl RvcPipeline {
     #[cfg(feature = "rnnoise")]
     pub fn load_with_rnnoise(config: RvcPipelineConfig<'_>) -> Result<Self> {
@@ -385,6 +638,53 @@ impl RvcPipeline {
         let mut pipeline = Self::load(config)?;
         pipeline.input_denoiser =
             InputDenoiser::Rnnoise(Box::new(crate::denoise::RnnoiseDenoiser::new(sample_rate)?));
+        pipeline
+            .content_raw_delay
+            .configure(pipeline.input_denoiser.content_delay_samples());
+        Ok(pipeline)
+    }
+
+    /// Load with the in-tree WebRTC-style device-rate noise suppressor. It uses
+    /// the same fixed-delay contract as RNNoise, so ContentVec residual mixing
+    /// remains sample-aligned while RMVPE receives the fully enhanced branch.
+    #[cfg(feature = "webrtc")]
+    pub fn load_with_webrtc(
+        config: RvcPipelineConfig<'_>,
+        level: crate::denoise::WebRtcSuppressionLevel,
+    ) -> Result<Self> {
+        if config.noise_gate_enabled {
+            bail!("WebRTC denoising and the input noise gate are mutually exclusive");
+        }
+        let sample_rate = config.sample_rate;
+        let mut pipeline = Self::load(config)?;
+        pipeline.input_denoiser = InputDenoiser::WebRtc(Box::new(
+            crate::denoise::WebRtcDenoiser::new(sample_rate, level)?,
+        ));
+        pipeline
+            .content_raw_delay
+            .configure(pipeline.input_denoiser.content_delay_samples());
+        Ok(pipeline)
+    }
+
+    /// Load with the official DeepFilterNet3 streaming runtime. Model loading is
+    /// intentionally a load-time operation; callers build this pipeline on a
+    /// worker/background loader before it can receive audio.
+    #[cfg(feature = "deepfilternet3")]
+    pub fn load_with_deepfilternet3(
+        config: RvcPipelineConfig<'_>,
+        dfn3: crate::denoise::DeepFilterNet3Config<'_>,
+    ) -> Result<Self> {
+        if config.noise_gate_enabled {
+            bail!("DeepFilterNet3 and the input noise gate are mutually exclusive");
+        }
+        let sample_rate = config.sample_rate;
+        let mut pipeline = Self::load(config)?;
+        pipeline.input_denoiser = InputDenoiser::DeepFilterNet3(Box::new(
+            crate::denoise::DeepFilterNet3Denoiser::new(dfn3, sample_rate)?,
+        ));
+        pipeline
+            .content_raw_delay
+            .configure(pipeline.input_denoiser.content_delay_samples());
         Ok(pipeline)
     }
 
@@ -421,7 +721,7 @@ impl RvcPipeline {
         let denoiser =
             crate::denoise::GtcrnDenoiser::new(gtcrn, super::shape::EMBEDDER_SAMPLE_RATE)?;
         let mut pipeline = Self::load(config)?;
-        pipeline.stream_state.gtcrn = Some(denoiser);
+        pipeline.stream_state.set_gtcrn(Some(denoiser));
         Ok(pipeline)
     }
 
@@ -439,6 +739,10 @@ impl RvcPipeline {
         let rvc_info = inspect_rvc_model(config.model)?;
         let rvc_sample_rate = rvc_info.rvc_sample_rate.unwrap_or(RVC_SAMPLE_RATE);
         let speaker_count = rvc_info.speaker_count;
+        let expected_feat_channels_usize = usize::try_from(rvc_info.expected_feat_channels)
+            .context("RVC expected feature channel count does not fit usize")?;
+        let feature_index =
+            load_feature_index(config.retrieval.index_path, expected_feat_channels_usize)?;
         let speaker_id = normalize_speaker_id(config.speaker_id, speaker_count);
         if speaker_id != config.speaker_id {
             info!(
@@ -520,10 +824,19 @@ impl RvcPipeline {
             speaker_count,
             speaker_id,
             pitch_shift: config.pitch_shift,
+            feature_index,
+            index_rate: normalized_unit_value(config.retrieval.index_rate),
+            protect: normalized_protect(config.retrieval.protect),
+            protect_transition_ms: normalized_protect_transition_ms(
+                config.retrieval.protect_transition_ms,
+            ),
             f0_threshold: config.f0.f0_threshold,
             silence_threshold: config.f0.silence_threshold,
             input_gain: config.input_gain,
             input_denoiser: build_input_denoiser(&config),
+            content_raw_delay: SampleDelay::default(),
+            denoiser_content_mix: normalized_denoiser_content_mix(config.denoiser_content_mix),
+            denoiser_rmvpe_mix: normalized_denoiser_rmvpe_mix(config.denoiser_rmvpe_mix),
             noise_gate_threshold: config.noise_gate_threshold,
             noise_gate_attack_ms: config.noise_gate_shaping.attack_ms,
             noise_gate_release_ms: config.noise_gate_shaping.release_ms,
@@ -542,7 +855,9 @@ impl RvcPipeline {
             max_output_gain: config.output_dynamics.max_output_gain,
             stream_state: RvcStreamState::new(rvc_sample_rate),
             input_scratch: Vec::new(),
+            denoiser_scratch: Vec::new(),
             feature_tensor: FeatureTensor::default(),
+            original_feature_tensor: FeatureTensor::default(),
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -600,6 +915,8 @@ impl RvcPipeline {
         let expected_feat_channels = rvc_info.expected_feat_channels;
         let expected_feat_channels_usize = usize::try_from(expected_feat_channels)
             .context("RVC expected feature channel count does not fit in usize")?;
+        let feature_index =
+            load_feature_index(config.retrieval.index_path, expected_feat_channels_usize)?;
         let rvc_sample_rate = rvc_info.rvc_sample_rate.unwrap_or(RVC_SAMPLE_RATE);
         let extra_convert_samples =
             extra_convert_samples_from_ms(config.extra_convert_ms, rvc_sample_rate);
@@ -974,10 +1291,19 @@ impl RvcPipeline {
             speaker_count,
             speaker_id,
             pitch_shift: config.pitch_shift,
+            feature_index,
+            index_rate: normalized_unit_value(config.retrieval.index_rate),
+            protect: normalized_protect(config.retrieval.protect),
+            protect_transition_ms: normalized_protect_transition_ms(
+                config.retrieval.protect_transition_ms,
+            ),
             f0_threshold: config.f0.f0_threshold,
             silence_threshold: config.f0.silence_threshold,
             input_gain: config.input_gain,
             input_denoiser: build_input_denoiser(&config),
+            content_raw_delay: SampleDelay::default(),
+            denoiser_content_mix: normalized_denoiser_content_mix(config.denoiser_content_mix),
+            denoiser_rmvpe_mix: normalized_denoiser_rmvpe_mix(config.denoiser_rmvpe_mix),
             noise_gate_threshold: config.noise_gate_threshold,
             noise_gate_attack_ms: config.noise_gate_shaping.attack_ms,
             noise_gate_release_ms: config.noise_gate_shaping.release_ms,
@@ -996,7 +1322,9 @@ impl RvcPipeline {
             max_output_gain: config.output_dynamics.max_output_gain,
             stream_state: RvcStreamState::new(rvc_sample_rate),
             input_scratch: Vec::new(),
+            denoiser_scratch: Vec::new(),
             feature_tensor: FeatureTensor::default(),
+            original_feature_tensor: FeatureTensor::default(),
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1029,31 +1357,62 @@ impl RvcPipeline {
         self.input_gain = input_gain;
     }
 
+    pub fn set_index_rate(&mut self, index_rate: f32) {
+        self.index_rate = normalized_unit_value(index_rate);
+    }
+
+    pub fn set_protect(&mut self, protect: f32) {
+        self.protect = normalized_protect(protect);
+    }
+
+    pub fn set_protect_transition_ms(&mut self, protect_transition_ms: u32) {
+        self.protect_transition_ms = normalized_protect_transition_ms(protect_transition_ms);
+    }
+
+    pub fn set_denoiser_content_mix(&mut self, denoiser_content_mix: f32) {
+        self.denoiser_content_mix = normalized_denoiser_content_mix(denoiser_content_mix);
+    }
+
+    pub fn set_denoiser_rmvpe_mix(&mut self, denoiser_rmvpe_mix: f32) {
+        self.denoiser_rmvpe_mix = normalized_denoiser_rmvpe_mix(denoiser_rmvpe_mix);
+    }
+
     /// Live-update the input noise gate. Toggling on (re)builds the gate from
     /// the stored attack/release/floor; while it stays on, only the threshold
     /// changes so the envelope/gain state carries across chunks. Attack and
     /// release are not live-adjustable (they shape the smoothing coefficients
     /// fixed at construction).
-    pub fn set_noise_gate(&mut self, enabled: bool, threshold: f32) {
+    /// Returns true when the gate mode changed and the caller must also discard
+    /// its `ChunkConverter` smoother history. Threshold-only automation keeps
+    /// both the gate envelope and the conversion timeline intact.
+    pub fn set_noise_gate(&mut self, enabled: bool, threshold: f32) -> bool {
         self.noise_gate_threshold = threshold;
         // Standalone live-parameter updates must not replace a configured
-        // stateful denoiser. Future denoiser variants need the same guard.
-        #[cfg(feature = "rnnoise")]
-        if matches!(self.input_denoiser, InputDenoiser::Rnnoise(_)) {
-            return;
+        // stateful denoiser. Feature-gated arms avoid referencing a backend in a
+        // smaller distribution build while keeping the guard at one call site.
+        if self.input_denoiser.is_stateful() {
+            return false;
         }
         // GTCRN owns the 16 kHz input-denoise seam in `stream_state`; a live gate
         // toggle must never build a device-rate gate that would fight it.
         #[cfg(feature = "gtcrn")]
         if self.stream_state.gtcrn.is_some() {
-            return;
+            return false;
         }
         if !enabled {
+            if matches!(self.input_denoiser, InputDenoiser::Off) {
+                return false;
+            }
             self.input_denoiser = InputDenoiser::Off;
-            return;
+            self.content_raw_delay.configure(0);
+            self.clear_conversion_history();
+            return true;
         }
         match &mut self.input_denoiser {
-            InputDenoiser::Gate(gate) => gate.set_threshold(threshold),
+            InputDenoiser::Gate(gate) => {
+                gate.set_threshold(threshold);
+                false
+            }
             _ => {
                 self.input_denoiser = InputDenoiser::Gate(dsp::NoiseGate::new(
                     self.noise_gate_sample_rate,
@@ -1062,21 +1421,29 @@ impl RvcPipeline {
                     self.noise_gate_release_ms,
                     self.noise_gate_floor,
                 ));
+                self.content_raw_delay.configure(0);
+                self.clear_conversion_history();
+                true
             }
         }
     }
 
-    /// Hot-swap the input denoiser variant live (off / gate / rnnoise). GTCRN
-    /// attaches through `set_gtcrn` (built off-thread); switching away from
-    /// gtcrn clears the 16 kHz seam. RNNoise construction is cheap (pure CPU),
-    /// so this is safe to run on the worker thread. The gate/stateful stages are
-    /// mutually exclusive by construction.
-    pub fn set_denoiser_mode(&mut self, mode: InputDenoiserMode, device_rate: u32) -> Result<()> {
-        #[cfg(feature = "gtcrn")]
-        {
-            self.stream_state.gtcrn = None;
-        }
-        self.input_denoiser = match mode {
+    /// Hot-swap the inexpensive input denoiser variants live. GTCRN and
+    /// DeepFilterNet3 attach through their dedicated pre-built swap methods;
+    /// switching away from them clears their separate seams. Model loading never
+    /// occurs on the audio callback, and the gate/stateful stages are mutually
+    /// exclusive by construction.
+    pub fn set_denoiser_mode(
+        &mut self,
+        mode: InputDenoiserMode,
+        device_rate: u32,
+        webrtc_level: crate::denoise_config::WebRtcSuppressionLevel,
+    ) -> Result<()> {
+        #[cfg(not(feature = "webrtc"))]
+        let _ = webrtc_level;
+        // Construct the next state before dropping the active one so a failed
+        // RNNoise build leaves the current stream usable.
+        let input_denoiser = match mode {
             InputDenoiserMode::Off => InputDenoiser::Off,
             InputDenoiserMode::Gate => InputDenoiser::Gate(dsp::NoiseGate::new(
                 device_rate as f32,
@@ -1097,10 +1464,33 @@ impl RvcPipeline {
                     bail!("RNNoise support is not enabled in this build")
                 }
             }
+            InputDenoiserMode::WebRtc => {
+                #[cfg(feature = "webrtc")]
+                {
+                    InputDenoiser::WebRtc(Box::new(crate::denoise::WebRtcDenoiser::new(
+                        device_rate,
+                        webrtc_level,
+                    )?))
+                }
+                #[cfg(not(feature = "webrtc"))]
+                {
+                    bail!("WebRTC denoising support is not enabled in this build")
+                }
+            }
             // GTCRN attaches via `set_gtcrn`; clear the device-rate stage so the
             // two never coexist.
-            InputDenoiserMode::Gtcrn => InputDenoiser::Off,
+            InputDenoiserMode::Gtcrn | InputDenoiserMode::DeepFilterNet3 => InputDenoiser::Off,
         };
+        #[cfg(feature = "gtcrn")]
+        self.stream_state.set_gtcrn(None);
+        self.input_denoiser = input_denoiser;
+        self.noise_gate_sample_rate = device_rate as f32;
+        self.content_raw_delay
+            .configure(self.input_denoiser.content_delay_samples());
+        // Denoiser output timelines are not interchangeable. Starting a new
+        // mode with old ContentVec/F0 history would concatenate differently
+        // delayed signals inside one inference window.
+        self.clear_conversion_history();
         Ok(())
     }
 
@@ -1111,7 +1501,25 @@ impl RvcPipeline {
     #[cfg(feature = "gtcrn")]
     pub fn set_gtcrn(&mut self, denoiser: Option<crate::denoise::GtcrnDenoiser>) {
         self.input_denoiser = InputDenoiser::Off;
-        self.stream_state.gtcrn = denoiser;
+        self.content_raw_delay.configure(0);
+        self.stream_state.set_gtcrn(None);
+        self.clear_conversion_history();
+        self.stream_state.set_gtcrn(denoiser);
+    }
+
+    /// Hot-swap a pre-built DeepFilterNet3 device-rate instance. `DfTract`
+    /// construction parses model archives and builds three graphs, so callers
+    /// must do it in the background loader before invoking this worker method.
+    #[cfg(feature = "deepfilternet3")]
+    pub fn set_deepfilternet3(&mut self, denoiser: Option<crate::denoise::DeepFilterNet3Denoiser>) {
+        self.input_denoiser = denoiser
+            .map(|denoiser| InputDenoiser::DeepFilterNet3(Box::new(denoiser)))
+            .unwrap_or(InputDenoiser::Off);
+        self.content_raw_delay
+            .configure(self.input_denoiser.content_delay_samples());
+        #[cfg(feature = "gtcrn")]
+        self.stream_state.set_gtcrn(None);
+        self.clear_conversion_history();
     }
 
     pub fn set_output_gain(&mut self, output_gain: f32) {
@@ -1123,12 +1531,44 @@ impl RvcPipeline {
     /// `LiveParams` and call this, so the live knobs stay wired identically
     /// across front-ends. `set_noise_gate` keeps the rnnoise guard, so passing
     /// `noise_gate_enabled: false` never tears down an active rnnoise stage.
-    pub fn apply_live(&mut self, live: &LiveParams) {
+    /// Returns true when live automation changed the input-denoiser timeline.
+    /// Front-ends must then reset the owning `ChunkConverter` so SOLA/PSOLA does
+    /// not join post-switch output against a pre-switch tail.
+    pub fn apply_live(&mut self, live: &LiveParams) -> bool {
         self.set_pitch_shift(live.pitch_shift);
         self.set_speaker_id(live.speaker_id);
         self.set_input_gain(live.input_gain);
         self.set_output_gain(live.output_gain);
-        self.set_noise_gate(live.noise_gate_enabled, live.noise_gate_threshold);
+        let denoiser_changed =
+            self.set_noise_gate(live.noise_gate_enabled, live.noise_gate_threshold);
+        self.set_denoiser_content_mix(live.denoiser_content_mix);
+        self.set_denoiser_rmvpe_mix(live.denoiser_rmvpe_mix);
+        self.set_index_rate(live.index_rate);
+        self.set_protect(live.protect);
+        self.set_protect_transition_ms(live.protect_transition_ms);
+        denoiser_changed
+    }
+
+    /// Clear every model-domain buffer tied to the current input timeline while
+    /// retaining loaded inference sessions and any already-installed GTCRN
+    /// engine. Callers changing a denoiser must reset the outer chunk smoother
+    /// too; that history belongs to `ChunkConverter`, not this pipeline.
+    fn clear_conversion_history(&mut self) {
+        #[cfg(feature = "gtcrn")]
+        let gtcrn = self.stream_state.gtcrn.take();
+        self.stream_state = RvcStreamState::new(self.rvc_sample_rate);
+        #[cfg(feature = "gtcrn")]
+        self.stream_state.set_gtcrn(gtcrn);
+        self.input_scratch.clear();
+        self.denoiser_scratch.clear();
+        self.feature_tensor = FeatureTensor::default();
+        self.original_feature_tensor = FeatureTensor::default();
+        self.input_reference_scratch.clear();
+        self.rms_mix_scratch = dsp::RmsMixScratch::default();
+        self.pitchf_untrimmed_scratch.clear();
+        self.pitchf_scratch.clear();
+        self.pitch_scratch.clear();
+        self.pitchf_postprocessed_scratch.clear();
     }
 
     /// Discards rolling audio/F0 context while retaining loaded inference
@@ -1148,25 +1588,16 @@ impl RvcPipeline {
                 floor: self.noise_gate_floor,
             },
         )?;
+        self.content_raw_delay
+            .configure(self.input_denoiser.content_delay_samples());
         // Preserve the loaded GTCRN denoiser across a context reset, but reset its
         // fixed-delay/cache state (mirroring the RNNoise reset above) so it does
         // not emit audio captured before the pause.
         #[cfg(feature = "gtcrn")]
-        let gtcrn = self.stream_state.gtcrn.take();
-        self.stream_state = RvcStreamState::new(self.rvc_sample_rate);
-        #[cfg(feature = "gtcrn")]
-        if let Some(mut gtcrn) = gtcrn {
+        if let Some(gtcrn) = self.stream_state.gtcrn.as_mut() {
             gtcrn.reset()?;
-            self.stream_state.gtcrn = Some(gtcrn);
         }
-        self.input_scratch.clear();
-        self.feature_tensor = FeatureTensor::default();
-        self.input_reference_scratch.clear();
-        self.rms_mix_scratch = dsp::RmsMixScratch::default();
-        self.pitchf_untrimmed_scratch.clear();
-        self.pitchf_scratch.clear();
-        self.pitch_scratch.clear();
-        self.pitchf_postprocessed_scratch.clear();
+        self.clear_conversion_history();
         Ok(())
     }
 }
@@ -1182,7 +1613,21 @@ impl VoiceModel for RvcPipeline {
         let total_start = Instant::now();
         let input_gain = self.input_gain.max(0.0);
         let apply_gain = (input_gain - 1.0).abs() > f32::EPSILON;
-        let denoiser_active = !matches!(self.input_denoiser, InputDenoiser::Off);
+        // GTCRN is attached to the 16 kHz stream rather than the device-rate
+        // `InputDenoiser` enum. Include it here so the worker builds a separate
+        // pitch branch; stream state aligns raw ContentVec samples to GTCRN's
+        // fixed delay before their residual mix.
+        let gtcrn_active = {
+            #[cfg(feature = "gtcrn")]
+            {
+                self.stream_state.gtcrn.is_some()
+            }
+            #[cfg(not(feature = "gtcrn"))]
+            {
+                false
+            }
+        };
+        let denoiser_active = !matches!(self.input_denoiser, InputDenoiser::Off) || gtcrn_active;
         // Only gain≠1.0 or an active denoiser need an owned buffer; the no-op
         // path keeps `audio` as a zero-copy borrow. When an owned buffer is
         // needed, reuse `input_scratch` instead of allocating a fresh Vec every
@@ -1190,6 +1635,7 @@ impl VoiceModel for RvcPipeline {
         // later `&mut self.stream_state` call; it is written back at the end of
         // the function to retain the allocation.
         let mut input_scratch = std::mem::take(&mut self.input_scratch);
+        let mut denoiser_scratch = std::mem::take(&mut self.denoiser_scratch);
         if apply_gain || denoiser_active {
             input_scratch.clear();
             if apply_gain {
@@ -1201,10 +1647,24 @@ impl VoiceModel for RvcPipeline {
             } else {
                 input_scratch.extend_from_slice(audio);
             }
-            // Noise reduction runs before RMS/silence detection and feature/F0
-            // extraction so the model sees the cleaned signal.
-            if denoiser_active {
-                self.input_denoiser.process_in_place(&mut input_scratch)?;
+            // Preserve the gain-scaled source for ContentVec, then denoise a
+            // reusable copy for RMVPE. This avoids deleting fricatives from the
+            // content branch while keeping pitch detection noise-robust.
+            if denoiser_active && !gtcrn_active {
+                denoiser_scratch.clear();
+                denoiser_scratch.extend_from_slice(&input_scratch);
+                self.input_denoiser
+                    .process_in_place(&mut denoiser_scratch)?;
+                // RNNoise emits a fixed-latency signal. Delay the raw branch
+                // before resampling so residual ContentVec mixing compares the
+                // same instant of speech rather than creating an echo.
+                self.content_raw_delay.process_in_place(&mut input_scratch);
+            } else if gtcrn_active {
+                // GTCRN runs after the 16 kHz resampler in stream state. Keep
+                // this device-rate copy raw; it is only a placeholder source
+                // for the pitch branch and is replaced by GTCRN at 16 kHz.
+                denoiser_scratch.clear();
+                denoiser_scratch.extend_from_slice(&input_scratch);
             }
         }
         let input_audio: &[f32] = if apply_gain || denoiser_active {
@@ -1214,21 +1674,36 @@ impl VoiceModel for RvcPipeline {
         };
         let output_extra_len = ms_to_samples(self.rvc_sample_rate, self.output_extra_ms);
         let volume_excluded_len = ms_to_samples(self.rvc_sample_rate, self.volume_excluded_ms);
-        let stream_input = self.stream_state.generate_input(
-            input_audio,
-            sample_rate,
-            output_extra_len,
-            volume_excluded_len,
-            self.extra_convert_samples,
-        )?;
+        let stream_input = if denoiser_active {
+            self.stream_state.generate_input_with_pitch(
+                input_audio,
+                &denoiser_scratch,
+                StreamInputTiming {
+                    sample_rate,
+                    crossfade_and_search_samples: output_extra_len,
+                    volume_excluded_samples: volume_excluded_len,
+                    extra_convert_samples: self.extra_convert_samples,
+                    denoiser_content_mix: self.denoiser_content_mix,
+                    denoiser_rmvpe_mix: self.denoiser_rmvpe_mix,
+                },
+            )?
+        } else {
+            self.stream_state.generate_input(
+                input_audio,
+                sample_rate,
+                output_extra_len,
+                volume_excluded_len,
+                self.extra_convert_samples,
+            )?
+        };
         // `input_audio` is no longer borrowed past this point; return the buffer
         // so its capacity is reused on the next chunk.
         self.input_scratch = input_scratch;
+        self.denoiser_scratch = denoiser_scratch;
 
-        // input_rms/silence are derived from the new 16 kHz increment (the same
-        // post-input-denoiser signal ContentVec/F0 consume), not the raw
-        // device-rate chunk — for every denoiser mode. This also changes the
-        // `input_rms` reported in ModelOutput to the 16 kHz value (intended).
+        // input_rms/silence follow the configured RMVPE branch. With denoising
+        // off this is the same single-resampled signal as ContentVec; with
+        // denoising on each branch can retain a different raw share.
         let input_rms = stream_input.input_rms;
         let is_silent = self.silence_threshold > 0.0 && input_rms < self.silence_threshold;
         let output_silent = is_silent && self.stream_state.prev_silence;
@@ -1265,27 +1740,43 @@ impl VoiceModel for RvcPipeline {
         }
         let raw_feature_len = usize::try_from(raw_feature_len)
             .context("embedder frame length does not fit in usize")?;
+        let raw_feature_dimensions = self
+            .feature_tensor
+            .shape
+            .get(2)
+            .copied()
+            .and_then(|dimensions| usize::try_from(dimensions).ok())
+            .context("embedder output must be rank-3 [1, frames, channels]")?;
         let feature_len_before_trim = raw_feature_len
             .checked_mul(2)
             .context("repeated embedder frame length overflowed")?;
 
+        let protect_active = protect_is_active(&self.feature_index, self.index_rate, self.protect);
+        if protect_active {
+            self.original_feature_tensor.copy_from(&self.feature_tensor);
+        }
+        if let Some(feature_index) = self.feature_index.as_mut() {
+            feature_index.blend_frames_in_place(
+                &mut self.feature_tensor.data,
+                raw_feature_len,
+                raw_feature_dimensions,
+                self.index_rate,
+            )?;
+        }
+
         let silence_front_frames =
             onnx_silence_front_feature_frames(self.extra_convert_samples, self.rvc_sample_rate);
-        if silence_front_frames > 0 && silence_front_frames < feature_len_before_trim {
-            if silence_front_frames.is_multiple_of(2) {
-                // `silence_front_frames` is on RVC's repeated 10 ms grid. Drop
-                // the equivalent ContentVec frames before repeat so discarded
-                // context is not duplicated and shifted every chunk.
-                self.feature_tensor
-                    .trim_front_frames(silence_front_frames / 2)?;
-                self.feature_tensor.repeat_frames(2)?;
-            } else {
-                self.feature_tensor.repeat_frames(2)?;
-                self.feature_tensor
-                    .trim_front_frames(silence_front_frames)?;
-            }
-        } else {
-            self.feature_tensor.repeat_frames(2)?;
+        prepare_rvc_feature_frames(
+            &mut self.feature_tensor,
+            silence_front_frames,
+            feature_len_before_trim,
+        )?;
+        if protect_active {
+            prepare_rvc_feature_frames(
+                &mut self.original_feature_tensor,
+                silence_front_frames,
+                feature_len_before_trim,
+            )?;
         }
         let embedder_time = embedder_start.elapsed();
         let feature_len = self
@@ -1301,10 +1792,10 @@ impl VoiceModel for RvcPipeline {
         // shift. pitch_shift is applied once in f0_postprocess after smoothing,
         // so clamp/octave/median act on natural F0. pitchf_buffer therefore
         // accumulates raw F0 (see the guardrail above the post-process call).
-        let audio_16k_len = self.stream_state.audio_16k_buffer.len();
+        let audio_16k_len = self.stream_state.pitch_16k_buffer.len();
         let rmvpe_input_samples_16k = self.rmvpe_input_samples_16k.min(audio_16k_len);
         let rmvpe_window_start_samples = audio_16k_len - rmvpe_input_samples_16k;
-        let rmvpe_audio_16k = &self.stream_state.audio_16k_buffer[rmvpe_window_start_samples..];
+        let rmvpe_audio_16k = &self.stream_state.pitch_16k_buffer[rmvpe_window_start_samples..];
         let pitchf_raw = self
             .pitch
             .extract(rmvpe_audio_16k, 0.0, self.f0_threshold)?;
@@ -1328,6 +1819,17 @@ impl VoiceModel for RvcPipeline {
             feature_len,
             &mut self.pitchf_scratch,
         );
+        if protect_active {
+            // Use natural (unshifted, unpostprocessed) F0. Pitch correction may
+            // fill short gaps for synthesis, but it must not classify an
+            // originally unvoiced consonant as voiced for feature retrieval.
+            self.feature_tensor.protect_unvoiced_frames(
+                &self.original_feature_tensor,
+                &self.pitchf_scratch,
+                self.protect,
+                protect_transition_frames(self.protect_transition_ms),
+            )?;
+        }
         // Guardrail: pitchf_buffer / pitchf_scratch hold raw (un-transposed) F0
         // because extract() above is called with 0.0 shift. Post-process the
         // RVC-aligned natural F0 and apply pitch_shift exactly once at the end.
@@ -1416,9 +1918,9 @@ impl VoiceModel for RvcPipeline {
             // will search over. Use the input buffer tail with the same
             // duration; taking the head would compare against past context
             // added only to stabilize the model.
-            // Reference the 16 kHz rolling signal (resampled 16 kHz -> RVC rate),
-            // the same signal ContentVec/F0 see, so the RMS-mix level matches the
-            // model's input for every denoiser mode.
+            // Reference the residual-preserving ContentVec rolling signal
+            // (resampled 16 kHz -> RVC rate), so output leveling follows the
+            // articulation branch rather than the fully denoised RMVPE branch.
             let input_reference = self.stream_state.output_reference_audio(
                 super::shape::EMBEDDER_SAMPLE_RATE,
                 self.rvc_sample_rate,
@@ -1558,5 +2060,30 @@ mod progress_tests {
         assert_eq!(normalize_speaker_id(307, Some(308)), 307);
         assert_eq!(normalize_speaker_id(308, Some(308)), 307);
         assert_eq!(normalize_speaker_id(500, None), 500);
+    }
+
+    #[test]
+    fn protect_transition_quantizes_up_to_the_rvc_feature_grid() {
+        assert_eq!(protect_transition_frames(0), 0);
+        assert_eq!(protect_transition_frames(1), 1);
+        assert_eq!(protect_transition_frames(10), 1);
+        assert_eq!(protect_transition_frames(11), 2);
+        assert_eq!(protect_transition_frames(20), 2);
+        assert_eq!(protect_transition_frames(MAX_PROTECT_TRANSITION_MS), 10);
+        assert_eq!(protect_transition_frames(MAX_PROTECT_TRANSITION_MS + 1), 10);
+    }
+
+    #[test]
+    fn rmvpe_denoiser_mix_defaults_to_full_cleaned_branch() {
+        assert_eq!(
+            LiveParams::default().denoiser_rmvpe_mix,
+            DEFAULT_DENOISER_RMVPE_MIX
+        );
+        assert_eq!(normalized_denoiser_rmvpe_mix(-1.0), 0.0);
+        assert_eq!(normalized_denoiser_rmvpe_mix(2.0), MAX_DENOISER_RMVPE_MIX);
+        assert_eq!(
+            normalized_denoiser_rmvpe_mix(f32::NAN),
+            DEFAULT_DENOISER_RMVPE_MIX
+        );
     }
 }

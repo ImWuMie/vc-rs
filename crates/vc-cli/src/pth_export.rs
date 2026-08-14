@@ -179,7 +179,7 @@ fn unique_name(prefix: &str, extension: &str, attempt: u32) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let dot_extension = (!extension.is_empty()).then_some(".").unwrap_or_default();
+    let dot_extension = if extension.is_empty() { "" } else { "." };
     format!(
         "{prefix}-{}-{nanos}-{attempt}{dot_extension}{extension}",
         std::process::id()

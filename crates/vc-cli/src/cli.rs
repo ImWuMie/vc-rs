@@ -1,7 +1,15 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use vc_core::model_rvc::DEFAULT_F0_THRESHOLD;
+use vc_core::denoise_config::{
+    WebRtcSuppressionLevel, DEFAULT_DFN3_ATTENUATION_LIMIT_DB, DEFAULT_DFN3_POST_FILTER_BETA,
+    MAX_DFN3_ATTENUATION_LIMIT_DB, MAX_DFN3_POST_FILTER_BETA,
+};
+use vc_core::model_rvc::{
+    DEFAULT_DENOISER_CONTENT_MIX, DEFAULT_DENOISER_RMVPE_MIX, DEFAULT_F0_THRESHOLD,
+    DEFAULT_PROTECT, DEFAULT_PROTECT_TRANSITION_MS, MAX_DENOISER_CONTENT_MIX,
+    MAX_DENOISER_RMVPE_MIX, MAX_PROTECT, MAX_PROTECT_TRANSITION_MS,
+};
 
 use vc_core::validation::{
     validate_conversion_timing, validate_finite_f32, validate_non_negative_f32,
@@ -122,6 +130,8 @@ pub enum Denoiser {
     NoiseGate,
     Rnnoise,
     Gtcrn,
+    WebRtc,
+    DeepFilterNet3,
 }
 
 impl From<Denoiser> for vc_app::DenoiserMode {
@@ -131,6 +141,8 @@ impl From<Denoiser> for vc_app::DenoiserMode {
             Denoiser::NoiseGate => Self::NoiseGate,
             Denoiser::Rnnoise => Self::Rnnoise,
             Denoiser::Gtcrn => Self::Gtcrn,
+            Denoiser::WebRtc => Self::WebRtc,
+            Denoiser::DeepFilterNet3 => Self::DeepFilterNet3,
         }
     }
 }
@@ -212,6 +224,13 @@ pub struct RunArgs {
     pub embedder_output: Option<String>,
     #[arg(long)]
     pub f0_model: Option<PathBuf>,
+    #[arg(
+        long = "index-path",
+        alias = "index",
+        value_name = "PATH",
+        help = "RVC added_IVF*_Flat_*.index feature retrieval file"
+    )]
+    pub index_path: Option<PathBuf>,
     #[arg(long)]
     pub input: Option<String>,
     #[arg(long)]
@@ -285,6 +304,27 @@ pub struct RunArgs {
     pub speaker_id: i64,
     #[arg(long, default_value_t = 0.0)]
     pub pitch_shift: f32,
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        value_parser = parse_unit_f32,
+        help = "RVC feature-index blend rate (0.0 disables retrieval)"
+    )]
+    pub index_rate: f32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PROTECT,
+        value_parser = parse_protect_f32,
+        help = "RVC unvoiced-frame consonant protection (0.0..=0.5; 0.5 disables it)"
+    )]
+    pub protect: f32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PROTECT_TRANSITION_MS,
+        value_parser = parse_protect_transition_ms,
+        help = "Optional RVC Protect boundary smoothing (0..=100 ms; 0 keeps standard binary Protect)"
+    )]
+    pub protect_transition_ms: u32,
     #[arg(long, default_value_t = DEFAULT_F0_THRESHOLD)]
     pub f0_threshold: f32,
     #[arg(
@@ -301,7 +341,7 @@ pub struct RunArgs {
     #[arg(
         long,
         value_enum,
-        help = "Input denoiser: off, noise-gate, rnnoise, or gtcrn"
+        help = "Input denoiser: off, noise-gate, rnnoise, gtcrn, webrtc, or deep-filter-net3"
     )]
     pub denoiser: Option<Denoiser>,
     #[arg(
@@ -310,6 +350,33 @@ pub struct RunArgs {
         help = "GTCRN model directory holding gtcrn_stream.onnx (required for --denoiser gtcrn)"
     )]
     pub gtcrn_model: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = WebRtcSuppressionLevel::Moderate,
+        help = "WebRTC suppression level (used with --denoiser webrtc)"
+    )]
+    pub webrtc_level: WebRtcSuppressionLevel,
+    #[arg(
+        long = "deepfilternet3-model",
+        value_name = "ARCHIVE",
+        help = "Official DeepFilterNet3 .tar.gz model archive (required for --denoiser deep-filter-net3)"
+    )]
+    pub deepfilternet3_model: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DFN3_ATTENUATION_LIMIT_DB,
+        value_parser = parse_dfn3_attenuation_limit_db,
+        help = "Maximum DeepFilterNet3 attenuation in dB (0..=100)"
+    )]
+    pub dfn3_attenuation_limit_db: f32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DFN3_POST_FILTER_BETA,
+        value_parser = parse_dfn3_post_filter_beta,
+        help = "DeepFilterNet3 post-filter beta (0..=0.1)"
+    )]
+    pub dfn3_post_filter_beta: f32,
     #[arg(long = "noise-gate", conflicts_with = "denoiser", action = clap::ArgAction::SetTrue, help = "Deprecated alias for --denoiser noise-gate")]
     pub noise_gate: bool,
     #[arg(
@@ -324,6 +391,20 @@ pub struct RunArgs {
     pub noise_gate_release_ms: f32,
     #[arg(long, default_value_t = DEFAULT_NOISE_GATE_FLOOR, help = "Noise gate floor gain when closed (0.0..=1.0)")]
     pub noise_gate_floor: f32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DENOISER_CONTENT_MIX,
+        value_parser = parse_unit_f32,
+        help = "Denoised signal share sent to ContentVec when a denoiser is active (0 keeps raw articulation; 1 is legacy full denoise)"
+    )]
+    pub denoiser_content_mix: f32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DENOISER_RMVPE_MIX,
+        value_parser = parse_unit_f32,
+        help = "Denoised signal share sent to RMVPE (0 keeps the aligned raw input; 1 uses full denoising)"
+    )]
+    pub denoiser_rmvpe_mix: f32,
     #[arg(long = "volume-envelope", action = clap::ArgAction::SetTrue, default_value_t = DEFAULT_VOLUME_ENVELOPE)]
     pub volume_envelope: bool,
     #[arg(long, default_value_t = DEFAULT_RMS_MIX_RATE, value_parser = parse_unit_f32)]
@@ -354,6 +435,13 @@ pub struct WavArgs {
     pub embedder_output: Option<String>,
     #[arg(long)]
     pub f0_model: PathBuf,
+    #[arg(
+        long = "index-path",
+        alias = "index",
+        value_name = "PATH",
+        help = "RVC added_IVF*_Flat_*.index feature retrieval file"
+    )]
+    pub index_path: Option<PathBuf>,
     #[arg(long)]
     pub input: PathBuf,
     #[arg(long)]
@@ -381,6 +469,27 @@ pub struct WavArgs {
     pub speaker_id: i64,
     #[arg(long, default_value_t = 0.0)]
     pub pitch_shift: f32,
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        value_parser = parse_unit_f32,
+        help = "RVC feature-index blend rate (0.0 disables retrieval)"
+    )]
+    pub index_rate: f32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PROTECT,
+        value_parser = parse_protect_f32,
+        help = "RVC unvoiced-frame consonant protection (0.0..=0.5; 0.5 disables it)"
+    )]
+    pub protect: f32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PROTECT_TRANSITION_MS,
+        value_parser = parse_protect_transition_ms,
+        help = "Optional RVC Protect boundary smoothing (0..=100 ms; 0 keeps standard binary Protect)"
+    )]
+    pub protect_transition_ms: u32,
     #[arg(long, default_value_t = DEFAULT_F0_THRESHOLD)]
     pub f0_threshold: f32,
     #[arg(
@@ -397,7 +506,7 @@ pub struct WavArgs {
     #[arg(
         long,
         value_enum,
-        help = "Input denoiser: off, noise-gate, rnnoise, or gtcrn"
+        help = "Input denoiser: off, noise-gate, rnnoise, gtcrn, webrtc, or deep-filter-net3"
     )]
     pub denoiser: Option<Denoiser>,
     #[arg(
@@ -406,6 +515,33 @@ pub struct WavArgs {
         help = "GTCRN model directory holding gtcrn_stream.onnx (required for --denoiser gtcrn)"
     )]
     pub gtcrn_model: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = WebRtcSuppressionLevel::Moderate,
+        help = "WebRTC suppression level (used with --denoiser webrtc)"
+    )]
+    pub webrtc_level: WebRtcSuppressionLevel,
+    #[arg(
+        long = "deepfilternet3-model",
+        value_name = "ARCHIVE",
+        help = "Official DeepFilterNet3 .tar.gz model archive (required for --denoiser deep-filter-net3)"
+    )]
+    pub deepfilternet3_model: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DFN3_ATTENUATION_LIMIT_DB,
+        value_parser = parse_dfn3_attenuation_limit_db,
+        help = "Maximum DeepFilterNet3 attenuation in dB (0..=100)"
+    )]
+    pub dfn3_attenuation_limit_db: f32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DFN3_POST_FILTER_BETA,
+        value_parser = parse_dfn3_post_filter_beta,
+        help = "DeepFilterNet3 post-filter beta (0..=0.1)"
+    )]
+    pub dfn3_post_filter_beta: f32,
     #[arg(long = "noise-gate", conflicts_with = "denoiser", action = clap::ArgAction::SetTrue, help = "Deprecated alias for --denoiser noise-gate")]
     pub noise_gate: bool,
     #[arg(
@@ -420,6 +556,20 @@ pub struct WavArgs {
     pub noise_gate_release_ms: f32,
     #[arg(long, default_value_t = DEFAULT_NOISE_GATE_FLOOR, help = "Noise gate floor gain when closed (0.0..=1.0)")]
     pub noise_gate_floor: f32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DENOISER_CONTENT_MIX,
+        value_parser = parse_unit_f32,
+        help = "Denoised signal share sent to ContentVec when a denoiser is active (0 keeps raw articulation; 1 is legacy full denoise)"
+    )]
+    pub denoiser_content_mix: f32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DENOISER_RMVPE_MIX,
+        value_parser = parse_unit_f32,
+        help = "Denoised signal share sent to RMVPE (0 keeps the aligned raw input; 1 uses full denoising)"
+    )]
+    pub denoiser_rmvpe_mix: f32,
     #[arg(
         long,
         default_value_t = DEFAULT_EXTRA_CONVERT_MS,
@@ -526,6 +676,58 @@ fn parse_unit_f32(value: &str) -> Result<f32, String> {
         Ok(value)
     } else {
         Err("value must be a finite number in 0.0..=1.0".to_string())
+    }
+}
+
+fn parse_protect_f32(value: &str) -> Result<f32, String> {
+    let value = value
+        .parse::<f32>()
+        .map_err(|err| format!("invalid float value: {err}"))?;
+    if value.is_finite() && (0.0..=MAX_PROTECT).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "value must be a finite number in 0.0..={MAX_PROTECT} (0.5 disables protection)"
+        ))
+    }
+}
+
+fn parse_protect_transition_ms(value: &str) -> Result<u32, String> {
+    let value = value
+        .parse::<u32>()
+        .map_err(|err| format!("invalid millisecond value: {err}"))?;
+    if value <= MAX_PROTECT_TRANSITION_MS {
+        Ok(value)
+    } else {
+        Err(format!(
+            "value must be an integer in 0..={MAX_PROTECT_TRANSITION_MS} ms"
+        ))
+    }
+}
+
+fn parse_dfn3_attenuation_limit_db(value: &str) -> Result<f32, String> {
+    let value = value
+        .parse::<f32>()
+        .map_err(|err| format!("invalid float value: {err}"))?;
+    if value.is_finite() && (0.0..=MAX_DFN3_ATTENUATION_LIMIT_DB).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "value must be a finite number in 0.0..={MAX_DFN3_ATTENUATION_LIMIT_DB} dB"
+        ))
+    }
+}
+
+fn parse_dfn3_post_filter_beta(value: &str) -> Result<f32, String> {
+    let value = value
+        .parse::<f32>()
+        .map_err(|err| format!("invalid float value: {err}"))?;
+    if value.is_finite() && (0.0..=MAX_DFN3_POST_FILTER_BETA).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "value must be a finite number in 0.0..={MAX_DFN3_POST_FILTER_BETA}"
+        ))
     }
 }
 
@@ -667,36 +869,74 @@ fn validate_common_conversion_options(
     Ok(())
 }
 
-fn validate_live_values(
+struct LiveValues {
     pitch_shift: f32,
     input_gain: f32,
     output_gain: f32,
     noise_gate_threshold: f32,
-) -> Result<(), String> {
-    validate_finite_f32("pitch shift", pitch_shift).map_err(|err| err.to_string())?;
-    validate_non_negative_f32("input gain", input_gain).map_err(|err| err.to_string())?;
-    validate_non_negative_f32("output gain", output_gain).map_err(|err| err.to_string())?;
-    validate_non_negative_f32("noise gate threshold", noise_gate_threshold)
+    denoiser_content_mix: f32,
+    denoiser_rmvpe_mix: f32,
+    index_rate: f32,
+    protect: f32,
+    protect_transition_ms: u32,
+}
+
+fn validate_live_values(values: LiveValues) -> Result<(), String> {
+    validate_finite_f32("pitch shift", values.pitch_shift).map_err(|err| err.to_string())?;
+    validate_non_negative_f32("input gain", values.input_gain).map_err(|err| err.to_string())?;
+    validate_non_negative_f32("output gain", values.output_gain).map_err(|err| err.to_string())?;
+    validate_non_negative_f32("noise gate threshold", values.noise_gate_threshold)
         .map_err(|err| err.to_string())?;
+    validate_unit_interval("index rate", values.index_rate).map_err(|err| err.to_string())?;
+    if !values.protect.is_finite() || !(0.0..=MAX_PROTECT).contains(&values.protect) {
+        return Err(format!(
+            "protect must be a finite value in 0.0..={MAX_PROTECT} (0.5 disables protection)"
+        ));
+    }
+    if values.protect_transition_ms > MAX_PROTECT_TRANSITION_MS {
+        return Err(format!(
+            "protect transition must be in 0..={MAX_PROTECT_TRANSITION_MS} ms"
+        ));
+    }
+    if !values.denoiser_content_mix.is_finite()
+        || !(0.0..=MAX_DENOISER_CONTENT_MIX).contains(&values.denoiser_content_mix)
+    {
+        return Err("denoiser content mix must be a finite value in 0.0..=1.0".to_string());
+    }
+    if !values.denoiser_rmvpe_mix.is_finite()
+        || !(0.0..=MAX_DENOISER_RMVPE_MIX).contains(&values.denoiser_rmvpe_mix)
+    {
+        return Err("denoiser RMVPE mix must be a finite value in 0.0..=1.0".to_string());
+    }
     Ok(())
 }
 
 fn validate_live_conversion_options(args: &RunArgs) -> Result<(), String> {
-    validate_live_values(
-        args.pitch_shift,
-        args.input_gain,
-        args.output_gain,
-        args.noise_gate_threshold,
-    )
+    validate_live_values(LiveValues {
+        pitch_shift: args.pitch_shift,
+        input_gain: args.input_gain,
+        output_gain: args.output_gain,
+        noise_gate_threshold: args.noise_gate_threshold,
+        denoiser_content_mix: args.denoiser_content_mix,
+        denoiser_rmvpe_mix: args.denoiser_rmvpe_mix,
+        index_rate: args.index_rate,
+        protect: args.protect,
+        protect_transition_ms: args.protect_transition_ms,
+    })
 }
 
 fn validate_wav_live_conversion_options(args: &WavArgs) -> Result<(), String> {
-    validate_live_values(
-        args.pitch_shift,
-        args.input_gain,
-        args.output_gain,
-        args.noise_gate_threshold,
-    )
+    validate_live_values(LiveValues {
+        pitch_shift: args.pitch_shift,
+        input_gain: args.input_gain,
+        output_gain: args.output_gain,
+        noise_gate_threshold: args.noise_gate_threshold,
+        denoiser_content_mix: args.denoiser_content_mix,
+        denoiser_rmvpe_mix: args.denoiser_rmvpe_mix,
+        index_rate: args.index_rate,
+        protect: args.protect,
+        protect_transition_ms: args.protect_transition_ms,
+    })
 }
 
 #[cfg(test)]
@@ -721,6 +961,11 @@ mod tests {
         assert_eq!(args.rms_mix_rate, 0.0);
         assert_eq!(args.f0_threshold, DEFAULT_F0_THRESHOLD);
         assert!(args.f0_continuity);
+        assert_eq!(args.index_rate, 0.0);
+        assert_eq!(args.protect, DEFAULT_PROTECT);
+        assert_eq!(args.protect_transition_ms, DEFAULT_PROTECT_TRANSITION_MS);
+        assert_eq!(args.denoiser_rmvpe_mix, DEFAULT_DENOISER_RMVPE_MIX);
+        assert!(args.index_path.is_none());
         assert_eq!(args.smoother, Smoother::Sola);
         assert_eq!(
             args.rvc_output_tail_discard_ms,
@@ -982,6 +1227,136 @@ mod tests {
         assert_eq!(args.provider, default_provider());
         assert_eq!(args.f0_threshold, DEFAULT_F0_THRESHOLD);
         assert!(args.f0_continuity);
+        assert_eq!(args.index_rate, 0.0);
+        assert_eq!(args.protect, DEFAULT_PROTECT);
+        assert_eq!(args.protect_transition_ms, DEFAULT_PROTECT_TRANSITION_MS);
+        assert!(args.index_path.is_none());
+    }
+
+    #[test]
+    fn parses_feature_index_controls_for_run_and_wav() {
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--index",
+            "voice.index",
+            "--index-rate",
+            "0.65",
+            "--protect",
+            "0.25",
+            "--protect-transition-ms",
+            "20",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.index_path, Some(PathBuf::from("voice.index")));
+        assert_eq!(args.index_rate, 0.65);
+        assert_eq!(args.protect, 0.25);
+        assert_eq!(args.protect_transition_ms, 20);
+        assert!(args.validate_conversion_options().is_ok());
+
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-model",
+            "f0.onnx",
+            "--index-path",
+            "voice.index",
+            "--index-rate",
+            "1.0",
+            "--protect",
+            "0.5",
+            "--protect-transition-ms",
+            "100",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+        ])
+        .unwrap();
+        let Command::Wav(args) = cli.command else {
+            panic!("expected wav command");
+        };
+        assert_eq!(args.index_path, Some(PathBuf::from("voice.index")));
+        assert_eq!(args.index_rate, 1.0);
+        assert_eq!(args.protect, 0.5);
+        assert_eq!(args.protect_transition_ms, 100);
+        assert!(args.validate_conversion_options().is_ok());
+    }
+
+    #[test]
+    fn parses_denoiser_rmvpe_mix_for_run_and_wav() {
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--denoiser-rmvpe-mix",
+            "0.2",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.denoiser_rmvpe_mix, 0.2);
+        assert!(args.validate_conversion_options().is_ok());
+
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-model",
+            "f0.onnx",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+            "--denoiser-rmvpe-mix",
+            "0.8",
+        ])
+        .unwrap();
+        let Command::Wav(args) = cli.command else {
+            panic!("expected wav command");
+        };
+        assert_eq!(args.denoiser_rmvpe_mix, 0.8);
+        assert!(args.validate_conversion_options().is_ok());
+
+        assert!(Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--denoiser-rmvpe-mix",
+            "1.01",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_feature_index_values_outside_rvc_ranges() {
+        assert!(
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--index-rate", "1.01",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--protect", "0.51",]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--protect-transition-ms",
+            "101",
+        ])
+        .is_err());
     }
 
     #[test]

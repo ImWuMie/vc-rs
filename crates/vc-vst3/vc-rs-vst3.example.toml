@@ -23,6 +23,19 @@
 model = "/path/to/models/rvc/your_model.onnx"
 embedder = "/path/to/models/hubert/contentvec.onnx"
 f0_model = "/path/to/models/rmvpe/rmvpe.onnx"
+# Optional: RVC retrieval index. Use an `added_IVF*_Flat_*.index` matching
+# the generator feature width (v1 = 256, v2 = 768), not a `trained_*.index`.
+# index_path = "/path/to/models/rvc/added_IVF256_Flat_nprobe_1.index"
+
+# --- Input denoiser (optional) ---
+# The VST3 worker supports off, noise-gate, rnnoise, webrtc, and
+# deep-filter-net3 when the matching package feature is built. Models remain
+# external; a package built without an optional feature reports a load error.
+denoiser = "off"
+webrtc_suppression_level = "moderate" # low | moderate | high | very-high
+# deepfilternet3_model = "/path/to/DeepFilterNet3_onnx.tar.gz"
+dfn3_attenuation_limit_db = 18.0
+dfn3_post_filter_beta = 0.0
 
 # Optional: explicit embedder output tensor name.
 # embedder_output = "output"
@@ -40,6 +53,14 @@ gpu_device_id = 0
 # Pitch, Speaker, Input Gain and Output Gain are NOT set here: they are DAW
 # parameters (the host saves/restores them per project and they are
 # automatable). Set them from the plugin's controls in your DAW.
+# Index Rate, Protect, and Protect Transition are also DAW parameters. Index
+# Rate = 0 disables retrieval; Protect defaults to 0.33 and 0.5 disables
+# unvoiced-frame protection. Protect Transition defaults to 0 ms (stock RVC);
+# try 20 ms to ease retrieved-feature boundaries around consonants.
+# Denoiser -> ContentVec is also a DAW parameter. It defaults to 0.25, keeping
+# raw articulation while mixing a quarter of the denoised signal into ContentVec;
+# Denoiser -> RMVPE is a separate DAW parameter and defaults to 1.0 (fully
+# denoised). Set it to 0.0 to feed RMVPE the aligned raw input instead.
 
 # --- Detection thresholds ---
 f0_threshold = 0.03

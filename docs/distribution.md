@@ -15,6 +15,14 @@ Build release archives with the repository packaging scripts, normally:
 pwsh scripts/package-all.ps1
 ```
 
+To produce the optional WebRTC + DeepFilterNet3 package variants, add
+`-DeepFilterNet3`. Those archives are named with a `-dfn3-` suffix so they do
+not overwrite the standard package for the same backend:
+
+```powershell
+pwsh scripts/package-all.ps1 -DeepFilterNet3
+```
+
 Do not assemble release archives manually from `target\release` or
 `target\bundled`. The packaging scripts apply release flags, isolate variants,
 populate runtime dependencies, and copy license material.
@@ -64,15 +72,22 @@ binary produced for another variant.
   contain the engine-builder helper and the selected GPU builder resources.
 - Build VST3 variants package-scoped. Do not use a whole-workspace build whose
   unified features can pull incompatible providers into the plugin.
-- Standalone packages enable the pure-Rust `rnnoise` feature. VST3 packages
-  must not enable or advertise RNNoise; inspect package-scoped dependency and
-  license output to catch accidental feature unification.
+- Standalone packages enable the pure-Rust `rnnoise` and allocation-free
+  `webrtc` features. VST3 packages enable `webrtc` but must not enable or
+  advertise RNNoise; inspect package-scoped dependency and license output to
+  catch accidental feature unification.
 - Standalone packages enable `gtcrn` (the 16 kHz GTCRN input denoiser; pulls
   `realfft`/`rustfft`). Windows ML runs GTCRN through ORT CPU; TensorRT keeps
   ONNX Runtime out of the package and runs GTCRN through the native TensorRT
   shim. VST3 (either variant) must not enable or ship `gtcrn`; verify the
   package-scoped feature set and staged files contain no GTCRN code or models.
   GTCRN models are never bundled (fetched via `download-models.ps1 -Gtcrn`).
+- DeepFilterNet3 is an opt-in distribution feature: pass `-DeepFilterNet3` to
+  either `package.ps1` or `scripts/package-all.ps1` to include its runtime code
+  and generate matching dependency notices. It still requires an official
+  external `.tar.gz` archive, which is never bundled. Fetch it only with
+  `download-models.ps1 -DeepFilterNet3` (or `-DeepFilterNet3LowLatency`), then
+  select the archive explicitly in the CLI/GUI/VST3 configuration.
 
 Start packaging from clean per-variant staging directories. Stale sidecar DLLs
 from another package must never survive into a release.

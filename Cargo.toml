@@ -26,6 +26,17 @@ all = { level = "warn", priority = -1 }
 [profile.release]
 strip = true
 
+# The official full DeepFilterNet3 export carries duplicate internal graph node
+# names. `tract-core` checks these names only under debug assertions; release
+# inference is valid and has an external-model smoke test in vc-core. Scope the
+# workaround to that third-party crate so vc-rs's own debug assertions remain
+# enabled and Debug GUI builds can still load the official archive.
+[profile.dev.package.tract-core]
+debug-assertions = false
+
+[profile.test.package.tract-core]
+debug-assertions = false
+
 [workspace.dependencies]
 anyhow = "1.0"
 tracing = "0.1"

@@ -147,12 +147,26 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     ui.separator();
 
     // Snapshot current settings for display, releasing the lock immediately.
-    let (model, embedder, f0_model, provider, gpu_device_id) = {
+    let (
+        model,
+        embedder,
+        f0_model,
+        index_path,
+        denoiser,
+        webrtc_level,
+        deepfilternet3_model,
+        provider,
+        gpu_device_id,
+    ) = {
         let s = state.params.settings.read().unwrap();
         (
             s.model.clone(),
             s.embedder.clone(),
             s.f0_model.clone(),
+            s.index_path.clone(),
+            s.denoiser.clone(),
+            s.webrtc_suppression_level.clone(),
+            s.deepfilternet3_model.clone(),
             s.provider.clone(),
             s.gpu_device_id,
         )
@@ -167,6 +181,69 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     }
     if file_row(ui, "F0 (RMVPE)", &f0_model) {
         spawn_picker(state, ModelKind::F0);
+    }
+    if file_row(ui, "Feature index (.index)", &index_path) {
+        spawn_picker(state, ModelKind::Index);
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("Input denoiser");
+        egui::ComboBox::from_id_salt("denoiser")
+            .selected_text(&denoiser)
+            .show_ui(ui, |ui| {
+                for option in denoiser_options() {
+                    if ui.selectable_label(denoiser == *option, *option).clicked() {
+                        state.params.settings.write().unwrap().denoiser = option.to_string();
+                        mark_dirty(state);
+                    }
+                }
+            });
+    });
+    if denoiser == "webrtc" {
+        ui.horizontal(|ui| {
+            ui.label("WebRTC suppression");
+            egui::ComboBox::from_id_salt("webrtc-level")
+                .selected_text(&webrtc_level)
+                .show_ui(ui, |ui| {
+                    for option in ["low", "moderate", "high", "very-high"] {
+                        if ui
+                            .selectable_label(webrtc_level == option, option)
+                            .clicked()
+                        {
+                            state
+                                .params
+                                .settings
+                                .write()
+                                .unwrap()
+                                .webrtc_suppression_level = option.to_string();
+                            mark_dirty(state);
+                        }
+                    }
+                });
+        });
+    }
+    if denoiser == "deep-filter-net3" {
+        if file_row(ui, "DeepFilterNet3 archive", &deepfilternet3_model) {
+            spawn_picker(state, ModelKind::DeepFilterNet3);
+        }
+        ui.small("DFN3 archive is external and is loaded only on Reload.");
+        let (attenuation, beta) = {
+            let s = state.params.settings.read().unwrap();
+            (s.dfn3_attenuation_limit_db, s.dfn3_post_filter_beta)
+        };
+        if let Some(value) = f32_slider(ui, "DFN3 attenuation", attenuation, 0.0, 100.0, " dB") {
+            state
+                .params
+                .settings
+                .write()
+                .unwrap()
+                .dfn3_attenuation_limit_db = value;
+            mark_dirty(state);
+        }
+        if let Some(value) = f32_slider(ui, "DFN3 post-filter", beta, 0.0, 0.1, "") {
+            state.params.settings.write().unwrap().dfn3_post_filter_beta = value;
+            mark_dirty(state);
+        }
     }
 
     ui.separator();
@@ -288,6 +365,36 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
             setter,
         ));
         ui.end_row();
+        ui.label("Denoiser -> ContentVec");
+        ui.add(widgets::ParamSlider::for_param(
+            &state.params.denoiser_content_mix,
+            setter,
+        ));
+        ui.end_row();
+        ui.label("Denoiser -> RMVPE");
+        ui.add(widgets::ParamSlider::for_param(
+            &state.params.denoiser_rmvpe_mix,
+            setter,
+        ));
+        ui.end_row();
+        ui.label("Index rate");
+        ui.add(widgets::ParamSlider::for_param(
+            &state.params.index_rate,
+            setter,
+        ));
+        ui.end_row();
+        ui.label("Protect");
+        ui.add(widgets::ParamSlider::for_param(
+            &state.params.protect,
+            setter,
+        ));
+        ui.end_row();
+        ui.label("Protect transition");
+        ui.add(widgets::ParamSlider::for_param(
+            &state.params.protect_transition_ms,
+            setter,
+        ));
+        ui.end_row();
     });
 
     // Gate attack/release/floor are static (applied on Load / Reload), so they
@@ -380,6 +487,8 @@ enum ModelKind {
     Rvc,
     Embedder,
     F0,
+    Index,
+    DeepFilterNet3,
 }
 
 /// Open the native file dialog on a separate thread and stage the chosen path
@@ -392,20 +501,34 @@ fn spawn_picker(state: &EditorState, kind: ModelKind) {
     let params = state.params.clone();
     let dirty = state.dirty.clone();
     std::thread::spawn(move || {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("ONNX model", &["onnx"])
-            .pick_file()
-        {
+        let dialog = match kind {
+            ModelKind::Index => rfd::FileDialog::new().add_filter("RVC feature index", &["index"]),
+            ModelKind::DeepFilterNet3 => {
+                rfd::FileDialog::new().add_filter("DeepFilterNet3 archive", &["gz"])
+            }
+            ModelKind::Rvc | ModelKind::Embedder | ModelKind::F0 => {
+                rfd::FileDialog::new().add_filter("ONNX model", &["onnx"])
+            }
+        };
+        if let Some(path) = dialog.pick_file() {
             if let Ok(mut settings) = params.settings.write() {
                 match kind {
                     ModelKind::Rvc => settings.model = path,
                     ModelKind::Embedder => settings.embedder = path,
                     ModelKind::F0 => settings.f0_model = path,
+                    ModelKind::Index => settings.index_path = path,
+                    ModelKind::DeepFilterNet3 => settings.deepfilternet3_model = path,
                 }
             }
             dirty.store(true, Ordering::SeqCst);
         }
     });
+}
+
+fn denoiser_options() -> &'static [&'static str] {
+    // Keep unavailable entries visible so a project saved with an optional
+    // backend reports a precise load error instead of silently changing mode.
+    &["off", "noise-gate", "rnnoise", "webrtc", "deep-filter-net3"]
 }
 
 fn spawn_gpu_device_discovery() -> (

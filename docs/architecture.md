@@ -126,15 +126,25 @@ This lifecycle preserves three invariants:
 
 ```mermaid
 flowchart TD
-    input["Device-rate mono chunk"] --> denoise["Off / Gate / RNNoise<br/>(device rate)"]
-    denoise --> state["Rolling stream state"]
-    state --> resample["Resample to 16 kHz<br/>(+ GTCRN denoise, if active)"]
-    resample --> embed["Content embedder"]
-    resample --> f0["F0 estimator"]
-    embed --> feats["Content feature 2x upsampling"]
-    f0 --> pitchf["Continuous F0 alignment<br/>+ optional internal-gap interpolation"]
+    input["Device-rate mono chunk"] --> gain["Input gain"]
+    gain --> raw16["Residual-preserving 16 kHz branch"]
+    gain --> denoise["Off / Gate / RNNoise / WebRTC / DFN3<br/>(device rate)"]
+    denoise --> pitch16["Pitch 16 kHz branch"]
+    pitch16 --> gtcrn["GTCRN or passthrough"]
+    raw16 --> blend["ContentVec blend<br/>(raw + denoised share)"]
+    gtcrn --> blend
+    raw16 --> rmvpeblend["RMVPE blend<br/>(raw + denoised share)"]
+    gtcrn --> rmvpeblend
+    blend --> embed["Content embedder"]
+    rmvpeblend --> f0["F0 estimator / RMVPE"]
+    embed --> retrieve["Optional IVF-Flat feature retrieval"]
+    retrieve --> feats["Content feature 2x upsampling"]
+    f0 --> rawf0["Natural F0 alignment"]
+    feats --> protect["Optional consonant protection + boundary easing<br/>(raw-F0 unvoiced frames)"]
+    rawf0 --> protect
+    protect --> rvc["RVC generator"]
+    rawf0 --> pitchf["F0 continuity + pitch shift"]
     pitchf --> coarse["Coarse pitch bins"]
-    feats --> rvc["RVC generator"]
     pitchf --> rvc
     coarse --> rvc
     rvc --> tail["Select stable output tail"]
@@ -143,10 +153,11 @@ flowchart TD
     join --> device["Device-rate output chunk"]
 ```
 
-Standalone RNNoise (48 kHz) runs at the **device rate**, after input gain and
-before RMS/silence detection, ContentVec, and F0 extraction. Its fixed-delay
-adapter preserves the input sample count for every worker call while retaining
-recurrent and resampler state across chunks.
+Standalone RNNoise (48 kHz) runs at the **device rate**, after input gain and on
+the RMVPE branch. Its fixed-delay adapter preserves the input sample count for
+every worker call while retaining recurrent and resampler state across chunks.
+The residual ContentVec branch remains unprocessed except for a matching delay,
+then receives the configured denoised share after both branches reach 16 kHz.
 
 **GTCRN (16 kHz) is the exception to the device-rate rule.** It denoises the new
 16 kHz increment *inside* `generate_input` — reusing the resample the pipeline
@@ -154,15 +165,34 @@ already does into `audio_16k_buffer`, before that increment is windowed — so t
 realtime hot path pays no extra round-trip resample and the model sees native
 16 kHz. It shares the same fixed-delay `FrameDenoiser` adapter as RNNoise (at
 16 kHz the adapter's resamplers are bypass), preserves the per-call 16 kHz sample
-count, and never shifts the feature/F0 grid. Because the cleaned signal now is the
-one ContentVec/F0 consume, the RVC-path **input RMS, silence detection,
-volume-envelope memory, and RMS-mix reference are all derived from that 16 kHz
-timeline for every denoiser mode** (Off / Gate / RNNoise / GTCRN), not from the
-raw device-rate buffer. The passthrough route keeps a separate device-rate GTCRN
-instance (its resamplers engage). GTCRN ships in standalone packages: Windows ML
-uses ORT CPU for the tiny graph, while TensorRT uses a native TensorRT engine so
-the TensorRT package remains ORT-free. VST3 intentionally does not enable or ship
-these optional core denoisers.
+count, and never shifts the feature/F0 grid. RVC-path **input RMS and silence
+detection use the configured RMVPE branch**, while volume-envelope memory and
+the RMS-mix reference follow the residual-preserving ContentVec blend. With
+denoising off, both histories are filled from one 16 kHz resample; a second
+resampler is used only when the device-rate branches differ. The passthrough
+route keeps a separate device-rate GTCRN instance (its resamplers engage). GTCRN
+ships in standalone packages: Windows ML uses ORT CPU for the tiny graph, while
+TensorRT uses a native TensorRT engine so the TensorRT package remains ORT-free.
+VST3 enables the in-tree WebRTC suppressor, but intentionally does not enable
+or ship RNNoise, GTCRN, or DeepFilterNet3 model data. `package.ps1 -DeepFilterNet3`
+is an external-model opt-in package variant: it includes DFN3 runtime code and
+matching license notices, but never the model archive.
+
+For Gate, RNNoise, WebRTC, GTCRN, and DeepFilterNet3, `denoiser_content_mix` and
+`denoiser_rmvpe_mix` are live worker-side controls:
+for ContentVec, `0` sends raw input, `0.25` is the residual-preserving default,
+and `1` uses the fully denoised path. RMVPE's control uses the same `0..=1`
+meaning, but defaults to `1.0` for compatibility with the former full-denoise
+pitch path. RNNoise and GTCRN have fixed output delay, so both raw branches pass
+through matching preallocated alignment before mixing; this prevents an earlier
+voice from being combined with the cleaned signal. All branch buffers,
+resampling, and denoiser work stay on the conversion worker; callbacks continue
+to move samples only through lock-free queues.
+
+Changing denoiser mode restarts its model-side rolling windows and matching
+delay lines, and the owning front-end discards the SOLA/PSOLA join history at the
+same boundary. This prevents pre-switch audio from being concatenated or
+crossfaded with a differently delayed post-switch timeline.
 
 Conceptually, RVC conversion has three model-facing inputs:
 
@@ -178,6 +208,27 @@ generation. F0 is then length-matched to the resulting feature frame count and
 kept both as continuous `pitchf` and quantized coarse pitch. Misaligning these
 streams usually sounds like timing drift, pitch lag, or unstable consonants, so
 frame-grid changes should be treated as audio-quality changes, not cleanup.
+
+When configured, the pipeline reads a standard RVC
+`added_IVF*_Flat_*.index` FAISS `IndexIVFFlat` file during model construction.
+It rejects unsupported index families, unpopulated `trained_*.index` files, and
+feature widths that do not match the generator (v1 = 256, v2 = 768). The worker
+searches its reusable IVF scratch buffers for the eight nearest vectors and
+applies upstream RVC inverse-squared-distance blending before feature doubling.
+`index_rate=0` is an exact no-op. If `protect < 0.5`, the worker also retains the
+pre-retrieval ContentVec tensor and, after the same trim/repeat transformation,
+mixes it back only for raw-F0-unvoiced frames. It intentionally uses raw,
+unshifted F0 so continuity/pitch-shift postprocessing cannot turn a consonant
+into a retrieval-voiced frame. Index file I/O, parsing, retrieval, and this
+extra scratch memory are all outside the audio callback.
+
+`protect_transition_ms` is a vc-rs extension, not an MXGF/upstream-RVC setting.
+At its default of zero it takes the exact binary upstream Protect path. A
+positive value is rounded up to the 10 ms generator feature grid and blends the
+nearby *voiced* frames progressively from the Protect mix back to full retrieval;
+the raw-F0-unvoiced frame itself remains protected. The bounded 0..100 ms scan
+uses the existing worker-owned tensors and no extra scratch allocation. It is
+skipped entirely without an index, with `index_rate=0`, or with `protect=0.5`.
 
 The default RMVPE confidence threshold is 0.03. Optional F0 continuity runs
 after alignment on the worker and linearly interpolates only zero runs bounded

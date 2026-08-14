@@ -9,12 +9,14 @@ description = "Standalone GUI for vc-rs"
 workspace = true
 
 [features]
-default = ["tensorrt", "rnnoise", "gtcrn"]
+default = ["tensorrt", "rnnoise", "gtcrn", "webrtc"]
 windowsml = ["vc-app/windowsml", "vc-core/windowsml"]
 tensorrt = ["vc-app/tensorrt", "vc-core/tensorrt"]
 cuda = ["vc-app/cuda", "vc-core/cuda"]
 rnnoise = ["vc-app/rnnoise", "vc-core/rnnoise"]
 gtcrn = ["vc-app/gtcrn", "vc-core/gtcrn"]
+webrtc = ["vc-app/webrtc", "vc-core/webrtc"]
+deepfilternet3 = ["vc-app/deepfilternet3", "vc-core/deepfilternet3"]
 # Opt-in ASIO host (cpal). Requires the Steinberg ASIO SDK + LLVM at build time;
 # see scripts/README.md. Never in `default`.
 asio = ["vc-app/asio"]

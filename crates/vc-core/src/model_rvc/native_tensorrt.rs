@@ -14,9 +14,10 @@ use tracing::info;
 use super::feature::FeatureTensor;
 use super::onnx_meta::RvcIoNames;
 use super::tensorrt::{
-    format_usize_shape, tensor_rt_cache_root, tensor_rt_model_cache_key, ModelRole,
-    TensorRtInputShape, TensorRtSessionProfile,
+    format_usize_shape, tensor_rt_cache_root, TensorRtInputShape, TensorRtSessionProfile,
 };
+#[cfg(feature = "gtcrn")]
+use super::tensorrt::{tensor_rt_model_cache_key, ModelRole};
 
 #[cfg(native_tensorrt)]
 mod ffi {
@@ -80,6 +81,7 @@ mod ffi {
             message: *mut c_char,
             message_len: usize,
         ) -> c_int;
+        #[cfg(feature = "gtcrn")]
         #[allow(clippy::too_many_arguments)]
         pub(super) fn vc_rs_trt_gtcrn_infer(
             native: *mut c_void,
@@ -121,7 +123,10 @@ pub(super) struct NativeRmvpeEngine {
     message: MessageBuffer,
 }
 
-#[cfg_attr(not(native_tensorrt), allow(dead_code))]
+// GTCRN is optional independently of the native TensorRT backend. Keep its
+// native adapter out of non-GTCRN binaries so CPU/Windows ML packages do not
+// retain an unused engine role or its cache-profile code.
+#[cfg(feature = "gtcrn")]
 pub(crate) struct NativeGtcrnEngine {
     #[cfg(native_tensorrt)]
     handle: std::ptr::NonNull<c_void>,
@@ -181,6 +186,7 @@ pub(super) struct NativeRvcEngine {
 unsafe impl Send for NativeContentVecEngine {}
 unsafe impl Send for NativeRmvpeEngine {}
 unsafe impl Send for NativeRvcEngine {}
+#[cfg(feature = "gtcrn")]
 unsafe impl Send for NativeGtcrnEngine {}
 
 impl NativeContentVecEngine {
@@ -320,6 +326,10 @@ impl NativeRmvpeEngine {
         vec![1, self.output_len.get() as i64]
     }
 
+    // The engine writes a dynamic-length F0 vector, so this must retain a Vec
+    // rather than accept a slice. It reuses `pitchf_scratch` across chunks;
+    // changing it to return a fresh Vec would allocate on every worker update.
+    #[allow(clippy::ptr_arg)]
     pub(super) fn extract_into(
         &mut self,
         audio_16k: &[f32],
@@ -343,6 +353,7 @@ impl NativeRmvpeEngine {
     }
 }
 
+#[cfg(feature = "gtcrn")]
 impl NativeGtcrnEngine {
     pub(crate) fn load(
         model_path: &Path,
@@ -560,13 +571,14 @@ impl Drop for NativeRvcEngine {
     }
 }
 
-#[cfg(native_tensorrt)]
+#[cfg(all(native_tensorrt, feature = "gtcrn"))]
 impl Drop for NativeGtcrnEngine {
     fn drop(&mut self) {
         unsafe { ffi::vc_rs_trt_engine_destroy(self.handle.as_ptr()) };
     }
 }
 
+#[cfg(feature = "gtcrn")]
 pub(crate) fn native_gtcrn_engine_is_cached(model_path: &Path, gpu_device_id: u32) -> bool {
     native_gtcrn_profile(model_path, super::GpuPriority::default(), gpu_device_id)
         .ok()
@@ -575,6 +587,7 @@ pub(crate) fn native_gtcrn_engine_is_cached(model_path: &Path, gpu_device_id: u3
         .is_some_and(|metadata| metadata.len() > 0)
 }
 
+#[cfg(feature = "gtcrn")]
 fn native_gtcrn_profile(
     model_path: &Path,
     gpu_priority: super::GpuPriority,
@@ -1231,7 +1244,7 @@ fn infer_rvc(
     bail!("native TensorRT RVC inference is unavailable in this binary")
 }
 
-#[cfg(native_tensorrt)]
+#[cfg(all(native_tensorrt, feature = "gtcrn"))]
 fn infer_gtcrn(
     engine: &mut NativeGtcrnEngine,
     mix: &[f32],
@@ -1267,7 +1280,7 @@ fn infer_gtcrn(
     Ok(())
 }
 
-#[cfg(not(native_tensorrt))]
+#[cfg(all(not(native_tensorrt), feature = "gtcrn"))]
 fn infer_gtcrn(
     _engine: &mut NativeGtcrnEngine,
     _mix: &[f32],

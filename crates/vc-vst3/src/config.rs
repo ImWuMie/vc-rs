@@ -9,6 +9,11 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use vc_core::denoise_config::{
+    WebRtcSuppressionLevel, DEFAULT_DFN3_ATTENUATION_LIMIT_DB, DEFAULT_DFN3_POST_FILTER_BETA,
+    MAX_DFN3_ATTENUATION_LIMIT_DB, MAX_DFN3_POST_FILTER_BETA,
+};
+use vc_core::model_rvc::InputDenoiserMode;
 use vc_core::model_rvc::{GpuPriority, DEFAULT_F0_THRESHOLD};
 use vc_core::validation::{
     validate_conversion_timing, validate_non_negative_f32, validate_unit_interval,
@@ -31,6 +36,19 @@ pub struct PluginConfig {
     pub model: PathBuf,
     pub embedder: PathBuf,
     pub f0_model: PathBuf,
+    /// Optional target-speaker FAISS `added_IVF*_Flat_*.index`. It is read
+    /// only when the worker loads/reloads the pipeline.
+    pub index_path: PathBuf,
+    /// Input denoiser selected for the next worker load. The VST3 package does
+    /// not expose GTCRN because that model's native backend is standalone-only.
+    /// Values are `off`, `noise-gate`, `rnnoise`, `webrtc`, or
+    /// `deep-filter-net3`.
+    pub denoiser: String,
+    pub webrtc_suppression_level: String,
+    /// External official DeepFilterNet3 archive; never embedded in the plugin.
+    pub deepfilternet3_model: PathBuf,
+    pub dfn3_attenuation_limit_db: f32,
+    pub dfn3_post_filter_beta: f32,
     pub embedder_output: Option<String>,
     /// Legacy config key kept for lenient parsing only. TensorRT engine paths
     /// are no longer user-provided; native TensorRT builds cache entries from
@@ -73,6 +91,12 @@ impl Default for PluginConfig {
             model: PathBuf::new(),
             embedder: PathBuf::new(),
             f0_model: PathBuf::new(),
+            index_path: PathBuf::new(),
+            denoiser: "off".to_string(),
+            webrtc_suppression_level: "moderate".to_string(),
+            deepfilternet3_model: PathBuf::new(),
+            dfn3_attenuation_limit_db: DEFAULT_DFN3_ATTENUATION_LIMIT_DB,
+            dfn3_post_filter_beta: DEFAULT_DFN3_POST_FILTER_BETA,
             embedder_output: None,
             rvc_engine: None,
             provider: default_provider().to_string(),
@@ -142,6 +166,33 @@ impl PluginConfig {
         }
     }
 
+    pub fn denoiser_mode(&self) -> anyhow::Result<InputDenoiserMode> {
+        match self.denoiser.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(InputDenoiserMode::Off),
+            "noise-gate" | "gate" => Ok(InputDenoiserMode::Gate),
+            "rnnoise" => Ok(InputDenoiserMode::Rnnoise),
+            "webrtc" | "webrtc-ns" => Ok(InputDenoiserMode::WebRtc),
+            "deep-filter-net3" | "deepfilternet3" | "dfn3" => {
+                Ok(InputDenoiserMode::DeepFilterNet3)
+            }
+            other => anyhow::bail!(
+                "unsupported VST3 denoiser '{other}'; use off, noise-gate, rnnoise, webrtc, or deep-filter-net3"
+            ),
+        }
+    }
+
+    pub fn webrtc_level(&self) -> anyhow::Result<WebRtcSuppressionLevel> {
+        match self.webrtc_suppression_level.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(WebRtcSuppressionLevel::Low),
+            "moderate" | "medium" => Ok(WebRtcSuppressionLevel::Moderate),
+            "high" => Ok(WebRtcSuppressionLevel::High),
+            "very-high" | "veryhigh" => Ok(WebRtcSuppressionLevel::VeryHigh),
+            other => anyhow::bail!(
+                "unsupported WebRTC suppression level '{other}'; use low, moderate, high, or very-high"
+            ),
+        }
+    }
+
     pub fn gpu_priority(&self) -> GpuPriority {
         match self.gpu_priority.trim().to_ascii_lowercase().as_str() {
             "normal" => GpuPriority::Normal,
@@ -172,6 +223,27 @@ impl PluginConfig {
         validate_unit_interval("RMS mix rate", self.rms_mix_rate)?;
         validate_non_negative_f32("target output RMS", self.target_output_rms)?;
         validate_non_negative_f32("max output gain", self.max_output_gain)?;
+        let denoiser = self.denoiser_mode()?;
+        let _ = self.webrtc_level()?;
+        if !self.dfn3_attenuation_limit_db.is_finite()
+            || !(0.0..=MAX_DFN3_ATTENUATION_LIMIT_DB).contains(&self.dfn3_attenuation_limit_db)
+        {
+            anyhow::bail!(
+                "DeepFilterNet3 attenuation limit must be in 0..={MAX_DFN3_ATTENUATION_LIMIT_DB} dB"
+            );
+        }
+        if !self.dfn3_post_filter_beta.is_finite()
+            || !(0.0..=MAX_DFN3_POST_FILTER_BETA).contains(&self.dfn3_post_filter_beta)
+        {
+            anyhow::bail!(
+                "DeepFilterNet3 post-filter beta must be in 0..={MAX_DFN3_POST_FILTER_BETA}"
+            );
+        }
+        if denoiser == InputDenoiserMode::DeepFilterNet3
+            && self.deepfilternet3_model.as_os_str().is_empty()
+        {
+            anyhow::bail!("DeepFilterNet3 requires deepfilternet3_model");
+        }
         Ok(())
     }
 
@@ -330,6 +402,13 @@ mod tests {
         let parsed: PluginConfig = toml::from_str("").unwrap();
         assert_eq!(parsed.f0_threshold, DEFAULT_F0_THRESHOLD);
         assert!(parsed.f0_continuity);
+    }
+
+    #[test]
+    fn feature_index_path_defaults_empty_and_parses() {
+        assert!(PluginConfig::default().index_path.as_os_str().is_empty());
+        let config: PluginConfig = toml::from_str("index_path = 'voice.index'").unwrap();
+        assert_eq!(config.index_path, PathBuf::from("voice.index"));
     }
 
     #[test]

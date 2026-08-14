@@ -11,7 +11,14 @@ use tracing_subscriber::EnvFilter;
 use vc_app::{
     AudioHost, DenoiserMode, DeviceSpec, EngineController, EngineState, EngineStatusSnapshot,
     F0Config, F0PostprocessConfig, LiveParams, ModelLoadState, NoiseGateShaping,
-    OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot, DEFAULT_F0_THRESHOLD,
+    OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot,
+    DEFAULT_DENOISER_CONTENT_MIX, DEFAULT_DENOISER_RMVPE_MIX, DEFAULT_F0_THRESHOLD,
+    DEFAULT_PROTECT, DEFAULT_PROTECT_TRANSITION_MS, MAX_DENOISER_CONTENT_MIX,
+    MAX_DENOISER_RMVPE_MIX, MAX_PROTECT, MAX_PROTECT_TRANSITION_MS,
+};
+use vc_core::denoise_config::{
+    WebRtcSuppressionLevel, DEFAULT_DFN3_ATTENUATION_LIMIT_DB, DEFAULT_DFN3_POST_FILTER_BETA,
+    MAX_DFN3_ATTENUATION_LIMIT_DB, MAX_DFN3_POST_FILTER_BETA,
 };
 use vc_core::gpu::{list_cuda_devices, GpuDevice};
 use vc_core::validation::CONVERSION_TIMING_LIMITS;
@@ -24,6 +31,7 @@ const GUI_SOLA_SEARCH_MS: u32 = 12;
 const GUI_MIN_EXTRA_CONVERT_MS: u32 = 100;
 const QUALITY_PRESET_CHUNK_MS: u32 = 450;
 const QUALITY_PRESET_EXTRA_CONVERT_MS: u32 = 2_120;
+const QUALITY_PRESET_PROTECT_TRANSITION_MS: u32 = 20;
 const RMS_HEALTHY_MIN: f32 = 0.01;
 const RMS_HEALTHY_MAX: f32 = 0.10;
 const RMS_HIGH_MAX: f32 = 0.25;
@@ -126,6 +134,7 @@ struct GuiSettings {
     model: String,
     embedder: String,
     f0_model: String,
+    index_path: String,
     provider: String,
     gpu_priority: String,
     gpu_device_id: u32,
@@ -160,9 +169,22 @@ struct GuiSettings {
     speaker_id: i64,
     input_gain: f32,
     output_gain: f32,
+    index_rate: f32,
+    protect: f32,
+    protect_transition_ms: u32,
+    denoiser_content_mix: f32,
+    denoiser_rmvpe_mix: f32,
     denoiser: String,
     #[serde(default)]
     gtcrn_model_dir: String,
+    #[serde(default)]
+    deepfilternet3_model: String,
+    #[serde(default)]
+    webrtc_suppression_level: String,
+    #[serde(default = "default_dfn3_attenuation_limit_db")]
+    dfn3_attenuation_limit_db: f32,
+    #[serde(default = "default_dfn3_post_filter_beta")]
+    dfn3_post_filter_beta: f32,
     #[serde(skip_serializing)]
     noise_gate_enabled: bool,
     noise_gate_threshold: f32,
@@ -190,6 +212,7 @@ impl Default for GuiSettings {
             model: String::new(),
             embedder: String::new(),
             f0_model: String::new(),
+            index_path: String::new(),
             provider: default_provider_name().to_string(),
             gpu_priority: "high".to_string(),
             gpu_device_id: 0,
@@ -216,8 +239,17 @@ impl Default for GuiSettings {
             speaker_id: 0,
             input_gain: 1.0,
             output_gain: 1.0,
+            index_rate: 0.0,
+            protect: DEFAULT_PROTECT,
+            protect_transition_ms: DEFAULT_PROTECT_TRANSITION_MS,
+            denoiser_content_mix: DEFAULT_DENOISER_CONTENT_MIX,
+            denoiser_rmvpe_mix: DEFAULT_DENOISER_RMVPE_MIX,
             denoiser: "off".to_string(),
             gtcrn_model_dir: String::new(),
+            deepfilternet3_model: String::new(),
+            webrtc_suppression_level: "moderate".to_string(),
+            dfn3_attenuation_limit_db: DEFAULT_DFN3_ATTENUATION_LIMIT_DB,
+            dfn3_post_filter_beta: DEFAULT_DFN3_POST_FILTER_BETA,
             noise_gate_enabled: false,
             noise_gate_threshold: 0.01,
             noise_gate_attack_ms: 5.0,
@@ -252,6 +284,35 @@ impl GuiSettings {
         self.wasapi_output_exclusive = false;
         self.wasapi_buffer_ms = 0;
         self.monitor_gain = self.monitor_gain.max(0.0);
+        self.index_rate = self.index_rate.clamp(0.0, 1.0);
+        self.protect = self.protect.clamp(0.0, MAX_PROTECT);
+        self.protect_transition_ms = self.protect_transition_ms.min(MAX_PROTECT_TRANSITION_MS);
+        self.denoiser_content_mix = if self.denoiser_content_mix.is_finite() {
+            self.denoiser_content_mix
+                .clamp(0.0, MAX_DENOISER_CONTENT_MIX)
+        } else {
+            DEFAULT_DENOISER_CONTENT_MIX
+        };
+        self.denoiser_rmvpe_mix = if self.denoiser_rmvpe_mix.is_finite() {
+            self.denoiser_rmvpe_mix.clamp(0.0, MAX_DENOISER_RMVPE_MIX)
+        } else {
+            DEFAULT_DENOISER_RMVPE_MIX
+        };
+        if !webrtc_suppression_level_names().contains(&self.webrtc_suppression_level.as_str()) {
+            self.webrtc_suppression_level = "moderate".to_string();
+        }
+        self.dfn3_attenuation_limit_db = if self.dfn3_attenuation_limit_db.is_finite() {
+            self.dfn3_attenuation_limit_db
+                .clamp(0.0, MAX_DFN3_ATTENUATION_LIMIT_DB)
+        } else {
+            DEFAULT_DFN3_ATTENUATION_LIMIT_DB
+        };
+        self.dfn3_post_filter_beta = if self.dfn3_post_filter_beta.is_finite() {
+            self.dfn3_post_filter_beta
+                .clamp(0.0, MAX_DFN3_POST_FILTER_BETA)
+        } else {
+            DEFAULT_DFN3_POST_FILTER_BETA
+        };
         self.crossfade_ms = GUI_CROSSFADE_MS;
         self.sola_search_ms = GUI_SOLA_SEARCH_MS;
         self.extra_convert_ms = self.extra_convert_ms.max(GUI_MIN_EXTRA_CONVERT_MS);
@@ -289,6 +350,11 @@ impl GuiSettings {
             // rnnoise still needs a reload (it rebuilds a stateful denoiser).
             noise_gate_enabled: self.denoiser == "noise-gate",
             noise_gate_threshold: self.noise_gate_threshold,
+            denoiser_content_mix: self.denoiser_content_mix,
+            denoiser_rmvpe_mix: self.denoiser_rmvpe_mix,
+            index_rate: self.index_rate,
+            protect: self.protect,
+            protect_transition_ms: self.protect_transition_ms,
         }
     }
 
@@ -303,6 +369,7 @@ impl GuiSettings {
             embedder: path_option(&self.embedder),
             embedder_output: None,
             f0_model: path_option(&self.f0_model),
+            feature_index: path_option(&self.index_path),
             provider: parse_provider(&self.provider)?,
             gpu_priority: parse_gpu_priority(&self.gpu_priority)?,
             gpu_device_id: self.gpu_device_id,
@@ -336,6 +403,12 @@ impl GuiSettings {
             } else {
                 Some(PathBuf::from(&self.gtcrn_model_dir))
             },
+            webrtc_suppression_level: parse_webrtc_suppression_level(
+                &self.webrtc_suppression_level,
+            )?,
+            deepfilternet3_model: path_option(&self.deepfilternet3_model),
+            dfn3_attenuation_limit_db: self.dfn3_attenuation_limit_db,
+            dfn3_post_filter_beta: self.dfn3_post_filter_beta,
             noise_gate_shaping: NoiseGateShaping {
                 attack_ms: self.noise_gate_attack_ms,
                 release_ms: self.noise_gate_release_ms,
@@ -470,15 +543,19 @@ impl VcGui {
     }
 
     fn browse_into(&mut self, kind: ModelKind) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("ONNX model", &["onnx"])
-            .pick_file()
-        {
+        let dialog = match kind {
+            ModelKind::Index => rfd::FileDialog::new().add_filter("RVC feature index", &["index"]),
+            ModelKind::Rvc | ModelKind::Embedder | ModelKind::F0 => {
+                rfd::FileDialog::new().add_filter("ONNX model", &["onnx"])
+            }
+        };
+        if let Some(path) = dialog.pick_file() {
             let value = path.to_string_lossy().into_owned();
             match kind {
                 ModelKind::Rvc => self.settings.model = value,
                 ModelKind::Embedder => self.settings.embedder = value,
                 ModelKind::F0 => self.settings.f0_model = value,
+                ModelKind::Index => self.settings.index_path = value,
             }
             self.changed();
         }
@@ -621,6 +698,12 @@ impl eframe::App for VcGui {
             changed |= path_changed;
             if browse_clicked {
                 self.browse_into(ModelKind::F0);
+            }
+            let (path_changed, browse_clicked) =
+                model_path_control(ui, "Feature index", &mut self.settings.index_path);
+            changed |= path_changed;
+            if browse_clicked {
+                self.browse_into(ModelKind::Index);
             }
 
             ui.separator();
@@ -862,6 +945,10 @@ impl eframe::App for VcGui {
                 self.settings.extra_convert_ms = QUALITY_PRESET_EXTRA_CONVERT_MS;
                 self.settings.f0_threshold = DEFAULT_F0_THRESHOLD;
                 self.settings.f0_continuity = true;
+                // This is a vc-rs extension, separate from the MXGF settings
+                // the rest of the preset was audited against. It remains a live
+                // parameter so users can A/B it without rebuilding the engine.
+                self.settings.protect_transition_ms = QUALITY_PRESET_PROTECT_TRANSITION_MS;
                 changed = true;
             }
             changed |= ui
@@ -930,8 +1017,49 @@ impl eframe::App for VcGui {
                         .text("Monitor gain"),
                 )
                 .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.settings.index_rate, 0.0..=1.0)
+                        .text("Index rate"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.settings.protect, 0.0..=MAX_PROTECT)
+                        .text("Protect"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut self.settings.protect_transition_ms,
+                        0..=MAX_PROTECT_TRANSITION_MS,
+                    )
+                    .suffix(" ms")
+                    .text("Protect transition"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut self.settings.denoiser_content_mix,
+                        0.0..=MAX_DENOISER_CONTENT_MIX,
+                    )
+                    .text("Denoiser -> ContentVec"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut self.settings.denoiser_rmvpe_mix,
+                        0.0..=MAX_DENOISER_RMVPE_MIX,
+                    )
+                    .text("Denoiser -> RMVPE"),
+                )
+                .changed();
             // Denoiser switching applies live while a session is running (all
-            // four modes; gtcrn loads its engine in the background first).
+            // model-free modes switch on the worker; graph-backed GTCRN/DFN3
+            // load off-thread before their stateful instances are swapped in.
             let denoiser_before = self.settings.denoiser.clone();
             egui::ComboBox::from_label("Input denoiser")
                 .selected_text(&self.settings.denoiser)
@@ -980,6 +1108,21 @@ impl eframe::App for VcGui {
                     )
                     .changed();
             }
+            if self.settings.denoiser == "webrtc" {
+                egui::ComboBox::from_label("WebRTC suppression")
+                    .selected_text(&self.settings.webrtc_suppression_level)
+                    .show_ui(ui, |ui| {
+                        for level in webrtc_suppression_level_names() {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.settings.webrtc_suppression_level,
+                                    level.to_string(),
+                                    *level,
+                                )
+                                .changed();
+                        }
+                    });
+            }
             // GTCRN model dir is reload-scoped (the denoiser is built at load),
             // matching the staged-settings convention for model paths.
             if self.settings.denoiser == "gtcrn" {
@@ -995,6 +1138,43 @@ impl eframe::App for VcGui {
                         }
                     }
                 });
+            }
+            if self.settings.denoiser == "deep-filter-net3" {
+                ui.horizontal(|ui| {
+                    ui.label("DeepFilterNet3 archive");
+                    changed |= ui
+                        .text_edit_singleline(&mut self.settings.deepfilternet3_model)
+                        .changed();
+                    if ui.button("Browse...").clicked() {
+                        if let Some(file) = rfd::FileDialog::new()
+                            .add_filter("DeepFilterNet3 archive", &["gz"])
+                            .pick_file()
+                        {
+                            self.settings.deepfilternet3_model =
+                                file.to_string_lossy().into_owned();
+                            changed = true;
+                        }
+                    }
+                });
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.dfn3_attenuation_limit_db,
+                            0.0..=MAX_DFN3_ATTENUATION_LIMIT_DB,
+                        )
+                        .suffix(" dB")
+                        .text("DFN3 attenuation limit"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.settings.dfn3_post_filter_beta,
+                            0.0..=MAX_DFN3_POST_FILTER_BETA,
+                        )
+                        .text("DFN3 post-filter beta"),
+                    )
+                    .changed();
             }
             if changed {
                 self.changed();
@@ -1155,6 +1335,7 @@ enum ModelKind {
     Rvc,
     Embedder,
     F0,
+    Index,
 }
 
 fn model_path_control(ui: &mut egui::Ui, label: &str, value: &mut String) -> (bool, bool) {
@@ -1320,12 +1501,48 @@ fn parse_denoiser(value: &str) -> Result<DenoiserMode, String> {
         "noise-gate" => Ok(DenoiserMode::NoiseGate),
         "rnnoise" => Ok(DenoiserMode::Rnnoise),
         "gtcrn" => Ok(DenoiserMode::Gtcrn),
+        "webrtc" => Ok(DenoiserMode::WebRtc),
+        "deep-filter-net3" | "deepfilternet3" => Ok(DenoiserMode::DeepFilterNet3),
         _ => Err(format!("Unsupported denoiser: {value}")),
     }
 }
 
 fn denoiser_names() -> &'static [&'static str] {
-    &["off", "noise-gate", "rnnoise", "gtcrn"]
+    &[
+        "off",
+        "noise-gate",
+        "rnnoise",
+        "webrtc",
+        "gtcrn",
+        "deep-filter-net3",
+    ]
+}
+
+fn parse_webrtc_suppression_level(value: &str) -> Result<WebRtcSuppressionLevel, String> {
+    match value {
+        // Older GUI TOML files predate this selector and can deserialize an
+        // empty value. Keep those sessions compatible with the documented
+        // moderate default instead of making an unrelated realtime config
+        // validation fail.
+        "" => Ok(WebRtcSuppressionLevel::Moderate),
+        "low" => Ok(WebRtcSuppressionLevel::Low),
+        "moderate" => Ok(WebRtcSuppressionLevel::Moderate),
+        "high" => Ok(WebRtcSuppressionLevel::High),
+        "very-high" | "veryhigh" => Ok(WebRtcSuppressionLevel::VeryHigh),
+        _ => Err(format!("Unsupported WebRTC suppression level: {value}")),
+    }
+}
+
+fn webrtc_suppression_level_names() -> &'static [&'static str] {
+    &["low", "moderate", "high", "very-high"]
+}
+
+fn default_dfn3_attenuation_limit_db() -> f32 {
+    DEFAULT_DFN3_ATTENUATION_LIMIT_DB
+}
+
+fn default_dfn3_post_filter_beta() -> f32 {
+    DEFAULT_DFN3_POST_FILTER_BETA
 }
 
 // Hosts the GUI exposes per direction, as cpal HostId tokens. Platform-gated to
@@ -1488,6 +1705,50 @@ mod tests {
         let defaults = GuiSettings::default();
         assert!(!defaults.realtime().unwrap().monitor_output_enabled);
         assert_eq!(defaults.live().monitor_gain, 1.0);
+    }
+
+    #[test]
+    fn feature_index_settings_flow_to_shared_realtime_config() {
+        let mut settings: GuiSettings = toml::from_str(
+            r#"
+            index_path = "voice.index"
+            index_rate = 0.72
+            protect = 0.25
+            protect_transition_ms = 20
+            denoiser_content_mix = 0.4
+            denoiser_rmvpe_mix = 0.6
+            passthrough = true
+            "#,
+        )
+        .unwrap();
+        settings.normalize_gui_managed_settings();
+
+        assert_eq!(settings.live().index_rate, 0.72);
+        assert_eq!(settings.live().protect, 0.25);
+        assert_eq!(settings.live().protect_transition_ms, 20);
+        assert_eq!(settings.live().denoiser_content_mix, 0.4);
+        assert_eq!(settings.live().denoiser_rmvpe_mix, 0.6);
+        assert_eq!(
+            settings.realtime().unwrap().feature_index,
+            Some(PathBuf::from("voice.index"))
+        );
+
+        let mut out_of_range: GuiSettings = toml::from_str(
+            "index_rate = 2.0\nprotect = 1.0\nprotect_transition_ms = 999\ndenoiser_content_mix = nan\ndenoiser_rmvpe_mix = nan",
+        )
+        .unwrap();
+        out_of_range.normalize_gui_managed_settings();
+        assert_eq!(out_of_range.index_rate, 1.0);
+        assert_eq!(out_of_range.protect, MAX_PROTECT);
+        assert_eq!(
+            out_of_range.protect_transition_ms,
+            MAX_PROTECT_TRANSITION_MS
+        );
+        assert_eq!(
+            out_of_range.denoiser_content_mix,
+            DEFAULT_DENOISER_CONTENT_MIX
+        );
+        assert_eq!(out_of_range.denoiser_rmvpe_mix, DEFAULT_DENOISER_RMVPE_MIX);
     }
 
     #[test]

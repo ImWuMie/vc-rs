@@ -34,6 +34,10 @@
     Requires LLVM/libclang and the Steinberg ASIO SDK on this machine (see
     scripts\README.md). The vst3 targets ignore it.
 
+.PARAMETER DeepFilterNet3
+    Include optional DeepFilterNet3 denoiser code in every selected package.
+    The model archive remains external and is never copied into dist.
+
 .PARAMETER RuntimeOnly
     (tensorrt targets) Bundle only the runtime DLLs (no engine builder).
     Forwarded to both tensorrt packages.
@@ -62,6 +66,10 @@
 .EXAMPLE
     # App packages with the ASIO backend (needs LLVM + Steinberg ASIO SDK):
     pwsh scripts\package-all.ps1 -Targets app-windowsml -Asio
+
+.EXAMPLE
+    # Windows ML app and plugin packages with WebRTC + DeepFilterNet3 support:
+    pwsh scripts\package-all.ps1 -Targets app-windowsml,vst3-windowsml -DeepFilterNet3
 #>
 [CmdletBinding()]
 param(
@@ -73,6 +81,10 @@ param(
     # LLVM + the Steinberg ASIO SDK (see scripts\README.md). Ignored by the vst3
     # targets (the plugin uses the DAW's I/O).
     [switch]$Asio,
+
+    # Forwarded to both standalone and VST3 package scripts. This adds only the
+    # runtime code; model archives remain explicit user downloads.
+    [switch]$DeepFilterNet3,
 
     # tensorrt targets
     [switch]$RuntimeOnly,
@@ -119,6 +131,7 @@ foreach ($name in $plan.Keys) {
     if ($CleanStage) { $pkgArgs['CleanStage'] = $true }
     # ASIO only applies to the app package script; the vst3 script has no such param.
     if ($Asio -and $spec.Script -eq $appScript) { $pkgArgs['Asio'] = $true }
+    if ($DeepFilterNet3) { $pkgArgs['DeepFilterNet3'] = $true }
     if ($spec.Variant -eq 'tensorrt') {
         if ($RuntimeOnly) { $pkgArgs['RuntimeOnly'] = $true }
         if ($PSBoundParameters.ContainsKey('TensorRtBin')) { $pkgArgs['TensorRtBin'] = $TensorRtBin }

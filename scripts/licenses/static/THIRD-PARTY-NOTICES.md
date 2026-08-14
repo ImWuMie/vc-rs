@@ -26,6 +26,11 @@ TensorRT install.
 Standalone TensorRT packages also include GTCRN input denoising through native
 TensorRT; its Rust DSP/FFT dependencies (`realfft`/`rustfft` and transitive
 crates) are covered by the generated third-party license file in the archive.
+Standalone and VST3 packages may also include the in-tree WebRTC-style
+suppression (`realfft`/`rustfft`), covered by that generated notice. The optional
+DeepFilterNet3 can be included only in an explicitly requested `-DeepFilterNet3`
+package. Its external model archive is never bundled; distributors must review
+the upstream MIT/Apache-2.0 DeepFilterNet license separately.
 
 | Component | DLLs | License |
 |---|---|---|

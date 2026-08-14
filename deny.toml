@@ -45,6 +45,9 @@ allow = [
     "CDLA-Permissive-2.0",
     "OFL-1.1",
     "Ubuntu-font-1.0",
+    # tiny-keccak is pulled transitively by the optional official DeepFilterNet3
+    # runtime. Keep this in sync with scripts/licenses/about.toml.
+    "CC0-1.0",
 ]
 # Per-crate license exceptions (crate + the SPDX it's allowed to use) go here.
 # audio_thread_priority is MPL-2.0 (weak, file-level copyleft); we pull it only
@@ -66,3 +69,7 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# Official libDF is not published with its inference module on crates.io. The
+# dependency is pinned to an exact revision in vc-core; keep this allow-list
+# source-specific rather than permitting arbitrary git dependencies.
+allow-git = ["https://github.com/Rikorose/DeepFilterNet.git"]

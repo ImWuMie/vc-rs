@@ -106,6 +106,13 @@ impl RnnoiseDenoiser {
         let mut denoiser = Self::new(sample_rate)?;
         denoiser.inner.process_finite(input)
     }
+
+    /// Discard fixed-delay and recurrent state without reconstructing the
+    /// adapter. Route changes call this only on the conversion worker, never in
+    /// the audio callback.
+    pub fn reset(&mut self) -> Result<()> {
+        self.inner.reset()
+    }
 }
 
 #[cfg(test)]

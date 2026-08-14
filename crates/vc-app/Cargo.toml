@@ -9,12 +9,14 @@ description = "Shared realtime application runtime for vc-rs frontends"
 workspace = true
 
 [features]
-default = ["tensorrt", "rnnoise", "gtcrn"]
+default = ["tensorrt", "rnnoise", "gtcrn", "webrtc"]
 windowsml = ["vc-core/windowsml"]
 tensorrt = ["vc-core/tensorrt"]
 cuda = ["vc-core/cuda"]
 rnnoise = ["vc-core/rnnoise"]
 gtcrn = ["vc-core/gtcrn"]
+webrtc = ["vc-core/webrtc"]
+deepfilternet3 = ["vc-core/deepfilternet3"]
 # Static ORT CPU only (Provider::Cpu), no Windows App SDK / GPU dependency. Gives
 # a self-contained, deterministic build for benchmarking and A/B audio comparison
 # (the CPU EP is reproducible run-to-run, unlike the GPU EPs).

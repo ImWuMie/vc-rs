@@ -15,8 +15,9 @@ use nice_plug::prelude::util;
 use rtrb::{Consumer, Producer, RingBuffer};
 use vc_core::dsp::chunk_samples_for_rate;
 use vc_core::model_rvc::{
-    ChunkConverter, ChunkOutputConfig, F0Config, F0PostprocessConfig, LiveParams, LoadProgress,
-    NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
+    ChunkConverter, ChunkOutputConfig, F0Config, F0PostprocessConfig, FeatureRetrievalConfig,
+    InputDenoiserMode, LiveParams, LoadProgress, NoiseGateShaping, OutputDynamicsConfig,
+    RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
 use vc_core::validation::CONVERSION_TIMING_LIMITS;
@@ -419,7 +420,7 @@ impl WorkerCtx {
             // Apply automatable parameters before converting this chunk. Builds
             // the same `LiveParams` the standalone worker does, so both drive the
             // single `apply_live` entry point rather than diverging set_* calls.
-            converter.model_mut().apply_live(&LiveParams {
+            let denoiser_changed = converter.model_mut().apply_live(&LiveParams {
                 pitch_shift: self.params.pitch_shift.value(),
                 speaker_id: self.params.speaker_id.value() as i64,
                 input_gain: util::db_to_gain(self.params.input_gain_db.value()),
@@ -429,7 +430,15 @@ impl WorkerCtx {
                 monitor_gain: 1.0,
                 noise_gate_enabled: self.params.noise_gate.value(),
                 noise_gate_threshold: util::db_to_gain(self.params.noise_gate_threshold_db.value()),
+                denoiser_content_mix: self.params.denoiser_content_mix.value(),
+                denoiser_rmvpe_mix: self.params.denoiser_rmvpe_mix.value(),
+                index_rate: self.params.index_rate.value(),
+                protect: self.params.protect.value(),
+                protect_transition_ms: self.params.protect_transition_ms.value().round() as u32,
             });
+            if denoiser_changed {
+                converter.reset_streaming_state();
+            }
 
             if let Err(err) = converter.process_chunk(chunk, self.sample_rate, None, &mut chunk_out)
             {
@@ -593,7 +602,7 @@ impl WorkerCtx {
         chunk_samples: usize,
     ) -> anyhow::Result<RvcPipeline> {
         let report_progress = |progress| self.report_load_progress(progress);
-        RvcPipeline::load(RvcPipelineConfig {
+        let config = RvcPipelineConfig {
             model: &settings.model,
             embedder: &settings.embedder,
             embedder_output: settings.embedder_output.as_deref(),
@@ -613,7 +622,16 @@ impl WorkerCtx {
                 silence_threshold: settings.silence_threshold,
                 postprocess: F0PostprocessConfig::continuity(settings.f0_continuity),
             },
+            retrieval: FeatureRetrievalConfig {
+                index_path: (!settings.index_path.as_os_str().is_empty())
+                    .then_some(settings.index_path.as_path()),
+                index_rate: self.params.index_rate.value(),
+                protect: self.params.protect.value(),
+                protect_transition_ms: self.params.protect_transition_ms.value().round() as u32,
+            },
             input_gain: 1.0,
+            denoiser_content_mix: self.params.denoiser_content_mix.value(),
+            denoiser_rmvpe_mix: self.params.denoiser_rmvpe_mix.value(),
             // Gate on/off + threshold are DAW parameters applied per chunk
             // (overwriting these load-time placeholders); attack/release/floor
             // are static and shape the gate built here.
@@ -636,6 +654,50 @@ impl WorkerCtx {
                 max_output_gain: settings.max_output_gain,
             },
             progress: Some(&report_progress),
-        })
+        };
+        let mode = settings.denoiser_mode()?;
+        match mode {
+            InputDenoiserMode::Off | InputDenoiserMode::Gate => RvcPipeline::load(config),
+            InputDenoiserMode::Rnnoise => {
+                #[cfg(feature = "rnnoise")]
+                {
+                    RvcPipeline::load_with_rnnoise(config)
+                }
+                #[cfg(not(feature = "rnnoise"))]
+                {
+                    anyhow::bail!("RNNoise support is not enabled in this VST3 build")
+                }
+            }
+            InputDenoiserMode::WebRtc => {
+                #[cfg(feature = "webrtc")]
+                {
+                    RvcPipeline::load_with_webrtc(config, settings.webrtc_level()?)
+                }
+                #[cfg(not(feature = "webrtc"))]
+                {
+                    anyhow::bail!("WebRTC denoising support is not enabled in this VST3 build")
+                }
+            }
+            InputDenoiserMode::DeepFilterNet3 => {
+                #[cfg(feature = "deepfilternet3")]
+                {
+                    RvcPipeline::load_with_deepfilternet3(
+                        config,
+                        vc_core::denoise::DeepFilterNet3Config {
+                            model_path: &settings.deepfilternet3_model,
+                            attenuation_limit_db: settings.dfn3_attenuation_limit_db,
+                            post_filter_beta: settings.dfn3_post_filter_beta,
+                        },
+                    )
+                }
+                #[cfg(not(feature = "deepfilternet3"))]
+                {
+                    anyhow::bail!("DeepFilterNet3 support is not enabled in this VST3 build")
+                }
+            }
+            InputDenoiserMode::Gtcrn => {
+                anyhow::bail!("GTCRN is not supported by the VST3 package")
+            }
+        }
     }
 }

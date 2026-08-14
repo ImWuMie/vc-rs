@@ -43,6 +43,24 @@ rnnoise = ["dep:nnnoiseless"]
 # native TensorRT when `tensorrt` is present. VST3 deliberately does not expose
 # this feature.
 gtcrn = ["dep:realfft"]
+# Lightweight WebRTC-style spectral noise suppression. This is an in-tree,
+# allocation-free frame processor; `realfft` is shared with GTCRN when both are
+# enabled.
+webrtc = ["dep:realfft"]
+# Official DeepFilterNet3 streaming runtime. The model archive stays external
+# (download-models.ps1 -DeepFilterNet3), so enabling the feature does not embed
+# third-party weights into vc-rs binaries.
+# Keep every direct Tract root on the version locked by the pinned libDF commit.
+# The runtime passes Tract-owned ndarray values through libDF's public API, so
+# mixing even compatible-looking Tract patch releases can split those types.
+deepfilternet3 = [
+  "dep:df",
+  "dep:ndarray",
+  "dep:tract-core",
+  "dep:tract-hir",
+  "dep:tract-onnx",
+  "dep:tract-pulse",
+]
 
 [dependencies]
 anyhow.workspace = true
@@ -59,6 +77,17 @@ nnnoiseless = { version = "0.5.2", default-features = false, optional = true }
 # fixed rev cleared via cargo-about/cargo-deny. Pure Rust (wraps `rustfft`), no
 # `ndarray`, no git source.
 realfft = { version = "=3.5.0", optional = true }
+# `libDF` is not published with its Tract inference module on crates.io. Pin the
+# official repository exactly; deny.toml allow-lists only this audited source.
+df = { package = "deep_filter", git = "https://github.com/Rikorose/DeepFilterNet.git", rev = "d375b2d8309e0935d165700c91da9de862a99c31", default-features = false, features = ["tract"], optional = true }
+ndarray = { version = "0.15.6", optional = true }
+# Keep every direct Tract root on the exact upstream-tested release. They are
+# deliberately feature-only constraints: vc-core calls libDF's public API and
+# does not expose Tract types of its own.
+tract-core = { version = "=0.21.4", optional = true }
+tract-hir = { version = "=0.21.4", optional = true }
+tract-onnx = { version = "=0.21.4", optional = true }
+tract-pulse = { version = "=0.21.4", optional = true }
 
 [build-dependencies]
 cc = "1"

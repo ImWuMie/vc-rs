@@ -252,10 +252,10 @@ pub fn select_catalog_provider_info(
     )
 }
 
-fn select_catalog_provider_info_by_candidates<'a>(
-    providers: &'a [CatalogProviderInfo],
+fn select_catalog_provider_info_by_candidates(
+    providers: &[CatalogProviderInfo],
     candidates: impl Iterator<Item = &'static CatalogCandidate>,
-) -> Option<&'a CatalogProviderInfo> {
+) -> Option<&CatalogProviderInfo> {
     let mut fallback = None;
     for candidate in candidates {
         for provider in providers

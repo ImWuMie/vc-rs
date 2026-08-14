@@ -25,6 +25,10 @@ accepted = [
     "CDLA-Permissive-2.0",
     "OFL-1.1",
     "Ubuntu-font-1.0",
+    # tiny-keccak is pulled transitively by the optional official DeepFilterNet3
+    # runtime. CC0-1.0 is a public-domain dedication and is safe to reproduce in
+    # the generated notice for an explicitly requested DFN3 distribution.
+    "CC0-1.0",
     # MPL-2.0 is accepted ONLY to emit the required notice for audio_thread_priority
     # (pulled transitively, unmodified, via cpal's `realtime` feature). cargo-about
     # has no per-crate accept, so this is global here; the actual policy gate keeps

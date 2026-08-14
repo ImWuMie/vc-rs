@@ -6,7 +6,7 @@
 .DESCRIPTION
     Activates the matched CUDA/cuDNN/TensorRT line (via scripts/activate.ps1),
     then runs `cargo test`, checks the matching standalone package feature set
-    (including RNNoise), and bundles `vc-vst3`. A clean pass means the toolchain,
+    (including RNNoise and WebRTC), and bundles `vc-vst3`. A clean pass means the toolchain,
     MSVC C++, and the GPU SDKs are wired up correctly.
 
     By default it builds the Windows ML plugin variant. Use -Variant tensorrt for
@@ -69,9 +69,11 @@ try {
     Invoke-Step "cargo test --workspace" { cargo test --workspace }
 
     # --- Standalone package feature set ------------------------------------
-    # Both standalone variants ship GTCRN. Windows ML uses ORT CPU for GTCRN;
-    # TensorRT stays ORT-free and runs GTCRN through the native shim.
-    $standaloneFeatures = "$Variant,rnnoise,gtcrn"
+    # Both standalone variants ship the in-tree WebRTC suppressor and GTCRN.
+    # Windows ML uses ORT CPU for GTCRN; TensorRT stays ORT-free and runs GTCRN
+    # through the native shim. DeepFilterNet3 remains opt-in because its model
+    # archive is external and must never enter a release package.
+    $standaloneFeatures = "$Variant,rnnoise,gtcrn,webrtc"
     Invoke-Step "cargo check standalone ($standaloneFeatures)" {
         cargo check -p vc-cli -p vc-gui --no-default-features --features $standaloneFeatures
     }
@@ -80,11 +82,11 @@ try {
     if (-not $SkipBundle) {
         if ($Variant -eq 'tensorrt') {
             Invoke-Step "cargo xtask bundle vc-vst3 (tensorrt)" {
-                cargo xtask bundle vc-vst3 --release --no-default-features --features tensorrt
+                cargo xtask bundle vc-vst3 --release --no-default-features --features tensorrt,webrtc
             }
         } else {
             Invoke-Step "cargo xtask bundle vc-vst3 (windowsml)" {
-                cargo xtask bundle vc-vst3 --release
+                cargo xtask bundle vc-vst3 --release --no-default-features --features windowsml,webrtc
             }
         }
     }

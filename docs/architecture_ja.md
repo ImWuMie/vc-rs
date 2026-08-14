@@ -87,7 +87,7 @@ RVC パイプラインは各チャンクを孤立した音声として扱いま�
 
 ```mermaid
 flowchart TD
-    input["デバイスレートのモノラルチャンク"] --> denoise["Off / Gate / RNNoise"]
+    input["デバイスレートのモノラルチャンク"] --> denoise["Off / Gate / RNNoise / WebRTC / DFN3"]
     denoise --> state["ローリングストリーム状態"]
     state --> resample["16 kHz の文脈へリサンプリング"]
     resample --> embed["Content 埋め込み抽出"]
@@ -106,8 +106,10 @@ flowchart TD
 
 スタンドアロン版のRNNoiseは入力ゲイン後、RMS/無音判定・ContentVec・F0抽出前に
 実行します。固定遅延アダプターはワーカー呼び出しごとの入力サンプル数を維持し、
-RNNoiseとリサンプラーの状態をチャンク間で継続します。VST3はこのoptional core
-featureを有効化・配布しません。
+RNNoiseとリサンプラーの状態をチャンク間で継続します。WebRTCも同じ共有ストリーム
+境界で動作します。VST3はWebRTCを含みますが、RNNoise、GTCRN、DeepFilterNet3の
+モデルデータは同梱しません。`package.ps1 -DeepFilterNet3` はDFN3 runtime codeと
+対応するlicense noticeだけを含む外部アーカイブ用のopt-in package variantです。
 
 概念的には、RVC 変換には 3 種類のモデル入力があります。
 

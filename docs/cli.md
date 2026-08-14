@@ -112,6 +112,7 @@ first, then export the resulting compact `assets\weights\*.pth` checkpoint.
 .\vc-rs.exe run --model <your-rvc-model>.onnx `
     --embedder .\assets\content_vec_500.onnx `
     --f0-model .\assets\rmvpe.onnx `
+    --index-path <matching-added-IVF.index> --index-rate 0.65 --protect 0.33 --protect-transition-ms 20 `
     --input "Microphone" --output "Speakers" `
     --chunk-ms 500 --extra-convert-ms 100 `
     --provider windowsml --speaker-id 0
@@ -151,6 +152,26 @@ lower `--chunk-ms`** to reduce latency.
 ## Key conversion parameters
 
 - `--speaker-id 0`: speaker ID for multi-speaker models (default: 0).
+- `--index-path <PATH>` (or `--index <PATH>`): optional RVC FAISS retrieval
+  index. Use the training result named `added_IVF*_Flat_*.index`, never the
+  unpopulated `trained_*.index`. Its feature width must match the generator:
+  RVC v1 indexes are 256-dimensional and v2 indexes are 768-dimensional.
+  The file is decoded when the model loads, not by the audio callback.
+- `--index-rate 0.0..1.0`: blends ContentVec with the retrieved target-speaker
+  features. `0.0` is an exact no-retrieval path; start around `0.5` to `0.75`.
+  Higher values can improve target timbre but can make articulation less natural
+  with a sparse, noisy, or mismatched index.
+- `--protect 0.0..0.5`: standard RVC consonant protection for unvoiced F0
+  frames when retrieval is enabled. `0.33` is the upstream default; `0.5`
+  disables protection. Lower values preserve more original ContentVec in breaths
+  and consonants. It has no effect when `--index-rate 0` or no index is loaded.
+- `--protect-transition-ms 0..100`: optional vc-rs smoothing around a Protect
+  boundary. `0` (the default) is exact standard RVC behavior. `20` ms is a
+  useful starting point when full or high index retrieval leaves an obvious
+  consonant edge: it gradually restores the retrieved features on the nearby
+  voiced frames while leaving the actual raw-F0-unvoiced frame protected. It
+  only applies when an index is loaded, `--index-rate` is nonzero, and
+  `--protect < 0.5`.
 - `--pitch-shift 0.0`: shift F0 in semitones (default: 0.0). `12.0` is one octave
   up, `-12.0` one octave down.
 - `--input-gain 1.0` / `--output-gain 1.0`: input/output gain (default: 1.0).
@@ -160,10 +181,24 @@ lower `--chunk-ms`** to reduce latency.
   gain, e.g. headphones while the primary output feeds a stream or DAW. Pass `""`
   for the system default device. `--monitor-gain 1.0` sets the monitor gain
   (default: 1.0). Not supported with an ASIO output host.
-- `--denoiser off|noise-gate|rnnoise|gtcrn`: exclusive input denoiser selection.
+- `--denoiser off|noise-gate|rnnoise|webrtc|gtcrn|deep-filter-net3`: exclusive input denoiser selection.
   RNNoise uses an embedded model. GTCRN requires `--gtcrn-model <dir>` pointing
   at a directory containing `gtcrn_stream.onnx` (download with
-  `download-models.ps1 -Gtcrn`). The old `--noise-gate` flag remains as an alias.
+  `download-models.ps1 -Gtcrn`). WebRTC is built in and accepts
+  `--webrtc-suppression-level low|moderate|high|very-high`. DeepFilterNet3
+  requires `--deepfilternet3-model <archive>` (download with
+  `download-models.ps1 -DeepFilterNet3`). The old `--noise-gate` flag remains
+  as an alias.
+- `--denoiser-content-mix 0.0..1.0`: share of the fully denoised branch mixed
+  into ContentVec. `0.0` preserves the raw articulation branch, `0.25` is the
+  recommended starting point, and `1.0` restores the legacy fully-denoised
+  ContentVec path. The setting is ignored when denoising is off. RNNoise and
+  GTCRN automatically delay the raw branch before mixing so their fixed output
+  latency cannot produce an echo.
+- `--denoiser-rmvpe-mix 0.0..1.0`: independent denoised share sent to RMVPE.
+  `1.0` (the default) preserves the historical fully denoised pitch input;
+  `0.0` uses the delay-aligned raw input. Intermediate values linearly blend
+  the two branches. The setting is ignored when denoising is off.
 - `--silence-threshold 0.0001`: threshold below which input is treated as
   silence.
 - `--rms-mix-rate <0.0-1.0>`: closer to 0.0 follows the input's loudness
@@ -204,11 +239,14 @@ ASIO loads a single driver globally, so when **both** directions are ASIO they
 must name the same driver. ASIO buffer size is set in the driver's own control
 panel, not by `--wasapi-buffer-ms`.
 
-`wav --denoiser rnnoise` and `wav --denoiser gtcrn` compensate the denoiser's
+`wav --denoiser rnnoise`, `wav --denoiser webrtc`, and `wav --denoiser gtcrn`
+compensate each denoiser's
 fixed streaming delay and keep the output WAV at the original sample count.
 RNNoise and GTCRN are available only in the standalone CLI/GUI packages, not
-VST3. GTCRN uses ORT CPU in Windows ML packages and native TensorRT in TensorRT
-packages.
+VST3. WebRTC is available in standalone and VST3 packages. GTCRN uses ORT CPU
+in Windows ML packages and native TensorRT in TensorRT packages. DeepFilterNet3
+is opt-in: pass `-DeepFilterNet3` to the package script to include its runtime
+code, while its external archive is never part of a package.
 
 ## Windows ML execution providers (windowsml package)
 

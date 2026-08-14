@@ -89,7 +89,12 @@ a versioned
 cargo install cargo-about --features cli # one-time packaging prerequisite
 pwsh crates\vc-vst3\package.ps1                                  # Windows ML (default)
 pwsh crates\vc-vst3\package.ps1 -Variant tensorrt
+pwsh crates\vc-vst3\package.ps1 -DeepFilterNet3                  # adds DFN3 code, not weights
 ```
+
+`-DeepFilterNet3` produces a separately named `-dfn3-` archive and VST3 bundle.
+Run `download-models.ps1 -DeepFilterNet3` after unpacking and select the external
+archive in the plugin editor; pretrained DFN3 weights are never distributed.
 
 Variant-specific options are forwarded to the populate script. Useful flags:
 `-OutDir <dir>` (default `dist\`), `-SkipBuild` (reuse `target\bundled`),

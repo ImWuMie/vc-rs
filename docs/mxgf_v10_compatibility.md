@@ -51,6 +51,36 @@ threshold, and continuity enabled. Existing GUI settings containing exactly the
 old 0.3 default migrate to 0.03; deliberately chosen custom thresholds remain
 unchanged.
 
+The same shared pipeline now supports standard RVC target-speaker retrieval:
+use an `added_IVF*_Flat_*.index` file that matches the selected ONNX generator
+(v1 ContentVec width 256; v2 width 768). The implementation loads only the
+standard FAISS IVF-Flat layout emitted by RVC training, searches eight nearest
+entries, and uses the upstream inverse-squared-distance weighting. `index_rate`
+is a live 0..1 blend control; `protect` is the standard 0..0.5 unvoiced-frame
+consonant safeguard (`0.33` default; `0.5` off). Retrieval and protection run on
+the existing conversion worker with reusable buffers, never on a device or DAW
+audio callback. Locally supplied real v1 and v2 RVC indexes were parsed during
+validation, but their paths and contents are not embedded or distributed.
+
+vc-rs additionally offers an optional `protect_transition_ms` control (default
+`0`, maximum `100`). This is not copied from or attributed to MXGF: it smooths
+the retrieved/original ContentVec transition on voiced frames adjacent to an
+unvoiced Protect frame while retaining the actual unvoiced frame's standard
+protection. The GUI high-quality preset selects `20 ms`; CLI and VST3 leave the
+default at `0` until users opt in.
+
+The denoiser path is another vc-rs extension, not MXGF's private model code. For
+Gate, RNNoise, WebRTC, and DeepFilterNet3, the worker keeps a gain-scaled raw
+16 kHz branch alongside the cleaned branch. `denoiser_content_mix=0.25` blends
+those branches for ContentVec to retain fricatives and breath detail, while
+`denoiser_rmvpe_mix=1.0` (the compatibility default) sends the fully cleaned
+branch to RMVPE. Both controls accept `0..=1`; setting the RMVPE control to `0`
+uses the delay-aligned raw branch, and intermediate values linearly blend it
+with the cleaned pitch signal. RNNoise, WebRTC, GTCRN, and DeepFilterNet3 have
+fixed delay, so the raw branches pass through matching preallocated delay before
+mixing instead of combining delayed and undelayed audio. All buffers and
+denoiser work belong to the conversion worker, never the audio callback.
+
 The initializer parser reads only protobuf names and dimensions. It skips raw
 weight bytes, runs only on the load/inspect path, and does not add any model
 weights, local paths, or MXGF runtime components to this repository.
