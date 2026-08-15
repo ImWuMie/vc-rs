@@ -131,16 +131,50 @@ impl InferSession for OrtInferSession {
             INTER_IN => TensorRef::from_array_view((INTER_SHAPE, caches.inter.as_slice()))?,
         ])?;
 
-        enh.copy_from_slice(outputs[ENH_OUT].try_extract_tensor::<f32>()?.1);
-        caches
-            .conv
-            .copy_from_slice(outputs[CONV_OUT].try_extract_tensor::<f32>()?.1);
-        caches
-            .tra
-            .copy_from_slice(outputs[TRA_OUT].try_extract_tensor::<f32>()?.1);
-        caches
-            .inter
-            .copy_from_slice(outputs[INTER_OUT].try_extract_tensor::<f32>()?.1);
+        // Keep malformed third-party GTCRN exports on the recoverable model
+        // error path.  This runs on the inference worker (never the audio
+        // callback), so validating rank, exact fixed shape, length, and finite
+        // values is preferable to an output index/copy panic that can tear
+        // down the whole realtime session.
+        macro_rules! copy_fixed_output {
+            ($name:expr, $expected:expr, $destination:expr) => {{
+                let value = outputs
+                    .get($name)
+                    .ok_or_else(|| anyhow!("GTCRN output '{}' is missing", $name))?;
+                let (shape, data) = value.try_extract_tensor::<f32>()?;
+                let expected: &[usize] = $expected;
+                if shape.len() != expected.len()
+                    || shape
+                        .iter()
+                        .zip(expected)
+                        .any(|(&actual, &wanted)| actual < 0 || actual != wanted as i64)
+                {
+                    bail!(
+                        "GTCRN output '{}' has shape {:?}; expected {:?}",
+                        $name,
+                        shape,
+                        expected
+                    );
+                }
+                if data.len() != $destination.len() {
+                    bail!(
+                        "GTCRN output '{}' has {} values; expected {}",
+                        $name,
+                        data.len(),
+                        $destination.len()
+                    );
+                }
+                if data.iter().any(|sample| !sample.is_finite()) {
+                    bail!("GTCRN output '{}' contains non-finite values", $name);
+                }
+                $destination.copy_from_slice(data);
+            }};
+        }
+
+        copy_fixed_output!(ENH_OUT, &MIX_SHAPE, enh);
+        copy_fixed_output!(CONV_OUT, &CONV_SHAPE, caches.conv);
+        copy_fixed_output!(TRA_OUT, &TRA_SHAPE, caches.tra);
+        copy_fixed_output!(INTER_OUT, &INTER_SHAPE, caches.inter);
         Ok(())
     }
 }

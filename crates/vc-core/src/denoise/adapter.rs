@@ -154,6 +154,7 @@ impl<D: FrameDenoiser> FixedDelayAdapter<D> {
     ///
     /// Assumes a freshly-built (or freshly-`reset`) adapter so the startup
     /// priming is deterministic.
+    #[allow(dead_code)]
     pub(crate) fn process_finite(&mut self, input: &[f32]) -> Result<Vec<f32>> {
         let block = (self.device_rate / 20).max(128);
         let mut delayed = Vec::with_capacity(input.len() + self.latency_samples);

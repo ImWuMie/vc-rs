@@ -11,9 +11,11 @@ use super::pitch::{
 };
 use super::shape::{
     aligned_rvc_input_len, extra_convert_samples_from_ms, keep_tail_in_place,
-    onnx_silence_front_feature_frames, output_len_from_convert_size, rmvpe_model_input_samples_16k,
-    rmvpe_model_input_samples_for_context_16k, tensor_rt_model_input_samples_16k,
-    EMBEDDER_SAMPLE_RATE, RVC_SAMPLE_RATE,
+    onnx_silence_front_feature_frames, output_len_from_convert_size,
+    resolve_rvc_context_samples_16k, rmvpe_model_input_samples_16k,
+    rmvpe_model_input_samples_for_context_16k, rvc_context_samples_16k_for_frames,
+    rvc_frames_for_context_samples_16k, tensor_rt_model_input_samples_16k, EMBEDDER_SAMPLE_RATE,
+    RVC_SAMPLE_RATE,
 };
 use super::stream::{RvcStreamState, StreamInputTiming, VOLUME_DECAY};
 use super::tensorrt::{
@@ -133,6 +135,100 @@ fn derives_tensorrt_contentvec_profile_from_default_realtime_chunking() {
 }
 
 #[test]
+fn custom_rvc_frames_map_to_a_fixed_contentvec_context() {
+    let extra_convert_samples = extra_convert_samples_from_ms(100, RVC_SAMPLE_RATE);
+    let automatic_context = tensor_rt_model_input_samples_16k(
+        24_000,
+        RVC_SAMPLE_RATE,
+        107,
+        extra_convert_samples,
+        RVC_SAMPLE_RATE,
+    );
+    assert_eq!(automatic_context, 11_520);
+    assert_eq!(
+        rvc_frames_for_context_samples_16k(
+            automatic_context,
+            extra_convert_samples,
+            RVC_SAMPLE_RATE,
+        )
+        .unwrap(),
+        62
+    );
+    assert_eq!(
+        rvc_context_samples_16k_for_frames(200, extra_convert_samples, RVC_SAMPLE_RATE).unwrap(),
+        33_600
+    );
+    assert_eq!(
+        resolve_rvc_context_samples_16k(
+            automatic_context,
+            Some(200),
+            None,
+            extra_convert_samples,
+            RVC_SAMPLE_RATE,
+        )
+        .unwrap(),
+        33_600
+    );
+}
+
+#[test]
+fn custom_rvc_frames_enforce_model_and_timing_bounds() {
+    let extra_convert_samples = extra_convert_samples_from_ms(100, RVC_SAMPLE_RATE);
+    let automatic_context = 11_520;
+    let static_mismatch = resolve_rvc_context_samples_16k(
+        automatic_context,
+        Some(200),
+        Some(62),
+        extra_convert_samples,
+        RVC_SAMPLE_RATE,
+    )
+    .unwrap_err();
+    assert!(static_mismatch.to_string().contains("supports only T=62"));
+    assert!(resolve_rvc_context_samples_16k(
+        automatic_context,
+        Some(60),
+        None,
+        extra_convert_samples,
+        RVC_SAMPLE_RATE,
+    )
+    .is_err());
+    assert!(
+        rvc_context_samples_16k_for_frames(201, extra_convert_samples, RVC_SAMPLE_RATE).is_err()
+    );
+}
+
+#[test]
+fn static_rvc_frames_are_checked_without_an_explicit_request() {
+    let extra_convert_samples = extra_convert_samples_from_ms(100, RVC_SAMPLE_RATE);
+    let automatic_context = 11_520; // The default 500 ms/85 ms test timing derives T=62.
+
+    assert_eq!(
+        resolve_rvc_context_samples_16k(
+            automatic_context,
+            None,
+            Some(62),
+            extra_convert_samples,
+            RVC_SAMPLE_RATE,
+        )
+        .unwrap(),
+        automatic_context
+    );
+
+    let mismatch = resolve_rvc_context_samples_16k(
+        automatic_context,
+        None,
+        Some(200),
+        extra_convert_samples,
+        RVC_SAMPLE_RATE,
+    )
+    .unwrap_err();
+    let message = mismatch.to_string();
+    assert!(message.contains("static T=200"));
+    assert!(message.contains("requires T=62"));
+    assert!(message.contains("export-pth --frames 62"));
+}
+
+#[test]
 fn rmvpe_input_uses_upstream_rvc_bucket_boundaries() {
     assert_eq!(rmvpe_model_input_samples_16k(12_960, 48_000), 4_960);
     assert_eq!(rmvpe_model_input_samples_16k(13_440, 48_000), 10_080);
@@ -234,7 +330,7 @@ fn validates_tensorrt_profile_input_shapes() {
         .unwrap();
     validate_tensorrt_input_shape(Provider::TensorRt, Some(&rvc), "feats", &[1, 75, 768]).unwrap();
     validate_tensorrt_input_shape(Provider::TensorRt, Some(&rvc), "pitch", &[1, 75]).unwrap();
-    validate_tensorrt_input_shape(Provider::Cpu, Some(&rvc), "pitch", &[1, 74]).unwrap();
+    validate_tensorrt_input_shape(Provider::Cpu, None, "pitch", &[1, 74]).unwrap();
 
     let err = validate_tensorrt_input_shape(Provider::TensorRt, Some(&rvc), "pitch", &[1, 74])
         .unwrap_err();
@@ -243,6 +339,16 @@ fn validates_tensorrt_profile_input_shapes() {
         .contains("requires input 'pitch' shape 1x75"));
     let err =
         validate_tensorrt_input_shape(Provider::Cuda, Some(&rvc), "pitch", &[1, 74]).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("requires input 'pitch' shape 1x75"));
+    let err = validate_tensorrt_input_shape(
+        Provider::WindowsMlNvTensorRtRtx,
+        Some(&rvc),
+        "pitch",
+        &[1, 74],
+    )
+    .unwrap_err();
     assert!(err
         .to_string()
         .contains("requires input 'pitch' shape 1x75"));
@@ -354,6 +460,22 @@ fn stream_state_derives_out_size_from_extra_convert_size() {
         .generate_input(&input, 48_000, 1_536, 1_536, 4_096)
         .unwrap();
     assert_eq!(out.out_size, 25_665);
+}
+
+#[test]
+fn stream_state_custom_context_keeps_the_output_cadence() {
+    let mut state = RvcStreamState::new(48_000);
+    state.set_contentvec_context_samples_16k(33_600);
+    let input = vec![0.0; 24_000];
+    let out = state
+        .generate_input(&input, 48_000, 1_536, 1_536, 4_096)
+        .unwrap();
+
+    assert_eq!(out.convert_size, 100_800);
+    // The extra context is left history only; the chunk output still follows
+    // the normal timing window so it does not add output latency.
+    assert_eq!(out.out_size, 25_665);
+    assert_eq!(state.audio_16k_buffer.len(), 33_600);
 }
 
 #[test]
@@ -559,22 +681,22 @@ fn pitchf_tail_for_output_matches_10ms_output_frames() {
 }
 
 #[test]
-fn stream_state_pitch_update_places_rmvpe_tail_window_at_absolute_frame() {
+fn stream_state_pitch_update_places_estimator_tail_window_at_absolute_frame() {
     let mut state = RvcStreamState::new(48_000);
     state.pitchf_buffer = (0..34).map(|frame| frame as f32).collect();
 
-    state.update_pitchf_from_rmvpe_window(&[100.0, 101.0, 102.0, 103.0], 480);
+    state.update_pitchf_from_estimator_window(&[100.0, 101.0, 102.0, 103.0], 480);
 
     assert_eq!(state.pitchf_buffer[2], 2.0);
     assert_eq!(&state.pitchf_buffer[3..7], &[100.0, 101.0, 102.0, 103.0]);
 }
 
 #[test]
-fn stream_state_pitch_update_drops_center_padded_tail_frame() {
+fn stream_state_pitch_update_drops_fcpe_center_padded_tail_frame() {
     let mut state = RvcStreamState::new(48_000);
     state.pitchf_buffer = vec![0.0, 1.0, 2.0];
 
-    state.update_pitchf_from_rmvpe_window(&[10.0, 20.0, 30.0, 40.0], 0);
+    state.update_pitchf_from_estimator_window(&[10.0, 20.0, 30.0, 40.0], 0);
 
     assert_eq!(state.pitchf_buffer, vec![10.0, 20.0, 30.0]);
 }

@@ -152,12 +152,27 @@ still supply your own RVC voice model (`.onnx`).
    realtime headroom from the current inference measurement and leaves **Pitch
    shift** unchanged because a standard RVC export does not provide the target
    voice's natural pitch range.
+
+**Dynamic tuning**: select `off`, `auto`, `chinese`, `english`, or `japanese`.
+`Auto` uses conservative acoustic cues (pitch variation, voiced ratio, and
+zero-crossing rate), not ASR language recognition, and switches only after
+several high-confidence chunks. It gradually overlays F0 threshold, Index rate,
+Protect and its transition, both denoiser mixes, input gain, and output-only
+silence suppression on top of the manual baseline.
+
 8. **Live parameters** (Pitch shift / Speaker ID / Input gain / Output gain /
    Monitor gain) apply in real time.
 9. **Input denoiser** — switch **live while running** between `off` /
-   `noise-gate` / `rnnoise` / `gtcrn` (see below); the noise-gate threshold and
-   shaping also apply live.
-10. **Telemetry** shows inference time, input/output RMS, and overruns/underruns
+   `noise-gate` / `rnnoise` / `webrtc` / `gtcrn` / `deep-filter-net3` (see
+   below); the noise-gate threshold and shaping also apply live.
+10. **Silence suppressor** — enable it alongside any non-gate input denoiser
+    when the converted voice has an idle noise floor. It learns stationary noise
+    from the RMVPE branch and fuses Silero neural VAD with energy,
+    zero-crossing-shape, and raw-F0 evidence; after two inactive chunks the
+    converted output fades out while RVC inference keeps its rolling context
+    current. Low neural confidence only vetoes weak F0 activation, leaving
+    energy/transient paths available for word starts, consonants, and pauses.
+11. **Telemetry** shows inference time, input/output RMS, and overruns/underruns
    so you can watch for dropouts and load (inference time is color-flagged when
    it exceeds the chunk budget).
 
@@ -168,13 +183,13 @@ switching back discards stale streaming context before conversion resumes.
 Model-free passthrough remains available, but that session cannot switch live
 back to RVC.
 
-Choose `off`, `noise-gate`, `rnnoise`, or `gtcrn` under **Input denoiser**, all
-switchable **live while running**: the first three are built in the background
-and hot-swapped immediately, while GTCRN loads its engine in the background on
-first switch (the previous denoiser keeps running during the load) and hot-swaps
-in when ready. RNNoise uses an embedded model and needs no additional download.
-Passthrough applies Input gain, the selected input denoiser, and Output gain.
-These input denoisers are not included in VST3.
+Choose `off`, `noise-gate`, `rnnoise`, `webrtc`, `gtcrn`, or
+`deep-filter-net3` under **Input denoiser**, all switchable **live while
+running**. The **Silence suppressor** is independent of that exclusive input
+choice: it suppresses generated RVC noise during sustained source silence but
+does not stop inference or replace a stateful denoiser. Passthrough applies
+Input gain, the selected input denoiser, and Output gain. Some denoisers are
+package-specific; see the distribution documentation for the selected build.
 
 Where each denoiser sits:
 

@@ -117,7 +117,7 @@ GUI にはない機能です。バッチ処理や、設定変更の決定的な�
   オクターブ上、`-12.0` で 1 オクターブ下。
 - `--input-gain 1.0` / `--output-gain 1.0`: 入力・出力にかけるゲイン
   （デフォルト: 1.0）。小さすぎる場合に上げます。上げすぎるとクリップします。
-- `--denoiser off|noise-gate|rnnoise|webrtc|gtcrn|deep-filter-net3`: 排他的な入力ノイズ抑制方式。
+- `--denoiser off|noise-gate|rnnoise|web-rtc|gtcrn|deep-filter-net3`: 排他的な入力ノイズ抑制方式。
   RNNoiseは組み込みモデルを使います。GTCRN は `gtcrn_stream.onnx` を含む
   ディレクトリを `--gtcrn-model <dir>` で指定します（`download-models.ps1
   -Gtcrn` で取得）。WebRTC は組み込みで、`--webrtc-suppression-level
@@ -160,7 +160,7 @@ ASIO はドライバをグローバルに1つだけロードするため、入�
 場合は同じドライバを指定してください。ASIO のバッファサイズはドライバ自身の
 コントロールパネルで設定し、`--wasapi-buffer-ms` は効きません。
 
-`wav --denoiser rnnoise`、`wav --denoiser webrtc`、`wav --denoiser gtcrn` は各デノイザの固定
+`wav --denoiser rnnoise`、`wav --denoiser web-rtc`、`wav --denoiser gtcrn` は各デノイザの固定
 ストリーミング遅延を自動補償し、入力WAVと同じサンプル数を維持します。
 RNNoise と GTCRN はスタンドアロンCLI/GUI専用で、VST3には含まれません。WebRTC は
 スタンドアロンとVST3の両方に含まれます。DeepFilterNet3 は外部アーカイブを使う
@@ -211,3 +211,34 @@ TensorRT（tensorrt 版）と Windows ML の TensorRT-RTX（`windowsml-nvtrtx`�
 
 キャッシュは再生成可能な派生データなので、削除しても次回のモデル読み込み時に
 作り直されるだけです（その回だけ起動が長くなります）。
+
+## 固定フレーム ONNXとハイブリッド F0
+
+TensorRT で RVC モデルを使う場合、実行ログに表示されるフレーム数 T に専用の ONNX を作ってください。
+例えば T=99 のときは次のようにします。
+
+```powershell
+.\vc-rs.exe export-pth `
+    --model .\voice.pth --output .\voice-frames-99.onnx `
+    --rvc-root D:\path\to\rvc --python D:\path\to\rvc\runtime\python.exe `
+    --frames 99 --trust-rvc-root
+```
+
+`--frames` を省略すると従来の dynamic export です。チャンク設定を変えたら、その T に合わせて別のエンジンを作ります。オーディオコールバックで shape 変更やメモリ確保は行いません。
+
+RMVPE は従来のデフォルトです。`--f0-mode fcpe` では RMVPE をロードせず、FCPE だけを使用できます。FCPE は外部 ONNX（`audio [1,N,1] float32` → `f0_hz [1,N/160+1,1] float32`）です。
+
+```powershell
+.\vc-rs.exe run --model .\voice.onnx --embedder .\assets\content_vec_500.onnx `
+    --f0-mode fcpe --fcpe-model .\assets\fcpe.onnx --provider tensorrt
+```
+
+`--f0-mode hybrid` は RMVPE と FCPE の両方をロードし、同じ 10 ms フレームグリッドで融合します。
+
+```powershell
+.\vc-rs.exe run --model .\voice.onnx --embedder .\assets\content_vec_500.onnx `
+    --f0-model .\assets\rmvpe.onnx --f0-mode hybrid `
+    --fcpe-model .\assets\fcpe.onnx --provider tensorrt
+```
+
+`fcpe` と `hybrid` は `--fcpe-model` が必要で、`rmvpe` と `hybrid` は `--f0-model` が必要です。FCPE の dynamic ONNX は T ごとに別々の固定 profile / engine に専用化されます。モデルは配布パッケージに含まれず、別途入手してライセンスを確認してください。

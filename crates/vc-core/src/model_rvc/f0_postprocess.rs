@@ -21,9 +21,29 @@ const UNVOICED: f32 = 0.0;
 const LR_NEAR_RATIO_TOL: f32 = 0.2;
 const OCTAVE_RATIO_TOL: f32 = 0.25;
 
+/// Waveform checks are intentionally conservative. A low score is strong
+/// evidence that RMVPE found pitch in aperiodic noise; a middling score is not
+/// enough to discard a breathy or weak voiced frame.
+const PERIODICITY_WINDOW_RADIUS_SAMPLES_16K: usize = 320;
+const PERIODICITY_MIN_OVERLAP_SAMPLES_16K: usize = 160;
+const MIN_WAVEFORM_PERIODICITY: f32 = 0.16;
+
+/// Full continuity across a long zero run turns pauses and unvoiced consonants
+/// into synthetic voiced sound. Two missing 10 ms frames are safe to repair;
+/// longer gaps need stable pitch support on both sides and are capped at 50 ms.
+const DIRECT_GAP_FILL_FRAMES: usize = 2;
+const CONTINUITY_MAX_GAP_FRAMES: usize = 5;
+const CONTINUITY_LOCAL_SEMITONES: f32 = 1.5;
+const CONTINUITY_BOUNDARY_SEMITONES: f32 = 3.0;
+
 #[derive(Clone, Debug)]
 pub struct F0PostprocessConfig {
     pub enabled: bool,
+
+    /// Reject voiced RMVPE frames that have no matching periodic support in the
+    /// 16 kHz waveform. This is a local autocorrelation check, not an RMVPE
+    /// posterior probability, and runs before retrieval/protect decisions.
+    pub waveform_periodicity_validation: bool,
 
     pub min_f0_hz: f32,
     pub max_f0_hz: f32,
@@ -34,14 +54,17 @@ pub struct F0PostprocessConfig {
     pub fill_short_unvoiced_gaps: bool,
     pub max_unvoiced_gap_frames: usize,
 
-    /// Fill every internal zero run bounded by voiced frames, using linear-Hz
-    /// interpolation. This matches the continuity treatment used by MXGF while
-    /// deliberately leaving leading/trailing zero runs unvoiced: their missing
-    /// off-window bound makes extrapolation likely to turn breaths and
-    /// consonants into artificial voiced sound.
+    /// Fill bounded internal zero runs. The implementation always repairs gaps
+    /// up to two frames, then requires stable pitch evidence on both sides, and
+    /// never crosses `max_unvoiced_gap_frames`. Leading/trailing runs stay
+    /// unvoiced because their off-window context is unknown.
     pub interpolate_internal_unvoiced_gaps: bool,
 
     pub fix_octave_jumps: bool,
+    /// Correct a final-frame octave outlier when the preceding two frames agree.
+    /// A rolling stream has no right neighbour for its newest F0 frame, so this
+    /// bounded look-behind handles the otherwise unresolved chunk-edge case.
+    pub fix_trailing_octave_jumps: bool,
 
     pub median_filter: bool,
     pub median_filter_radius: usize,
@@ -58,6 +81,7 @@ impl Default for F0PostprocessConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            waveform_periodicity_validation: false,
 
             min_f0_hz: 50.0,   // matches existing coarse f0_min
             max_f0_hz: 1100.0, // matches existing coarse f0_max
@@ -70,6 +94,7 @@ impl Default for F0PostprocessConfig {
             interpolate_internal_unvoiced_gaps: false,
 
             fix_octave_jumps: true,
+            fix_trailing_octave_jumps: false,
 
             median_filter: true,
             median_filter_radius: 1,
@@ -80,20 +105,54 @@ impl Default for F0PostprocessConfig {
 }
 
 impl F0PostprocessConfig {
-    /// The narrowly scoped F0-continuity treatment used by the realtime quality
-    /// preset. Keep the other corrective filters off: they are independent
-    /// policy choices and must not silently alter vibrato or genuine octave
-    /// transitions when a front-end asks only for dropout interpolation.
+    /// The compatibility-oriented F0-continuity treatment. Keep the other
+    /// corrective filters off: they are independent policy choices and must not
+    /// silently alter vibrato or genuine octave transitions when a front-end
+    /// asks only for dropout interpolation.
     pub fn continuity(enabled: bool) -> Self {
         Self {
             enabled,
+            waveform_periodicity_validation: false,
             remove_short_voiced_islands: false,
             fill_short_unvoiced_gaps: false,
             interpolate_internal_unvoiced_gaps: true,
+            max_unvoiced_gap_frames: CONTINUITY_MAX_GAP_FRAMES,
             fix_octave_jumps: false,
             median_filter: false,
             ..Self::default()
         }
+    }
+
+    /// Build the shared realtime F0 policy from independently visible controls.
+    ///
+    /// `continuity` preserves the established MXGF-compatible interpolation
+    /// behavior. `stabilization` adds only temporal evidence checks around that
+    /// policy: a one-frame voiced island is discarded, isolated octave mistakes
+    /// are repaired, and a three-frame voiced median removes impulsive F0 noise.
+    /// It does not claim access to an RMVPE probability, which the current model
+    /// session API does not expose.
+    pub fn continuity_with_stabilization(continuity: bool, stabilization: bool) -> Self {
+        let mut config = Self::continuity(continuity);
+        if !stabilization {
+            return config;
+        }
+
+        // Stabilization can stand alone when users disable full internal-gap
+        // interpolation. In that case, retain only short dropouts so silence and
+        // stop consonants are not turned into a long synthetic pitch contour.
+        config.enabled = true;
+        config.waveform_periodicity_validation = true;
+        config.remove_short_voiced_islands = true;
+        config.max_voiced_island_frames = 1;
+        if !continuity {
+            config.fill_short_unvoiced_gaps = true;
+            config.max_unvoiced_gap_frames = 2;
+        }
+        config.fix_octave_jumps = true;
+        config.fix_trailing_octave_jumps = true;
+        config.median_filter = true;
+        config.median_filter_radius = 1;
+        config
     }
 }
 
@@ -128,6 +187,44 @@ impl F0Postprocessor {
         self.config = config;
     }
 
+    /// Validate thresholded RMVPE F0 against the exact 16 kHz waveform window
+    /// used by the estimator.
+    ///
+    /// The output remains natural/unshifted F0. Keeping this pass before the
+    /// rolling F0 timeline means speech activity, adaptive retrieval, Protect,
+    /// and synthesis all see the same corrected voiced/unvoiced decision. The
+    /// caller owns and reuses `output`; no allocation belongs in an audio
+    /// callback (this method runs only on the conversion worker).
+    pub fn validate_raw_pitchf_into(
+        &self,
+        input_pitchf: &[f32],
+        audio_16k: &[f32],
+        output: &mut Vec<f32>,
+    ) {
+        output.clear();
+        output.extend_from_slice(input_pitchf);
+        if !self.config.waveform_periodicity_validation {
+            return;
+        }
+
+        for (frame_index, f0) in output.iter_mut().enumerate() {
+            if !f0.is_finite() || *f0 < self.config.min_f0_hz || *f0 > self.config.max_f0_hz {
+                *f0 = UNVOICED;
+                continue;
+            }
+            if *f0 <= UNVOICED {
+                *f0 = UNVOICED;
+                continue;
+            }
+
+            if waveform_periodicity_16k(audio_16k, frame_index, *f0)
+                .is_some_and(|periodicity| periodicity < MIN_WAVEFORM_PERIODICITY)
+            {
+                *f0 = UNVOICED;
+            }
+        }
+    }
+
     /// Post-process aligned raw `pitchf` and apply pitch shift exactly once.
     ///
     /// `input_pitchf` is the RVC-aligned, *un-shifted* (natural) F0 and is never
@@ -160,6 +257,9 @@ impl F0Postprocessor {
             }
             if self.config.fix_octave_jumps {
                 self.fix_octave_jumps(output);
+                if self.config.fix_trailing_octave_jumps {
+                    self.fix_trailing_octave_jump(output);
+                }
             }
             if self.config.median_filter && self.config.median_filter_radius > 0 {
                 self.median_filter(output);
@@ -252,12 +352,12 @@ impl F0Postprocessor {
         }
     }
 
-    /// Fill every internal unvoiced run, with no length cap, using the same
-    /// linear-Hz interpolation semantics as `numpy.interp`. Unlike `numpy.interp`
-    /// we do not extend the nearest voiced value over an edge run because a
-    /// streaming window cannot know whether that edge is breath, silence, or a
-    /// pitch dropout. Most chunk boundaries are already internal here because
-    /// this pass runs over the shared rolling F0 window on the worker thread.
+    /// Fill only short, reliable internal unvoiced runs. Unbounded interpolation
+    /// is tempting on a rolling window, but it voices complete pauses, breaths,
+    /// and fricatives whenever a later vowel supplies the missing right bound.
+    /// This pass therefore repairs one/two-frame dropouts directly, admits up to
+    /// the configured cap only when both bounds have stable voiced support, and
+    /// never extrapolates an edge run.
     fn interpolate_internal_unvoiced_gaps(&self, pitchf: &mut [f32]) {
         let n = pitchf.len();
         let mut i = 0;
@@ -268,14 +368,14 @@ impl F0Postprocessor {
                     i += 1;
                 }
                 let end = i;
-                if start > 0 && end < n {
-                    let left = pitchf[start - 1];
-                    let right = pitchf[end];
-                    let steps = (end - start + 1) as f32;
-                    for (k, value) in pitchf[start..end].iter_mut().enumerate() {
-                        let t = (k + 1) as f32 / steps;
-                        *value = left + (right - left) * t;
-                    }
+                let gap_frames = end - start;
+                if start > 0
+                    && end < n
+                    && gap_frames <= self.config.max_unvoiced_gap_frames
+                    && (gap_frames <= DIRECT_GAP_FILL_FRAMES
+                        || has_reliable_gap_bounds(pitchf, start, end))
+                {
+                    interpolate_log_f0_gap(pitchf, start, end);
                 }
             } else {
                 i += 1;
@@ -311,6 +411,34 @@ impl F0Postprocessor {
         }
     }
 
+    /// Correct a potential last-frame octave error using two preceding voiced
+    /// frames as temporal evidence. This is intentionally stricter than the
+    /// interior rule: a real octave transition is allowed whenever the previous
+    /// two frames do not already agree, preventing a new sustained note from
+    /// being flattened merely because it begins at a chunk boundary.
+    fn fix_trailing_octave_jump(&self, pitchf: &mut [f32]) {
+        let n = pitchf.len();
+        if n < 3 {
+            return;
+        }
+        let before = pitchf[n - 3];
+        let left = pitchf[n - 2];
+        let center = pitchf[n - 1];
+        if before <= UNVOICED || left <= UNVOICED || center <= UNVOICED {
+            return;
+        }
+        if (before / left - 1.0).abs() > LR_NEAR_RATIO_TOL {
+            return;
+        }
+        let reference = 0.5 * (before + left);
+        let ratio = center / reference;
+        if (ratio - 2.0).abs() <= OCTAVE_RATIO_TOL {
+            pitchf[n - 1] = center * 0.5;
+        } else if (ratio - 0.5).abs() <= OCTAVE_RATIO_TOL {
+            pitchf[n - 1] = center * 2.0;
+        }
+    }
+
     /// Step 7: log-F0 median filter over voiced frames only.
     ///
     /// Unvoiced (`0.0`) frames stay unvoiced and are never mixed into a window.
@@ -326,6 +454,23 @@ impl F0Postprocessor {
         for i in 0..n {
             if input[i] <= UNVOICED {
                 continue;
+            }
+            if radius == 1 {
+                // A three-frame median is meant to remove an impulse, not the
+                // first frame of a real pitch transition. Require both adjacent
+                // voiced frames to agree before replacing the centre; this also
+                // makes the quality preset preserve deliberate octave changes.
+                if i == 0 || i + 1 >= n {
+                    continue;
+                }
+                let left = input[i - 1];
+                let right = input[i + 1];
+                if left <= UNVOICED
+                    || right <= UNVOICED
+                    || (left / right - 1.0).abs() > LR_NEAR_RATIO_TOL
+                {
+                    continue;
+                }
             }
             window.clear();
             let lo = i.saturating_sub(radius);
@@ -353,6 +498,113 @@ impl F0Postprocessor {
     }
 }
 
+pub(super) fn waveform_periodicity_16k(
+    audio_16k: &[f32],
+    frame_index: usize,
+    f0_hz: f32,
+) -> Option<f32> {
+    if audio_16k.is_empty() || !f0_hz.is_finite() || f0_hz <= 0.0 {
+        return None;
+    }
+
+    let expected_lag = (16_000.0 / f0_hz).round() as usize;
+    if expected_lag < 2 {
+        return None;
+    }
+    let center = frame_index.saturating_mul(160).min(audio_16k.len());
+    let start = center.saturating_sub(PERIODICITY_WINDOW_RADIUS_SAMPLES_16K);
+    let end = center
+        .saturating_add(PERIODICITY_WINDOW_RADIUS_SAMPLES_16K)
+        .min(audio_16k.len());
+    let window = &audio_16k[start..end];
+    let search_radius = ((expected_lag as f32 * 0.04).ceil() as usize).clamp(1, 8);
+    let first_lag = expected_lag.saturating_sub(search_radius).max(2);
+    let last_lag = expected_lag.saturating_add(search_radius);
+    let mut best: Option<f32> = None;
+
+    for lag in first_lag..=last_lag {
+        let Some(overlap) = window.len().checked_sub(lag) else {
+            continue;
+        };
+        if overlap < PERIODICITY_MIN_OVERLAP_SAMPLES_16K {
+            continue;
+        }
+        let correlation = normalized_lag_correlation(window, lag, overlap);
+        best = Some(best.map_or(correlation, |value| value.max(correlation)));
+    }
+    best.map(|value| value.clamp(-1.0, 1.0))
+}
+
+fn normalized_lag_correlation(window: &[f32], lag: usize, overlap: usize) -> f32 {
+    let left = &window[..overlap];
+    let right = &window[lag..lag + overlap];
+    let count = overlap as f64;
+    let left_mean = left
+        .iter()
+        .map(|sample| f64::from(finite_or_zero(*sample)))
+        .sum::<f64>()
+        / count;
+    let right_mean = right
+        .iter()
+        .map(|sample| f64::from(finite_or_zero(*sample)))
+        .sum::<f64>()
+        / count;
+    let mut covariance = 0.0f64;
+    let mut left_energy = 0.0f64;
+    let mut right_energy = 0.0f64;
+    for (&left, &right) in left.iter().zip(right) {
+        let left = f64::from(finite_or_zero(left)) - left_mean;
+        let right = f64::from(finite_or_zero(right)) - right_mean;
+        covariance += left * right;
+        left_energy += left * left;
+        right_energy += right * right;
+    }
+    let denominator = (left_energy * right_energy).sqrt();
+    if denominator <= f64::EPSILON {
+        0.0
+    } else {
+        (covariance / denominator) as f32
+    }
+}
+
+fn has_reliable_gap_bounds(pitchf: &[f32], start: usize, end: usize) -> bool {
+    if start < 2 || end + 1 >= pitchf.len() {
+        return false;
+    }
+    let left_support = pitchf[start - 2];
+    let left = pitchf[start - 1];
+    let right = pitchf[end];
+    let right_support = pitchf[end + 1];
+    [left_support, left, right, right_support]
+        .into_iter()
+        .all(|f0| f0.is_finite() && f0 > UNVOICED)
+        && pitch_distance_semitones(left_support, left) <= CONTINUITY_LOCAL_SEMITONES
+        && pitch_distance_semitones(right, right_support) <= CONTINUITY_LOCAL_SEMITONES
+        && pitch_distance_semitones(left, right) <= CONTINUITY_BOUNDARY_SEMITONES
+}
+
+pub(super) fn pitch_distance_semitones(left: f32, right: f32) -> f32 {
+    12.0 * (left / right).log2().abs()
+}
+
+fn interpolate_log_f0_gap(pitchf: &mut [f32], start: usize, end: usize) {
+    let log_left = pitchf[start - 1].ln();
+    let log_right = pitchf[end].ln();
+    let steps = (end - start + 1) as f32;
+    for (offset, value) in pitchf[start..end].iter_mut().enumerate() {
+        let progress = (offset + 1) as f32 / steps;
+        *value = (log_left + (log_right - log_left) * progress).exp();
+    }
+}
+
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +626,33 @@ mod tests {
         let mut out = Vec::new();
         p.process_pitchf_into(input, shift, &mut out);
         out
+    }
+
+    fn validate(cfg: F0PostprocessConfig, input: &[f32], audio_16k: &[f32]) -> Vec<f32> {
+        let processor = F0Postprocessor::new(cfg);
+        let mut out = Vec::new();
+        processor.validate_raw_pitchf_into(input, audio_16k, &mut out);
+        out
+    }
+
+    fn sine_16k(frequency_hz: f32, samples: usize) -> Vec<f32> {
+        (0..samples)
+            .map(|sample| {
+                (std::f32::consts::TAU * frequency_hz * sample as f32 / 16_000.0).sin() * 0.2
+            })
+            .collect()
+    }
+
+    fn aperiodic_noise(samples: usize) -> Vec<f32> {
+        let mut state = 0x6d2b_79f5u32;
+        (0..samples)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                ((state as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.2
+            })
+            .collect()
     }
 
     fn approx(a: f32, b: f32) {
@@ -473,10 +752,39 @@ mod tests {
     }
 
     #[test]
-    fn continuity_fills_all_internal_gaps_linearly_but_not_edges() {
+    fn continuity_repairs_short_internal_gaps_in_log_space_but_not_edges() {
         let cfg = F0PostprocessConfig::continuity(true);
-        let out = run(cfg, &[0.0, 100.0, 0.0, 0.0, 0.0, 500.0, 0.0], 0.0);
-        assert_eq!(out, vec![0.0, 100.0, 200.0, 300.0, 400.0, 500.0, 0.0]);
+        let out = run(cfg, &[0.0, 100.0, 0.0, 0.0, 110.0, 0.0], 0.0);
+        let (left, right) = (100.0_f32.ln(), 110.0_f32.ln());
+        assert_eq!(out[0], 0.0);
+        approx(out[2], (left + (right - left) / 3.0).exp());
+        approx(out[3], (left + (right - left) * 2.0 / 3.0).exp());
+        assert_eq!(out[5], 0.0);
+    }
+
+    #[test]
+    fn continuity_requires_stable_bounds_for_medium_gaps() {
+        let cfg = F0PostprocessConfig::continuity(true);
+        let stable = run(
+            cfg.clone(),
+            &[100.0, 100.0, 0.0, 0.0, 0.0, 105.0, 105.0],
+            0.0,
+        );
+        assert!(stable[2..5].iter().all(|f0| *f0 > 0.0));
+
+        let unstable = run(cfg, &[100.0, 130.0, 0.0, 0.0, 0.0, 200.0, 160.0], 0.0);
+        assert_eq!(&unstable[2..5], &[0.0; 3]);
+    }
+
+    #[test]
+    fn continuity_never_voices_a_long_pause() {
+        let cfg = F0PostprocessConfig::continuity(true);
+        let out = run(
+            cfg,
+            &[100.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 105.0, 105.0],
+            0.0,
+        );
+        assert_eq!(&out[2..8], &[0.0; 6]);
     }
 
     #[test]
@@ -486,6 +794,40 @@ mod tests {
             run(F0PostprocessConfig::continuity(false), &input, 0.0),
             input
         );
+    }
+
+    #[test]
+    fn waveform_periodicity_keeps_supported_pitch_and_rejects_mismatch() {
+        let cfg = F0PostprocessConfig::continuity_with_stabilization(false, true);
+        let audio = sine_16k(200.0, 1_600);
+        let supported = validate(cfg.clone(), &[200.0; 10], &audio);
+        assert!(supported.iter().all(|f0| *f0 == 200.0));
+
+        let mismatched = validate(cfg, &[320.0; 10], &audio);
+        assert!(mismatched.iter().all(|f0| *f0 == 0.0));
+    }
+
+    #[test]
+    fn waveform_periodicity_rejects_pitch_on_flat_audio() {
+        let cfg = F0PostprocessConfig::continuity_with_stabilization(false, true);
+        let out = validate(cfg, &[220.0; 8], &[0.0; 1_280]);
+        assert!(out.iter().all(|f0| *f0 == 0.0));
+    }
+
+    #[test]
+    fn waveform_periodicity_rejects_aperiodic_noise_pitch() {
+        let cfg = F0PostprocessConfig::continuity_with_stabilization(false, true);
+        let out = validate(cfg, &[220.0; 12], &aperiodic_noise(1_920));
+        assert!(out.iter().filter(|f0| **f0 == 0.0).count() >= 11);
+    }
+
+    #[test]
+    fn disabled_waveform_validation_is_an_exact_passthrough() {
+        let cfg = F0PostprocessConfig::continuity(true);
+        let input = [f32::NAN, -20.0, 0.0, 220.0, 2_000.0];
+        let out = validate(cfg, &input, &[0.0; 800]);
+        assert!(out[0].is_nan());
+        assert_eq!(&out[1..], &input[1..]);
     }
 
     // 6. octave jump correction, only for isolated near-2x/0.5x with close sides.
@@ -506,6 +848,31 @@ mod tests {
         // Left and right not close => not an octave error, keep as-is.
         let glide = run(cfg, &[220.0, 440.0, 330.0], 0.0);
         approx(glide[1], 440.0);
+    }
+
+    #[test]
+    fn stabilized_policy_repairs_interior_and_trailing_octave_outliers() {
+        let cfg = F0PostprocessConfig::continuity_with_stabilization(false, true);
+        assert!(cfg.enabled);
+        assert!(cfg.fix_octave_jumps);
+        assert!(cfg.fix_trailing_octave_jumps);
+        assert!(cfg.median_filter);
+        assert!(cfg.fill_short_unvoiced_gaps);
+
+        let out = run(cfg, &[220.0, 220.0, 440.0, 220.0, 440.0], 0.0);
+        approx(out[2], 220.0);
+        approx(out[4], 220.0);
+    }
+
+    #[test]
+    fn stabilized_policy_keeps_a_real_sustained_octave_change() {
+        let cfg = F0PostprocessConfig::continuity_with_stabilization(false, true);
+        let out = run(cfg, &[220.0, 220.0, 440.0, 440.0, 440.0], 0.0);
+        approx(out[0], 220.0);
+        approx(out[1], 220.0);
+        approx(out[2], 440.0);
+        approx(out[3], 440.0);
+        approx(out[4], 440.0);
     }
 
     // 7. median filter: stable 3-point, unvoiced not mixed, order-independent.

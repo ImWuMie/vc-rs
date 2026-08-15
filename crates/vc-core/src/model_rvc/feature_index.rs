@@ -9,9 +9,9 @@
 //! producing plausible but wrong features.
 //!
 //! Loading and decoding happen only while a pipeline is being constructed. The
-//! worker-side query path reuses all scratch buffers and never opens files,
-//! locks, or allocates, which is important because it runs once per conversion
-//! chunk in realtime sessions.
+//! worker-side query path reuses its scratch capacity after the first feature
+//! window shape is seen and never opens files or takes locks, which is important
+//! because it runs once per conversion chunk in realtime sessions.
 
 use std::fs;
 use std::path::Path;
@@ -27,6 +27,38 @@ const MAX_NPROBE: usize = 8;
 const MAX_NLIST: usize = 1_000_000;
 const MAX_INDEX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const EXACT_DISTANCE_EPSILON: f32 = 1.0e-12;
+// Adaptive retrieval is deliberately conservative. A weak match still keeps a
+// small target-voice share, while unvoiced/boundary frames lose substantially
+// more index influence so consonants remain anchored to the source ContentVec.
+const ADAPTIVE_INDEX_MIN_DISTANCE_FACTOR: f32 = 0.35;
+const ADAPTIVE_INDEX_MIN_VOICING_FACTOR: f32 = 0.40;
+const ADAPTIVE_INDEX_BOUNDARY_REDUCTION: f32 = 0.30;
+const ADAPTIVE_PROTECT_MIN_FACTOR: f32 = 0.20;
+const DISTANCE_CONFIDENCE_FULL_RATIO: f32 = 0.45;
+const DISTANCE_CONFIDENCE_NONE_RATIO: f32 = 0.95;
+// RMVPE's supported model contract exposes thresholded pitchf, not posterior
+// probabilities. These controls therefore use a conservative temporal
+// reliability proxy from raw F0 support and pitch continuity.
+const F0_RELIABILITY_MIN_FACTOR: f32 = 0.55;
+const F0_PAIR_STABLE_SEMITONES: f32 = 1.5;
+const F0_PAIR_UNSTABLE_SEMITONES: f32 = 7.0;
+const F0_NEIGHBOR_AGREEMENT_SEMITONES: f32 = 2.5;
+const F0_ISOLATED_JUMP_START_SEMITONES: f32 = 3.5;
+const F0_ISOLATED_JUMP_FULL_SEMITONES: f32 = 10.0;
+const F0_MIN_VOICED_RELIABILITY: f32 = 0.35;
+// A Schmitt-style boundary envelope reacts immediately to consonant/onset
+// evidence, holds through threshold chatter, then releases over a few 20 ms
+// ContentVec frames. Final Index/Protect controls use the same fast-drop,
+// slow-recovery policy so target timbre returns without a hard feature step.
+const F0_BOUNDARY_WEIGHT: f32 = 0.85;
+const BOUNDARY_ENTER_THRESHOLD: f32 = 0.58;
+const BOUNDARY_EXIT_THRESHOLD: f32 = 0.22;
+const BOUNDARY_ATTACK_ALPHA: f32 = 0.85;
+const BOUNDARY_RELEASE_ALPHA: f32 = 0.45;
+const INDEX_DROP_ALPHA: f32 = 0.80;
+const INDEX_RECOVERY_ALPHA: f32 = 0.38;
+const PROTECT_DROP_ALPHA: f32 = 0.82;
+const PROTECT_RECOVERY_ALPHA: f32 = 0.34;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FeatureIndexSummary {
@@ -56,6 +88,11 @@ pub(super) struct FeatureIndex {
     centroid_distances: Vec<f32>,
     centroid_ids: Vec<usize>,
     mixed_frame: Vec<f32>,
+    // Per-window adaptive controls. They are retained so FeatureTensor can
+    // apply the same distance/boundary evidence to unvoiced Protect frames
+    // after the generator's 2x frame expansion and silence-front trim.
+    adaptive_protect_scales: Vec<f32>,
+    boundary_strengths: Vec<f32>,
 }
 
 impl FeatureIndex {
@@ -175,6 +212,8 @@ impl FeatureIndex {
             centroid_distances: vec![f32::INFINITY; nprobe],
             centroid_ids: vec![usize::MAX; nprobe],
             mixed_frame: vec![0.0; dimensions],
+            adaptive_protect_scales: Vec::new(),
+            boundary_strengths: Vec::new(),
         })
     }
 
@@ -191,6 +230,7 @@ impl FeatureIndex {
     /// eight nearest RVC index entries. This is the same retrieval equation used
     /// by the upstream RVC Python pipeline, before it doubles feature frames for
     /// the generator's 10 ms grid.
+    #[allow(dead_code)]
     pub(super) fn blend_frames_in_place(
         &mut self,
         data: &mut [f32],
@@ -201,6 +241,149 @@ impl FeatureIndex {
         if index_rate <= 0.0 {
             return Ok(());
         }
+        if !index_rate.is_finite() {
+            bail!("RVC index rate must be finite");
+        }
+        let index_rate = self.validate_blend_inputs(data, frames, dimensions, index_rate)?;
+        for frame in data.chunks_exact_mut(dimensions) {
+            self.blend_frame(frame, index_rate);
+        }
+        Ok(())
+    }
+
+    /// Blend retrieval with frame-local quality controls. `natural_pitchf_10ms`
+    /// is the raw, unshifted F0 aligned to the untrimmed 10 ms generator grid;
+    /// each ContentVec frame owns two adjacent values. The method performs the
+    /// same nearest-neighbor query as standard RVC exactly once per frame, then
+    /// lowers its effective Index rate for weak matches, unvoiced material, and
+    /// sharp ContentVec transitions.
+    pub(super) fn blend_frames_adaptive_in_place(
+        &mut self,
+        data: &mut [f32],
+        frames: usize,
+        dimensions: usize,
+        index_rate: f32,
+        natural_pitchf_10ms: &[f32],
+    ) -> Result<()> {
+        if index_rate <= 0.0 {
+            self.adaptive_protect_scales.clear();
+            self.boundary_strengths.clear();
+            return Ok(());
+        }
+        let index_rate = self.validate_blend_inputs(data, frames, dimensions, index_rate)?;
+        let expected_pitch_len = frames
+            .checked_mul(2)
+            .context("adaptive retrieval F0 frame length overflow")?;
+        if natural_pitchf_10ms.len() != expected_pitch_len {
+            bail!(
+                "adaptive retrieval F0 frame count {} does not match {} ContentVec frames x 2",
+                natural_pitchf_10ms.len(),
+                frames
+            );
+        }
+
+        self.boundary_strengths.resize(frames, 0.0);
+        self.adaptive_protect_scales.resize(frames, 1.0);
+        // Calculate boundaries before mutating any feature frame. Comparing a
+        // frame against an already-retrieved neighbor would make the result
+        // depend on loop order and create a subtle one-frame shimmer.
+        for frame_index in 0..frames {
+            let start = frame_index * dimensions;
+            let frame = &data[start..start + dimensions];
+            let previous_delta = if frame_index > 0 {
+                let previous_start = start - dimensions;
+                normalized_frame_delta(frame, &data[previous_start..previous_start + dimensions])
+            } else {
+                0.0
+            };
+            let next_delta = if frame_index + 1 < frames {
+                let next_start = start + dimensions;
+                normalized_frame_delta(frame, &data[next_start..next_start + dimensions])
+            } else {
+                0.0
+            };
+            let content_boundary = smoothstep(previous_delta.max(next_delta), 0.20, 0.75);
+            let f0_boundary =
+                F0_BOUNDARY_WEIGHT * f0_transition_strength(natural_pitchf_10ms, frame_index);
+            self.boundary_strengths[frame_index] = content_boundary.max(f0_boundary);
+        }
+
+        // This state is intentionally window-local. Realtime calls replay a
+        // rolling historical prefix; carrying the prior call's terminal EMA
+        // into the next window's oldest frame would run time backwards and make
+        // identical windows drift. Reconstructing from retained context is both
+        // deterministic and continuous at the emitted tail.
+        stabilize_boundary_strengths_in_place(&mut self.boundary_strengths);
+        let mut previous_index_scale = None;
+        let mut previous_protect_scale = None;
+
+        for (frame_index, frame) in data.chunks_exact_mut(dimensions).enumerate() {
+            let Some(distance_confidence) = self.retrieve_frame(frame) else {
+                // No usable vector leaves the source untouched and must not
+                // reduce Protect for this frame either. Reset the local
+                // smoother so an empty IVF bucket cannot leak stale evidence
+                // into the next usable bucket.
+                self.adaptive_protect_scales[frame_index] = 1.0;
+                previous_index_scale = None;
+                previous_protect_scale = None;
+                continue;
+            };
+            let voicing_factor = voicing_factor(natural_pitchf_10ms, frame_index);
+            let f0_reliability = f0_temporal_reliability(natural_pitchf_10ms, frame_index);
+            let f0_reliability_factor =
+                F0_RELIABILITY_MIN_FACTOR + (1.0 - F0_RELIABILITY_MIN_FACTOR) * f0_reliability;
+            let boundary_strength = self.boundary_strengths[frame_index];
+            let distance_factor = ADAPTIVE_INDEX_MIN_DISTANCE_FACTOR
+                + (1.0 - ADAPTIVE_INDEX_MIN_DISTANCE_FACTOR) * distance_confidence;
+            let boundary_factor = 1.0 - ADAPTIVE_INDEX_BOUNDARY_REDUCTION * boundary_strength;
+            let target_index_scale =
+                (distance_factor * voicing_factor * f0_reliability_factor * boundary_factor)
+                    .clamp(0.0, 1.0);
+            let index_scale = smooth_adaptive_control(
+                previous_index_scale,
+                target_index_scale,
+                INDEX_DROP_ALPHA,
+                INDEX_RECOVERY_ALPHA,
+            );
+            previous_index_scale = Some(index_scale);
+            let effective_rate = (index_rate * index_scale).clamp(0.0, 1.0);
+            self.apply_retrieved_frame(frame, effective_rate);
+
+            // Protect is only applied again on unvoiced frames. Distance and
+            // boundary evidence already shaped the voiced Index rate above; a
+            // second confidence multiplication there would over-attenuate
+            // sustained vowels and make the target voice disappear.
+            let target_protect_scale = ((ADAPTIVE_PROTECT_MIN_FACTOR
+                + (1.0 - ADAPTIVE_PROTECT_MIN_FACTOR) * distance_confidence)
+                * (1.0 - 0.65 * boundary_strength)
+                * f0_reliability_factor)
+                .clamp(0.0, 1.0);
+            let protect_scale = smooth_adaptive_control(
+                previous_protect_scale,
+                target_protect_scale,
+                PROTECT_DROP_ALPHA,
+                PROTECT_RECOVERY_ALPHA,
+            );
+            previous_protect_scale = Some(protect_scale);
+            self.adaptive_protect_scales[frame_index] = protect_scale;
+        }
+        Ok(())
+    }
+
+    /// Scales for the raw ContentVec frames from the most recent adaptive
+    /// retrieval pass. The slice is worker-owned and remains valid until the
+    /// next query; it is read after the pipeline expands/trims feature frames.
+    pub(super) fn adaptive_protect_scales(&self) -> &[f32] {
+        &self.adaptive_protect_scales
+    }
+
+    fn validate_blend_inputs(
+        &self,
+        data: &[f32],
+        frames: usize,
+        dimensions: usize,
+        index_rate: f32,
+    ) -> Result<f32> {
         if !index_rate.is_finite() {
             bail!("RVC index rate must be finite");
         }
@@ -222,14 +405,23 @@ impl FeatureIndex {
                 dimensions
             );
         }
-        let index_rate = index_rate.clamp(0.0, 1.0);
-        for frame in data.chunks_exact_mut(dimensions) {
-            self.blend_frame(frame, index_rate);
-        }
-        Ok(())
+        Ok(index_rate.clamp(0.0, 1.0))
     }
 
+    #[allow(dead_code)]
     fn blend_frame(&mut self, frame: &mut [f32], index_rate: f32) {
+        if self.retrieve_frame(frame).is_some() {
+            self.apply_retrieved_frame(frame, index_rate);
+        }
+    }
+
+    /// Fill `mixed_frame` with the weighted nearest index vector and return a
+    /// scale-free match confidence. `None` means the selected IVF buckets had
+    /// no usable vectors; `Some(0.0)` is still a valid but weak match and must
+    /// retain the standard blend behavior. Comparing nearest distance with its
+    /// IVF centroid distance makes confidence portable across v1/v2 feature
+    /// dimensions and across indexes with different feature magnitudes.
+    fn retrieve_frame(&mut self, frame: &[f32]) -> Option<f32> {
         self.select_nearest_centroids(frame);
 
         let mut neighbor_distances = [f32::INFINITY; NEIGHBORS];
@@ -262,7 +454,7 @@ impl FeatureIndex {
             // An empty nearest IVF bucket is unusual for a normal added RVC
             // index. Keeping the source ContentVec frame is safer than inventing
             // a substitute from an unrelated list.
-            return;
+            return None;
         }
 
         let lists = &self.lists;
@@ -290,15 +482,22 @@ impl FeatureIndex {
                 }
             }
             if !total_weight.is_finite() || total_weight <= 0.0 {
-                return;
+                return None;
             }
             for mixed in mixed_frame.iter_mut() {
                 *mixed /= total_weight;
             }
         }
 
+        Some(distance_confidence(
+            neighbor_distances[0],
+            self.centroid_distances[0],
+        ))
+    }
+
+    fn apply_retrieved_frame(&mut self, frame: &mut [f32], index_rate: f32) {
         let source_weight = 1.0 - index_rate;
-        for (source, retrieved) in frame.iter_mut().zip(mixed_frame.iter()) {
+        for (source, retrieved) in frame.iter_mut().zip(self.mixed_frame.iter()) {
             *source = *source * source_weight + *retrieved * index_rate;
         }
     }
@@ -321,6 +520,271 @@ impl FeatureIndex {
             }
         }
     }
+}
+
+fn distance_confidence(nearest_distance: f32, centroid_distance: f32) -> f32 {
+    if nearest_distance <= EXACT_DISTANCE_EPSILON {
+        return 1.0;
+    }
+    if !nearest_distance.is_finite()
+        || !centroid_distance.is_finite()
+        || centroid_distance <= EXACT_DISTANCE_EPSILON
+    {
+        return 0.0;
+    }
+    let ratio = (nearest_distance / centroid_distance).max(0.0);
+    1.0 - smoothstep(
+        ratio,
+        DISTANCE_CONFIDENCE_FULL_RATIO,
+        DISTANCE_CONFIDENCE_NONE_RATIO,
+    )
+}
+
+fn smoothstep(value: f32, low: f32, high: f32) -> f32 {
+    if value <= low {
+        return 0.0;
+    }
+    if value >= high {
+        return 1.0;
+    }
+    let t = (value - low) / (high - low);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn normalized_frame_delta(left: &[f32], right: &[f32]) -> f32 {
+    let mut distance = 0.0f32;
+    let mut energy = 0.0f32;
+    for (&left, &right) in left.iter().zip(right) {
+        let delta = left - right;
+        distance += delta * delta;
+        energy += left * left + right * right;
+    }
+    if !distance.is_finite() || !energy.is_finite() {
+        // Treat malformed/overflowing feature energy as a hard boundary. This
+        // keeps the adaptive rate finite and favors the source frame instead of
+        // allowing a NaN to propagate into the generator tensor.
+        return 1.0;
+    }
+    (distance / energy.max(1.0e-6)).sqrt().clamp(0.0, 1.5)
+}
+
+fn voicing_factor(natural_pitchf_10ms: &[f32], frame_index: usize) -> f32 {
+    let start = frame_index * 2;
+    let voiced_in_frame = natural_pitchf_10ms[start..start + 2]
+        .iter()
+        .filter(|&&pitchf| valid_raw_f0(pitchf).is_some())
+        .count();
+    let current_voiced = voiced_in_frame > 0;
+    let base = match voiced_in_frame {
+        2 => 1.0,
+        1 => 0.68,
+        _ => ADAPTIVE_INDEX_MIN_VOICING_FACTOR,
+    };
+    let previous_voiced = frame_index > 0
+        && natural_pitchf_10ms[start - 2..start]
+            .iter()
+            .any(|&pitchf| valid_raw_f0(pitchf).is_some());
+    let next_voiced = start + 2 < natural_pitchf_10ms.len()
+        && natural_pitchf_10ms[start + 2..start + 4]
+            .iter()
+            .any(|&pitchf| valid_raw_f0(pitchf).is_some());
+    if (frame_index > 0 && previous_voiced != current_voiced)
+        || (frame_index + 1 < natural_pitchf_10ms.len() / 2 && next_voiced != current_voiced)
+    {
+        base * 0.85
+    } else {
+        base
+    }
+}
+
+fn f0_transition_strength(natural_pitchf_10ms: &[f32], frame_index: usize) -> f32 {
+    let frame_count = natural_pitchf_10ms.len() / 2;
+    if frame_index >= frame_count {
+        return 0.0;
+    }
+
+    let current = frame_voiced_ratio(natural_pitchf_10ms, frame_index);
+    // Compare complete ContentVec-sized (20 ms) voicing ratios. A partial
+    // 10 ms pair by itself is not enough to call a sustained alternating
+    // pattern a boundary; its F0 reliability is handled separately below.
+    let mut max_delta: f32 = 0.0;
+    if frame_index > 0 {
+        max_delta = max_delta
+            .max((current - frame_voiced_ratio(natural_pitchf_10ms, frame_index - 1)).abs());
+    }
+    if frame_index + 1 < frame_count {
+        max_delta = max_delta
+            .max((current - frame_voiced_ratio(natural_pitchf_10ms, frame_index + 1)).abs());
+    }
+    smoothstep(max_delta, 0.25, 0.75)
+}
+
+fn stabilize_boundary_strengths_in_place(strengths: &mut [f32]) {
+    let mut latched = false;
+    let mut envelope = 0.0f32;
+    for strength in strengths {
+        let raw = if strength.is_finite() {
+            strength.clamp(0.0, 1.0)
+        } else {
+            // Malformed feature/F0 evidence must bias toward retaining source
+            // articulation, never inject NaN into the adaptive controls.
+            1.0
+        };
+
+        if latched {
+            if raw <= BOUNDARY_EXIT_THRESHOLD {
+                latched = false;
+            }
+        } else if raw >= BOUNDARY_ENTER_THRESHOLD {
+            latched = true;
+        }
+
+        let target = if latched {
+            raw.max(BOUNDARY_ENTER_THRESHOLD)
+        } else {
+            raw
+        };
+        let alpha = if target >= envelope {
+            BOUNDARY_ATTACK_ALPHA
+        } else {
+            BOUNDARY_RELEASE_ALPHA
+        };
+        envelope += alpha * (target - envelope);
+        envelope = envelope.clamp(0.0, 1.0);
+        *strength = envelope;
+    }
+}
+
+fn f0_temporal_reliability(natural_pitchf_10ms: &[f32], frame_index: usize) -> f32 {
+    let frame_count = natural_pitchf_10ms.len() / 2;
+    if frame_index >= frame_count {
+        return 0.0;
+    }
+
+    let start = frame_index * 2;
+    let left = valid_raw_f0(natural_pitchf_10ms[start]);
+    let right = valid_raw_f0(natural_pitchf_10ms[start + 1]);
+    let voiced = usize::from(left.is_some()) + usize::from(right.is_some());
+    let mut reliability = match (left, right) {
+        (Some(left), Some(right)) => {
+            let pair_jump = semitone_distance(left, right);
+            let pair_stability = 1.0
+                - smoothstep(
+                    pair_jump,
+                    F0_PAIR_STABLE_SEMITONES,
+                    F0_PAIR_UNSTABLE_SEMITONES,
+                );
+            F0_MIN_VOICED_RELIABILITY + (1.0 - F0_MIN_VOICED_RELIABILITY) * pair_stability
+        }
+        (Some(_), None) | (None, Some(_)) => 0.55,
+        (None, None) => 0.45,
+    };
+
+    let has_previous = frame_index > 0;
+    let has_next = frame_index + 1 < frame_count;
+    let previous_voiced =
+        has_previous && frame_voiced_count(natural_pitchf_10ms, frame_index - 1) > 0;
+    let next_voiced = has_next && frame_voiced_count(natural_pitchf_10ms, frame_index + 1) > 0;
+
+    // Only call a frame an island/dropout when both sides are visible. Rolling
+    // window edges have unknown context and must not be penalized by a guess.
+    if has_previous && has_next {
+        if voiced == 0 && previous_voiced && next_voiced {
+            reliability = reliability.min(0.38);
+        } else if voiced > 0 && !previous_voiced && !next_voiced {
+            reliability = reliability.min(0.32);
+        }
+    }
+
+    // Suppress an isolated octave/large jump only when the two surrounding
+    // ContentVec frames agree. A sustained real pitch transition has one
+    // neighbor on the new contour and therefore does not meet this condition.
+    if let (Some(previous), Some(current), Some(next)) = (
+        frame_log2_pitch(natural_pitchf_10ms, frame_index.checked_sub(1)),
+        frame_log2_pitch(natural_pitchf_10ms, Some(frame_index)),
+        frame_log2_pitch(
+            natural_pitchf_10ms,
+            (frame_index + 1 < frame_count).then_some(frame_index + 1),
+        ),
+    ) {
+        let neighbor_delta = 12.0 * (previous - next).abs();
+        if neighbor_delta <= F0_NEIGHBOR_AGREEMENT_SEMITONES {
+            let isolated_delta = 12.0 * (current - previous).abs().min((current - next).abs());
+            let jump_strength = smoothstep(
+                isolated_delta,
+                F0_ISOLATED_JUMP_START_SEMITONES,
+                F0_ISOLATED_JUMP_FULL_SEMITONES,
+            );
+            let jump_cap = 1.0 - (1.0 - F0_MIN_VOICED_RELIABILITY) * jump_strength;
+            reliability = reliability.min(jump_cap);
+        }
+    }
+
+    reliability.clamp(0.0, 1.0)
+}
+
+fn smooth_adaptive_control(
+    previous: Option<f32>,
+    target: f32,
+    drop_alpha: f32,
+    recovery_alpha: f32,
+) -> f32 {
+    let target = if target.is_finite() {
+        target.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let Some(previous) = previous.filter(|value| value.is_finite()) else {
+        return target;
+    };
+    let previous = previous.clamp(0.0, 1.0);
+    let alpha = if target < previous {
+        drop_alpha
+    } else {
+        recovery_alpha
+    };
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    (previous + alpha * (target - previous)).clamp(0.0, 1.0)
+}
+
+fn valid_raw_f0(pitchf: f32) -> Option<f32> {
+    (pitchf.is_finite() && pitchf > 0.0).then_some(pitchf)
+}
+
+fn frame_voiced_count(natural_pitchf_10ms: &[f32], frame_index: usize) -> usize {
+    let start = frame_index.saturating_mul(2);
+    natural_pitchf_10ms
+        .get(start..start.saturating_add(2))
+        .unwrap_or_default()
+        .iter()
+        .filter(|&&pitchf| valid_raw_f0(pitchf).is_some())
+        .count()
+}
+
+fn frame_voiced_ratio(natural_pitchf_10ms: &[f32], frame_index: usize) -> f32 {
+    frame_voiced_count(natural_pitchf_10ms, frame_index) as f32 * 0.5
+}
+
+fn frame_log2_pitch(natural_pitchf_10ms: &[f32], frame_index: Option<usize>) -> Option<f32> {
+    let start = frame_index?.checked_mul(2)?;
+    let frame = natural_pitchf_10ms.get(start..start.checked_add(2)?)?;
+    let mut log_sum = 0.0f32;
+    let mut voiced = 0usize;
+    for &pitchf in frame {
+        if let Some(pitchf) = valid_raw_f0(pitchf) {
+            log_sum += pitchf.log2();
+            voiced += 1;
+        }
+    }
+    (voiced > 0).then_some(log_sum / voiced as f32)
+}
+
+fn semitone_distance(left: f32, right: f32) -> f32 {
+    (12.0 * (left.log2() - right.log2()).abs()).clamp(0.0, 120.0)
 }
 
 fn squared_l2(left: &[f32], right: &[f32]) -> f32 {
@@ -650,6 +1114,22 @@ mod tests {
     }
 
     #[test]
+    fn standard_blend_does_not_skip_a_valid_zero_confidence_match() {
+        let path = temp_index_path("weak-standard");
+        fs::write(&path, standard_index_bytes()).unwrap();
+        let mut index = FeatureIndex::load(&path, 2).unwrap();
+        let _ = fs::remove_file(&path);
+
+        // The query and its nearest centroid are equally close, so the
+        // adaptive confidence is zero even though the IVF bucket has a valid
+        // vector. Standard RVC blending must still use that retrieved vector.
+        let mut frames = vec![1.9, 1.9];
+        index.blend_frames_in_place(&mut frames, 1, 2, 1.0).unwrap();
+        assert!(frames[0] > 1.9);
+        assert!(frames[1] > 1.9);
+    }
+
+    #[test]
     fn zero_index_rate_leaves_features_exactly_unchanged() {
         let path = temp_index_path("zero-rate");
         fs::write(&path, standard_index_bytes()).unwrap();
@@ -659,6 +1139,214 @@ mod tests {
         let mut frames = vec![0.5, -0.25];
         index.blend_frames_in_place(&mut frames, 1, 2, 0.0).unwrap();
         assert_eq!(frames, vec![0.5, -0.25]);
+    }
+
+    #[test]
+    fn distance_confidence_is_bounded_and_decreases_for_weaker_matches() {
+        let exact = distance_confidence(0.0, 1.0);
+        let close = distance_confidence(0.4, 1.0);
+        let weak = distance_confidence(0.8, 1.0);
+        let outside = distance_confidence(1.2, 1.0);
+        assert_eq!(exact, 1.0);
+        assert!(close > weak);
+        assert!(weak > outside);
+        assert!((0.0..=1.0).contains(&close));
+        assert!((0.0..=1.0).contains(&weak));
+        assert_eq!(outside, 0.0);
+    }
+
+    #[test]
+    fn voicing_factor_favors_fully_voiced_frames() {
+        let fully_voiced = voicing_factor(&[120.0, 121.0, 120.0, 121.0], 0);
+        let half_voiced = voicing_factor(&[120.0, 0.0, 120.0, 0.0], 0);
+        let unvoiced = voicing_factor(&[0.0, 0.0, 0.0, 0.0], 0);
+        assert_eq!(fully_voiced, 1.0);
+        assert!(half_voiced < fully_voiced);
+        assert_eq!(unvoiced, ADAPTIVE_INDEX_MIN_VOICING_FACTOR);
+    }
+
+    #[test]
+    fn raw_f0_reliability_distinguishes_stable_and_unreliable_patterns() {
+        let stable = f0_temporal_reliability(&[120.0, 121.0, 120.0, 121.0, 120.0, 121.0], 1);
+        let partial = f0_temporal_reliability(&[120.0, 121.0, 120.0, 0.0, 120.0, 121.0], 1);
+        let stable_unvoiced = f0_temporal_reliability(&[0.0; 6], 1);
+        let dropout = f0_temporal_reliability(&[120.0, 121.0, 0.0, 0.0, 120.0, 121.0], 1);
+        let isolated = f0_temporal_reliability(&[0.0, 0.0, 120.0, 121.0, 0.0, 0.0], 1);
+        let octave_outlier =
+            f0_temporal_reliability(&[120.0, 121.0, 240.0, 242.0, 119.0, 121.0], 1);
+        let within_pair_jump = f0_temporal_reliability(&[120.0, 240.0], 0);
+
+        assert!(stable > partial);
+        assert!(partial > stable_unvoiced);
+        assert!(stable_unvoiced > dropout);
+        assert!(isolated < stable_unvoiced);
+        assert!(octave_outlier <= F0_MIN_VOICED_RELIABILITY + 1.0e-6);
+        assert!(within_pair_jump <= F0_MIN_VOICED_RELIABILITY + 1.0e-6);
+
+        // A real transition persists into the right neighbor, so it must not
+        // be classified as an isolated octave error.
+        let sustained_octave =
+            f0_temporal_reliability(&[120.0, 121.0, 240.0, 242.0, 241.0, 243.0], 1);
+        assert!(sustained_octave > 0.95);
+    }
+
+    #[test]
+    fn raw_f0_reliability_treats_invalid_values_as_unvoiced_and_stays_finite() {
+        for pitchf in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -120.0, 0.0] {
+            let reliability = f0_temporal_reliability(&[pitchf, pitchf], 0);
+            assert!(reliability.is_finite());
+            assert_eq!(reliability, 0.45);
+        }
+    }
+
+    #[test]
+    fn f0_transition_strength_detects_voicing_edges() {
+        let pitchf = [120.0, 121.0, 120.0, 121.0, 0.0, 0.0];
+        assert_eq!(
+            f0_transition_strength(&[120.0, 121.0, 120.0, 121.0], 0),
+            0.0
+        );
+        assert_eq!(f0_transition_strength(&pitchf, 1), 1.0);
+        assert_eq!(f0_transition_strength(&[120.0, 0.0], 0), 0.0);
+    }
+
+    #[test]
+    fn boundary_hysteresis_holds_through_threshold_chatter() {
+        let mut strengths = [0.70, 0.50, 0.40, 0.25, 0.21, 0.50, f32::NAN];
+        stabilize_boundary_strengths_in_place(&mut strengths);
+
+        assert!(strengths[..4]
+            .iter()
+            .all(|strength| *strength >= BOUNDARY_ENTER_THRESHOLD));
+        assert!(strengths[4] < BOUNDARY_ENTER_THRESHOLD);
+        // After exiting, a value between the thresholds must not relatch.
+        assert!(strengths[5] < BOUNDARY_ENTER_THRESHOLD);
+        assert!(strengths[6].is_finite());
+        assert!(strengths[6] > strengths[5]);
+    }
+
+    #[test]
+    fn adaptive_control_drops_faster_than_it_recovers() {
+        let dropped = smooth_adaptive_control(Some(1.0), 0.0, 0.80, 0.38);
+        let recovered = smooth_adaptive_control(Some(0.0), 1.0, 0.80, 0.38);
+        assert!(1.0 - dropped > recovered);
+        assert_eq!(smooth_adaptive_control(None, 0.7, 0.80, 0.38), 0.7);
+        assert!(smooth_adaptive_control(Some(f32::NAN), f32::NAN, 0.80, 0.38).is_finite());
+    }
+
+    #[test]
+    fn adaptive_window_replay_is_deterministic_and_reuses_scratch() {
+        let path = temp_index_path("adaptive-replay");
+        fs::write(&path, standard_index_bytes()).unwrap();
+        let mut index = FeatureIndex::load(&path, 2).unwrap();
+        let _ = fs::remove_file(&path);
+
+        let original = vec![0.5, 0.0, 1.0, 1.0, 2.0, 2.0];
+        let pitchf = [120.0, 121.0, 120.0, 0.0, 0.0, 0.0];
+        let mut first = original.clone();
+        index
+            .blend_frames_adaptive_in_place(&mut first, 3, 2, 1.0, &pitchf)
+            .unwrap();
+        let first_scales = index.adaptive_protect_scales().to_vec();
+        let boundary_capacity = index.boundary_strengths.capacity();
+        let protect_capacity = index.adaptive_protect_scales.capacity();
+
+        let mut replay = original.clone();
+        index
+            .blend_frames_adaptive_in_place(&mut replay, 3, 2, 1.0, &pitchf)
+            .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(index.adaptive_protect_scales(), first_scales);
+        assert_eq!(index.boundary_strengths.capacity(), boundary_capacity);
+        assert_eq!(index.adaptive_protect_scales.capacity(), protect_capacity);
+
+        let mut smaller = original[..4].to_vec();
+        index
+            .blend_frames_adaptive_in_place(&mut smaller, 2, 2, 1.0, &pitchf[..4])
+            .unwrap();
+        assert_eq!(index.boundary_strengths.capacity(), boundary_capacity);
+        assert_eq!(index.adaptive_protect_scales.capacity(), protect_capacity);
+
+        let mut disabled = original.clone();
+        index
+            .blend_frames_adaptive_in_place(&mut disabled, 3, 2, 0.0, &[])
+            .unwrap();
+        assert_eq!(disabled, original);
+        assert!(index.adaptive_protect_scales().is_empty());
+
+        let mut reenabled = original.clone();
+        index
+            .blend_frames_adaptive_in_place(&mut reenabled, 3, 2, 1.0, &pitchf)
+            .unwrap();
+        assert_eq!(reenabled, first);
+        assert_eq!(index.adaptive_protect_scales(), first_scales);
+    }
+
+    #[test]
+    fn invalid_adaptive_f0_length_does_not_mutate_input_or_scratch() {
+        let path = temp_index_path("adaptive-invalid-f0");
+        fs::write(&path, standard_index_bytes()).unwrap();
+        let mut index = FeatureIndex::load(&path, 2).unwrap();
+        let _ = fs::remove_file(&path);
+
+        let mut warmup = vec![0.5, 0.0];
+        index
+            .blend_frames_adaptive_in_place(&mut warmup, 1, 2, 1.0, &[120.0, 121.0])
+            .unwrap();
+        let old_scales = index.adaptive_protect_scales.clone();
+        let old_boundaries = index.boundary_strengths.clone();
+
+        let mut frames = vec![0.5, 0.0, 1.0, 1.0];
+        let unchanged = frames.clone();
+        let error = index
+            .blend_frames_adaptive_in_place(&mut frames, 2, 2, 1.0, &[120.0])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("F0 frame count"));
+        assert_eq!(frames, unchanged);
+        assert_eq!(index.adaptive_protect_scales, old_scales);
+        assert_eq!(index.boundary_strengths, old_boundaries);
+    }
+
+    #[test]
+    fn adaptive_retrieval_scales_weak_and_unvoiced_frames() {
+        let path = temp_index_path("adaptive");
+        fs::write(&path, standard_index_bytes()).unwrap();
+        let mut index = FeatureIndex::load(&path, 2).unwrap();
+        let _ = fs::remove_file(&path);
+
+        // The first frame is an exact, voiced match. The second is farther from
+        // both the IVF centroid and its stored vectors, so it receives less
+        // target-voice influence and a smaller Protect scale.
+        let mut frames = vec![0.5, 0.0, 1.0, 1.0];
+        index
+            .blend_frames_adaptive_in_place(&mut frames, 2, 2, 1.0, &[120.0, 120.0, 120.0, 120.0])
+            .unwrap();
+        let scales = index.adaptive_protect_scales();
+        assert_eq!(scales.len(), 2);
+        assert!(scales[0] > scales[1]);
+
+        let path = temp_index_path("adaptive-voicing");
+        fs::write(&path, standard_index_bytes()).unwrap();
+        let mut voiced_index = FeatureIndex::load(&path, 2).unwrap();
+        let _ = fs::remove_file(&path);
+        let mut voiced = vec![0.5, 0.0];
+        voiced_index
+            .blend_frames_adaptive_in_place(&mut voiced, 1, 2, 1.0, &[120.0, 120.0])
+            .unwrap();
+
+        let path = temp_index_path("adaptive-unvoiced");
+        fs::write(&path, standard_index_bytes()).unwrap();
+        let mut unvoiced_index = FeatureIndex::load(&path, 2).unwrap();
+        let _ = fs::remove_file(&path);
+        let mut unvoiced = vec![0.5, 0.0];
+        unvoiced_index
+            .blend_frames_adaptive_in_place(&mut unvoiced, 1, 2, 1.0, &[0.0, 0.0])
+            .unwrap();
+
+        let voiced_delta = (voiced[0] - 0.5).abs();
+        let unvoiced_delta = (unvoiced[0] - 0.5).abs();
+        assert!(voiced_delta > unvoiced_delta);
     }
 
     #[test]

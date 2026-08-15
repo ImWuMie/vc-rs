@@ -31,6 +31,11 @@ pub struct ChunkStats {
     pub model_output_samples: usize,
     /// Fraction of the RVC-aligned F0 window classified as voiced.
     pub voiced_ratio: f32,
+    /// Standard deviation of voiced F0 values on a semitone scale. This is a
+    /// compact speech-shape signal for the optional dynamic tuner; it is not a
+    /// language classifier by itself and is zero when the chunk has too little
+    /// voiced material.
+    pub pitch_variation_semitones: f32,
     /// Denominator used by `voiced_ratio`; retained so offline diagnostics can
     /// compute a frame-weighted aggregate across differently sized windows.
     pub pitch_frames: usize,
@@ -205,8 +210,29 @@ fn chunk_stats(
         } else {
             voiced_frames as f32 / output_pitchf.len() as f32
         },
+        pitch_variation_semitones: pitch_variation_semitones(output_pitchf),
         pitch_frames: output_pitchf.len(),
     }
+}
+
+fn pitch_variation_semitones(pitchf: &[f32]) -> f32 {
+    let mut count = 0u32;
+    let mut sum = 0.0f64;
+    let mut sum_squares = 0.0f64;
+    for &f0 in pitchf {
+        if f0.is_finite() && f0 > 0.0 {
+            let semitones = 12.0 * f64::from(f0).log2();
+            count = count.saturating_add(1);
+            sum += semitones;
+            sum_squares += semitones * semitones;
+        }
+    }
+    if count < 2 {
+        return 0.0;
+    }
+    let count = f64::from(count);
+    let variance = (sum_squares / count - (sum / count).powi(2)).max(0.0);
+    variance.sqrt() as f32
 }
 
 #[cfg(test)]

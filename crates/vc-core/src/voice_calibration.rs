@@ -79,15 +79,23 @@ impl VoiceCalibrationProfile {
 
         let noise_floor = finite_positive(self.noise_floor_rms) * input_gain;
         let speech_after_gain = speech_rms * input_gain;
-        // The gate detects instantaneous envelope amplitude, not frame RMS.
-        // A 2x noise-floor threshold has enough margin for steady ambience while
-        // the speech-relative cap avoids chewing quiet consonants.
-        let speech_cap = (speech_after_gain * 0.35).max(0.001);
-        let gate_threshold = (noise_floor * 2.0).clamp(0.001, speech_cap.min(0.12));
         let noisy = (self.signal_to_noise_db.is_finite() && self.signal_to_noise_db < 18.0)
             || (self.noise_floor_rms.is_finite() && self.noise_floor_rms > 0.004);
         let very_noisy = self.signal_to_noise_db.is_finite() && self.signal_to_noise_db < 12.0;
         let clipped = self.clipped_sample_ratio.is_finite() && self.clipped_sample_ratio >= 0.002;
+        // The gate detects instantaneous envelope amplitude, not frame RMS.
+        // Give noisy rooms a wider floor margin because isolated noise peaks can
+        // reopen a sample-level detector. The speech-relative cap still keeps
+        // the source-silence suppressor from cutting quiet consonants.
+        let speech_cap = (speech_after_gain * 0.35).max(0.001);
+        let gate_multiplier = if very_noisy || clipped {
+            3.0
+        } else if noisy {
+            2.5
+        } else {
+            2.0
+        };
+        let gate_threshold = (noise_floor * gate_multiplier).clamp(0.001, speech_cap.min(0.12));
         // Only interpret a low voiced ratio when both a pitch model and a
         // meaningful amount of speech were observed. A zero frame count means
         // the current session has no F0 model, not that the microphone failed.
@@ -109,7 +117,7 @@ impl VoiceCalibrationProfile {
         VoiceCalibrationRecommendation {
             input_gain,
             gate_threshold,
-            prefer_noise_gate: noisy && self.speech_frame_ratio >= 0.10,
+            prefer_silence_suppressor: noisy && self.speech_frame_ratio >= 0.10,
             // Keep a raw ContentVec residual for articulation. In noisy rooms a
             // slightly larger cleaned share reduces environmental consonant-like
             // artifacts without returning to the old all-denoised path.
@@ -185,7 +193,11 @@ impl VoiceCalibrationProfile {
 pub struct VoiceCalibrationRecommendation {
     pub input_gain: f32,
     pub gate_threshold: f32,
-    pub prefer_noise_gate: bool,
+    /// Whether calibration found enough steady background noise to warrant
+    /// muting converted output after sustained source silence. This is separate
+    /// from the legacy input `noise-gate` denoiser and can coexist with WebRTC,
+    /// GTCRN, and DeepFilterNet3.
+    pub prefer_silence_suppressor: bool,
     pub denoiser_content_mix: f32,
     pub denoiser_rmvpe_mix: f32,
     pub index_rate: f32,
@@ -459,7 +471,7 @@ mod tests {
         let recommendation = profile.recommendation(true);
 
         assert!(recommendation.input_gain <= 0.93);
-        assert!(recommendation.prefer_noise_gate);
+        assert!(recommendation.prefer_silence_suppressor);
         assert_eq!(recommendation.index_rate, 0.45);
         assert_eq!(recommendation.protect, 0.22);
         assert_eq!(recommendation.denoiser_rmvpe_mix, 1.0);

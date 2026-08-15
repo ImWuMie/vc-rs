@@ -82,12 +82,39 @@ impl FeatureTensor {
     /// weight back to full retrieval. The unvoiced frame itself stays fully
     /// protected, which avoids trading consonant clarity for a smoother feature
     /// boundary.
+    #[allow(dead_code)]
     pub(super) fn protect_unvoiced_frames(
         &mut self,
         original: &Self,
         natural_pitchf: &[f32],
         protect: f32,
         transition_frames: usize,
+    ) -> Result<()> {
+        self.protect_unvoiced_frames_with_adaptive(
+            original,
+            natural_pitchf,
+            protect,
+            transition_frames,
+            None,
+            0,
+        )
+    }
+
+    /// Apply Protect with optional per-ContentVec-frame confidence scales from
+    /// adaptive index retrieval. The scale is intentionally limited to
+    /// unvoiced frames: voiced transition easing already has its own temporal
+    /// rule, and multiplying it by retrieval confidence would make sustained
+    /// vowels lose too much target timbre. `repeated_frame_offset` is measured
+    /// on the final 10 ms grid and accounts for the silence-front crop applied
+    /// after ContentVec's 2x expansion.
+    pub(super) fn protect_unvoiced_frames_with_adaptive(
+        &mut self,
+        original: &Self,
+        natural_pitchf: &[f32],
+        protect: f32,
+        transition_frames: usize,
+        adaptive_protect_scales: Option<&[f32]>,
+        repeated_frame_offset: usize,
     ) -> Result<()> {
         // Upstream RVC reserves 0.5 as the disabled state. Keeping that exact
         // boundary matters for compatibility with its GUI/config presets.
@@ -122,7 +149,14 @@ impl FeatureTensor {
             .enumerate()
         {
             let retrieved_weight = if is_unvoiced(*pitchf) {
-                protect
+                let raw_frame_index = frame_index.saturating_add(repeated_frame_offset) / 2;
+                let adaptive_scale = adaptive_protect_scales
+                    .and_then(|scales| scales.get(raw_frame_index))
+                    .copied()
+                    .filter(|scale| scale.is_finite())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0);
+                protect * adaptive_scale
             } else {
                 voiced_retrieval_weight(natural_pitchf, frame_index, protect, transition_frames)
             };
@@ -284,5 +318,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(retrieved.data, vec![1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn adaptive_protect_maps_repeated_frames_to_raw_content_frames() {
+        let original = FeatureTensor {
+            data: vec![0.0; 4],
+            shape: vec![1, 4, 1],
+        };
+        let mut retrieved = FeatureTensor {
+            data: vec![1.0; 4],
+            shape: vec![1, 4, 1],
+        };
+
+        // Frames 0/1 map to raw ContentVec frame 0, while frames 2/3 map to
+        // raw frame 1. A one-frame front crop shifts that mapping by one 10 ms
+        // slot and is intentionally included in this regression test.
+        retrieved
+            .protect_unvoiced_frames_with_adaptive(
+                &original,
+                &[0.0, 0.0, 0.0, 0.0],
+                0.5 - f32::EPSILON,
+                0,
+                Some(&[0.2, 0.8]),
+                1,
+            )
+            .unwrap();
+
+        // `(frame + 1) / 2` maps [0, 1, 2, 3] to [0, 1, 1, 2]; missing raw
+        // frame 2 falls back to an unscaled Protect value of 0.5.
+        let expected = [0.1, 0.4, 0.4, 0.5];
+        for (actual, expected) in retrieved.data.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
     }
 }

@@ -32,7 +32,8 @@
 
 .PARAMETER SkipBuild
     Reuse existing target\release\vc-rs.exe and vc-gui.exe instead of building.
-    The stage, populate, and archive steps still run.
+    The stage, populate, and archive steps still run, but only after a build
+    identity stamp proves the backend/features and executable SHA-256 values.
 
 .PARAMETER Asio
     Add the opt-in ASIO audio backend to the app binaries (appends the `asio`
@@ -148,6 +149,7 @@ if (-not (Get-Command cargo-about -ErrorAction SilentlyContinue)) {
 # Sets CARGO_ENCODED_RUSTFLAGS, inherited by the cargo build below and the
 # tensorrt builder-helper build.
 . (Join-Path $repoRoot 'scripts\rustflags.ps1')
+. (Join-Path $repoRoot 'scripts\package-artifact-stamp.ps1')
 
 # Single-provider feature set per variant. `--no-default-features` drops the
 # other backend so the binary stays lean (a tensorrt build sheds ONNX Runtime).
@@ -164,6 +166,9 @@ $features = switch ($Variant) {
 if ($Asio) { $features += ',asio' }
 if ($DeepFilterNet3) { $features += ',deepfilternet3' }
 $buildFeatureArgs = @('--no-default-features', '--features', $features)
+$packageStamp = Join-Path $releaseDir '.vc-rs-app-package-build.json'
+$defaultBuilderExe = Join-Path $repoRoot 'tools\tensorrt_builder\target\release\vc-tensorrt-builder.exe'
+$builderWasSupplied = -not [string]::IsNullOrWhiteSpace($BuilderExe)
 
 Push-Location $repoRoot
 try {
@@ -176,22 +181,56 @@ try {
 
         # The TensorRT engine-builder helper is a separate ORT-free binary. Build
         # it here (unless skipped) so package-tensorrt.ps1 can bundle it.
-        if ($Variant -eq 'tensorrt' -and -not $RuntimeOnly -and -not $BuilderExe) {
-            $helper = Join-Path $repoRoot 'tools\tensorrt_builder\target\release\vc-tensorrt-builder.exe'
+        if ($Variant -eq 'tensorrt' -and -not $RuntimeOnly -and -not $builderWasSupplied) {
             Write-Host "==> cargo build --release (vc-tensorrt-builder helper)" -ForegroundColor Cyan
             cargo build --release --manifest-path (Join-Path $repoRoot 'tools\tensorrt_builder\Cargo.toml')
             if ($LASTEXITCODE -ne 0) { throw "building vc-tensorrt-builder failed (exit $LASTEXITCODE)." }
-            if (Test-Path $helper) { $BuilderExe = $helper }
+            $BuilderExe = $defaultBuilderExe
         }
     }
     else {
-        Write-Host "==> Skipping build (-SkipBuild); reusing standalone executables in $releaseDir" -ForegroundColor Yellow
+        Write-Host "==> Skipping build (-SkipBuild); validating standalone artifact identity" -ForegroundColor Yellow
     }
 
     $exe = Join-Path $releaseDir 'vc-rs.exe'
     if (-not (Test-Path $exe)) { throw "vc-rs.exe not found in $releaseDir. Run without -SkipBuild first." }
     $guiExe = Join-Path $releaseDir 'vc-gui.exe'
     if (-not (Test-Path $guiExe)) { throw "vc-gui.exe not found in $releaseDir. Run without -SkipBuild first." }
+
+    if ($Variant -eq 'tensorrt' -and -not $RuntimeOnly -and -not $BuilderExe) {
+        $BuilderExe = $defaultBuilderExe
+    }
+    $stampArtifacts = [ordered]@{
+        'vc-gui.exe' = $guiExe
+        'vc-rs.exe' = $exe
+    }
+    if ($Variant -eq 'tensorrt' -and -not $RuntimeOnly) {
+        $stampArtifacts['vc-tensorrt-builder.exe'] = $BuilderExe
+    }
+
+    if ($SkipBuild) {
+        Assert-PackageArtifactStamp `
+            -Path $packageStamp `
+            -PackageKind 'app' `
+            -Variant $Variant `
+            -Features $features `
+            -Asio ([bool]$Asio) `
+            -DeepFilterNet3 ([bool]$DeepFilterNet3) `
+            -RuntimeOnly ([bool]$RuntimeOnly) `
+            -Artifacts $stampArtifacts
+        Write-Host "==> Verified package artifact identity and SHA-256 values." -ForegroundColor Green
+    }
+    else {
+        Write-PackageArtifactStamp `
+            -Path $packageStamp `
+            -PackageKind 'app' `
+            -Variant $Variant `
+            -Features $features `
+            -Asio ([bool]$Asio) `
+            -DeepFilterNet3 ([bool]$DeepFilterNet3) `
+            -RuntimeOnly ([bool]$RuntimeOnly) `
+            -Artifacts $stampArtifacts
+    }
 
     # 2. Stage both executables together so the populate step drops the variant
     #    DLLs beside them (and so we don't pollute target\release). The folder is
@@ -259,10 +298,16 @@ try {
     #    downloader beside the executables; it fetches the shared embedder + F0 models
     #    into .\assets\ (relative to itself), which the run flags below point at.
     $license = Join-Path $repoRoot 'LICENSE'
-    if (Test-Path $license) { Copy-Item $license (Join-Path $staging 'LICENSE') -Force }
+    if (-not (Test-Path -LiteralPath $license -PathType Leaf)) {
+        throw "Required LICENSE file is missing: $license"
+    }
+    Copy-Item -LiteralPath $license -Destination (Join-Path $staging 'LICENSE') -Force
 
     $modelDl = Join-Path $repoRoot 'download-models.ps1'
-    if (Test-Path $modelDl) { Copy-Item $modelDl (Join-Path $staging 'download-models.ps1') -Force }
+    if (-not (Test-Path -LiteralPath $modelDl -PathType Leaf)) {
+        throw "Required model downloader is missing: $modelDl"
+    }
+    Copy-Item -LiteralPath $modelDl -Destination (Join-Path $staging 'download-models.ps1') -Force
 
     $reqLine = switch ($Variant) {
         'windowsml' { '  Windows App SDK Runtime 2.x installed (provides ONNX Runtime + DirectML).' }

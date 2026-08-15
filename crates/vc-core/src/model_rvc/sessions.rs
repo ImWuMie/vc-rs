@@ -20,26 +20,215 @@ use tracing::info;
 use crate::Provider;
 
 use super::feature::FeatureTensor;
-use super::native_tensorrt::{NativeContentVecEngine, NativeRmvpeEngine, NativeRvcEngine};
+use super::native_tensorrt::{
+    NativeContentVecEngine, NativeFcpeEngine, NativeRmvpeEngine, NativeRvcEngine,
+};
 #[cfg(feature = "ort")]
-use super::noise::GaussianNoise;
+use super::noise::{GaussianNoise, RVC_RND_SEED};
 use super::onnx_meta::{read_model_io, RvcIoNames};
 use super::tensorrt::*;
 
-// Fixed seed for the RVC latent-noise generator: reproducible across runs while
-// still advancing per chunk (each chunk draws fresh, independent noise like the
-// reference `torch.randn`). Spells "RVCRND" in ASCII for grep-ability.
-#[cfg(feature = "ort")]
-const RVC_RND_SEED: u64 = 0x0000_5256_4352_4e44;
+/// Validate and copy an embedder output into a reused `FeatureTensor`.
+///
+/// Model outputs are an external trust boundary.  Keep this check on the
+/// worker-side inference path so malformed exports return a normal error
+/// before `FeatureTensor::repeat_frames`/`copy_within` can observe a bad
+/// batch, channel count, data length, or non-finite value.  The success path
+/// only scans the values that are copied already and performs no allocation.
+fn validate_feature_tensor(shape: &[i64], data: &[f32], expected_channels: usize) -> Result<()> {
+    if shape.len() != 3 || shape[0] != 1 || shape[1] <= 0 {
+        bail!("embedder output must have shape [1, frames>0, channels], got {shape:?}");
+    }
+    let channels = usize::try_from(shape[2]).context("embedder output has invalid channels")?;
+    if channels != expected_channels {
+        bail!(
+            "embedder output channel count changed: got {}, expected {}",
+            channels,
+            expected_channels
+        );
+    }
+    let frames = usize::try_from(shape[1]).context("embedder output has invalid frames")?;
+    let expected_len = frames
+        .checked_mul(channels)
+        .ok_or_else(|| anyhow!("embedder output shape volume overflows usize"))?;
+    if data.len() != expected_len {
+        bail!(
+            "embedder output contains {} values, expected {} for shape {shape:?}",
+            data.len(),
+            expected_len
+        );
+    }
+    if data.iter().any(|value| !value.is_finite()) {
+        bail!("embedder output contains non-finite values");
+    }
+    Ok(())
+}
 
-/// Copies an embedder output (`shape` + `data`) into a reused `FeatureTensor`,
-/// clearing it first. Lets the extract paths fill a caller-owned buffer instead
-/// of allocating a fresh tensor each chunk.
-fn fill_feature_tensor(out: &mut FeatureTensor, shape: &[i64], data: &[f32]) {
+fn fill_feature_tensor(
+    out: &mut FeatureTensor,
+    shape: &[i64],
+    data: &[f32],
+    expected_channels: usize,
+) -> Result<()> {
+    validate_feature_tensor(shape, data, expected_channels)?;
     out.data.clear();
     out.data.extend_from_slice(data);
     out.shape.clear();
     out.shape.extend_from_slice(shape);
+    Ok(())
+}
+
+fn validate_rvc_audio_shape(shape: &[i64], data_len: Option<usize>) -> Result<()> {
+    // Community exporters differ only in whether they preserve the two
+    // singleton axes around mono audio. Treat those layouts as equivalent,
+    // while retaining an exact-volume check before any downstream copy or
+    // smoothing code can observe an inconsistent tensor.
+    let samples = match shape {
+        [samples] if *samples > 0 => *samples,
+        [batch, samples] if *batch == 1 && *samples > 0 => *samples,
+        [batch, channels, samples] if *batch == 1 && *channels == 1 && *samples > 0 => *samples,
+        _ => {
+            bail!(
+                "RVC audio output must have shape [samples>0], [1, samples>0], or [1, 1, samples>0]; got {shape:?}"
+            )
+        }
+    };
+    let samples = usize::try_from(samples).context("RVC audio output has invalid sample count")?;
+    if let Some(data_len) = data_len {
+        if data_len != samples {
+            bail!(
+                "RVC audio output contains {} values, expected {} for shape {shape:?}",
+                data_len,
+                samples
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_rvc_audio_data(data: &[f32]) -> Result<()> {
+    if data.iter().any(|sample| !sample.is_finite()) {
+        bail!("RVC audio output contains non-finite values");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod output_contract_tests {
+    use super::{
+        validate_feature_tensor, validate_rmvpe_pitch_data, validate_rmvpe_pitch_shape,
+        validate_rvc_audio_data, validate_rvc_audio_shape,
+    };
+
+    #[test]
+    fn validates_contentvec_output_shape_volume_channels_and_values() {
+        validate_feature_tensor(&[1, 2, 3], &[0.0; 6], 3).unwrap();
+
+        for (shape, data, channels) in [
+            (&[2_i64, 2, 3][..], &[0.0; 12][..], 3),
+            (&[1, 0, 3][..], &[][..], 3),
+            (&[1, 2, 4][..], &[0.0; 8][..], 3),
+            (&[1, 2, 3][..], &[0.0; 5][..], 3),
+        ] {
+            assert!(
+                validate_feature_tensor(shape, data, channels).is_err(),
+                "shape={shape:?} data_len={} channels={channels}",
+                data.len()
+            );
+        }
+        assert!(validate_feature_tensor(&[1, 1, 2], &[0.0, f32::NAN], 2).is_err());
+    }
+
+    #[test]
+    fn validates_common_rmvpe_output_layouts_and_values() {
+        for shape in [&[32_i64][..], &[1, 32][..], &[1, 32, 1][..]] {
+            validate_rmvpe_pitch_shape(shape, Some(32)).unwrap();
+        }
+        for shape in [
+            &[][..],
+            &[0_i64][..],
+            &[2, 32][..],
+            &[1, 32, 2][..],
+            &[1, 1, 32, 1][..],
+        ] {
+            assert!(
+                validate_rmvpe_pitch_shape(shape, None).is_err(),
+                "shape={shape:?}"
+            );
+        }
+        assert!(validate_rmvpe_pitch_shape(&[1, 32], Some(31)).is_err());
+        assert!(validate_rmvpe_pitch_data(&[1.0, f32::INFINITY]).is_err());
+        validate_rmvpe_pitch_data(&[0.0, 220.0]).unwrap();
+    }
+
+    #[test]
+    fn accepts_common_mono_rvc_output_layouts() {
+        for shape in [&[320_i64][..], &[1, 320][..], &[1, 1, 320][..]] {
+            validate_rvc_audio_shape(shape, Some(320)).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_rvc_output_layout_or_volume() {
+        for shape in [
+            &[][..],
+            &[0_i64][..],
+            &[2, 320][..],
+            &[1, 2, 320][..],
+            &[1, 1, 0][..],
+            &[1, 1, 1, 320][..],
+        ] {
+            assert!(
+                validate_rvc_audio_shape(shape, None).is_err(),
+                "shape={shape:?}"
+            );
+        }
+        assert!(validate_rvc_audio_shape(&[1, 320], Some(319)).is_err());
+    }
+
+    #[test]
+    fn rejects_non_finite_rvc_audio() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(validate_rvc_audio_data(&[0.0, value]).is_err());
+        }
+        validate_rvc_audio_data(&[-1.0, 0.0, 1.0]).unwrap();
+    }
+}
+
+fn validate_rmvpe_pitch_shape(shape: &[i64], data_len: Option<usize>) -> Result<()> {
+    let samples = match shape {
+        [frames] if *frames > 0 => {
+            usize::try_from(*frames).context("RMVPE frame count overflow")?
+        }
+        [batch, frames] if *batch == 1 && *frames > 0 => {
+            usize::try_from(*frames).context("RMVPE frame count overflow")?
+        }
+        [batch, frames, channels] if *batch == 1 && *channels == 1 && *frames > 0 => {
+            usize::try_from(*frames).context("RMVPE frame count overflow")?
+        }
+        _ => {
+            bail!(
+                "RMVPE pitchf output must have shape [frames], [1, frames], or [1, frames, 1]; got {shape:?}"
+            )
+        }
+    };
+    if let Some(data_len) = data_len {
+        if data_len != samples {
+            bail!(
+                "RMVPE pitchf output contains {} values, expected {} for shape {shape:?}",
+                data_len,
+                samples
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_rmvpe_pitch_data(data: &[f32]) -> Result<()> {
+    if data.iter().any(|value| !value.is_finite()) {
+        bail!("RMVPE pitchf output contains non-finite values");
+    }
+    Ok(())
 }
 
 pub(super) struct HubertEmbedderSession {
@@ -55,6 +244,7 @@ pub(super) struct HubertEmbedderSession {
     native: Option<NativeContentVecEngine>,
     pub(super) input_name: String,
     pub(super) output_name: String,
+    expected_channels: usize,
 }
 
 impl HubertEmbedderSession {
@@ -72,6 +262,12 @@ impl HubertEmbedderSession {
         let io = read_model_io(path)?;
         let input_name = io.single_input_name()?.to_string();
         let output_name = io.select_embedder_output(expected_channels, requested_output)?;
+        let expected_channels_i64 = expected_channels;
+        let expected_channels = usize::try_from(expected_channels)
+            .context("ContentVec expected channel count does not fit usize")?;
+        if expected_channels == 0 {
+            bail!("ContentVec expected channel count must be positive");
+        }
         let native = if provider.is_tensorrt() {
             let profile = tensor_rt_profile.as_ref().ok_or_else(|| {
                 anyhow!("native TensorRT ContentVec requires a fixed-shape profile")
@@ -81,7 +277,7 @@ impl HubertEmbedderSession {
                 profile,
                 input_name.as_str(),
                 output_name.as_str(),
-                expected_channels,
+                expected_channels_i64,
             )?)
         } else {
             None
@@ -122,6 +318,7 @@ impl HubertEmbedderSession {
             native,
             input_name,
             output_name,
+            expected_channels,
         })
     }
 
@@ -223,8 +420,10 @@ impl HubertEmbedderSession {
         if self.tensor_rt_binding.is_some() {
             return self.extract_with_binding(audio_16k, out);
         }
+        let expected_channels = self.expected_channels;
         if let Some(native) = self.native.as_mut() {
             native.extract_into(audio_16k, out)?;
+            validate_feature_tensor(&out.shape, &out.data, expected_channels)?;
             return Ok(());
         }
         #[cfg(feature = "ort")]
@@ -267,8 +466,7 @@ impl HubertEmbedderSession {
         if shape.len() != 3 {
             bail!("embedder output must be rank-3 [1, frames, channels], got {shape}");
         }
-        fill_feature_tensor(out, shape, data);
-        Ok(())
+        fill_feature_tensor(out, shape, data, self.expected_channels)
     }
 
     #[cfg(feature = "ort")]
@@ -320,8 +518,7 @@ impl HubertEmbedderSession {
                         format_usize_shape(&actual_shape)
                     );
                 }
-                fill_feature_tensor(out, shape, data);
-                Ok(())
+                fill_feature_tensor(out, shape, data, self.expected_channels)
             }
             HubertTensorRtBinding::CudaGraph(binding) => {
                 let h2d_us = binding
@@ -363,8 +560,7 @@ impl HubertEmbedderSession {
                         format_usize_shape(&actual_shape)
                     );
                 }
-                fill_feature_tensor(out, shape, data);
-                Ok(())
+                fill_feature_tensor(out, shape, data, self.expected_channels)
             }
         }
     }
@@ -393,8 +589,7 @@ impl RmvpePitchSession {
         tensor_rt_session_purpose: TensorRtSessionPurpose,
     ) -> Result<Self> {
         let io = read_model_io(path)?;
-        io.require_inputs(&["waveform", "threshold"])?;
-        io.require_output("pitchf")?;
+        io.validate_rmvpe_contract()?;
         let native = if provider.is_tensorrt() {
             let profile = tensor_rt_profile
                 .as_ref()
@@ -466,7 +661,9 @@ impl RmvpePitchSession {
             let value = outputs
                 .get("pitchf")
                 .ok_or_else(|| anyhow!("RMVPE output 'pitchf' not found"))?;
-            let (shape, _) = value.try_extract_tensor::<f32>()?;
+            let (shape, data) = value.try_extract_tensor::<f32>()?;
+            validate_rmvpe_pitch_shape(shape, Some(data.len()))?;
+            validate_rmvpe_pitch_data(data)?;
             Ok(shape.to_vec())
         }
         #[cfg(not(feature = "ort"))]
@@ -563,6 +760,10 @@ impl RmvpePitchSession {
         if let Some(native) = self.native.as_mut() {
             self.pitchf_scratch.clear();
             native.extract_into(audio_16k, pitch_shift, threshold, &mut self.pitchf_scratch)?;
+            if self.pitchf_scratch.is_empty() {
+                bail!("native TensorRT RMVPE returned an empty pitchf output");
+            }
+            validate_rmvpe_pitch_data(&self.pitchf_scratch)?;
             return Ok(self.pitchf_scratch.as_slice());
         }
         #[cfg(feature = "ort")]
@@ -598,7 +799,9 @@ impl RmvpePitchSession {
         let value = outputs
             .get("pitchf")
             .ok_or_else(|| anyhow!("RMVPE output 'pitchf' not found"))?;
-        let (_, data) = value.try_extract_tensor::<f32>()?;
+        let (shape, data) = value.try_extract_tensor::<f32>()?;
+        validate_rmvpe_pitch_shape(shape, Some(data.len()))?;
+        validate_rmvpe_pitch_data(data)?;
         let factor = 2.0f32.powf(pitch_shift / 12.0);
         // `data` borrows `outputs` (i.e. `self.session`); `pitchf_scratch` is a
         // disjoint field, so scaling into it here is a valid split borrow.
@@ -641,6 +844,8 @@ impl RmvpePitchSession {
                     run_start.elapsed().as_micros()
                 );
                 let (shape, data) = binding.output.try_extract_tensor::<f32>()?;
+                validate_rmvpe_pitch_shape(shape, Some(data.len()))?;
+                validate_rmvpe_pitch_data(data)?;
                 let actual_shape = i64_shape_to_usize(shape, "rmvpe output")?;
                 if actual_shape != binding.output_shape {
                     bail!(
@@ -688,6 +893,8 @@ impl RmvpePitchSession {
                     h2d_us + run_us + d2h_us
                 );
                 let (shape, data) = binding.host_output.try_extract_tensor::<f32>()?;
+                validate_rmvpe_pitch_shape(shape, Some(data.len()))?;
+                validate_rmvpe_pitch_data(data)?;
                 let actual_shape = i64_shape_to_usize(shape, "rmvpe output")?;
                 if actual_shape != binding.output_shape {
                     bail!(
@@ -708,11 +915,352 @@ impl RmvpePitchSession {
     }
 }
 
-// Per-session latent-noise generator for RVC exports that take the VITS
+/// FCPE pitch session. The model contract is intentionally kept separate from
+/// RMVPE: FCPE consumes `[1, samples, 1]` and returns `[1, frames, 1]` on a
+/// 160-sample (10 ms) grid, with no threshold input. Fixed-shape providers
+/// allocate/bind this exact window during load so inference never changes a
+/// TensorRT profile or CUDA-graph address.
+pub(super) struct FcpePitchSession {
+    #[cfg(feature = "ort")]
+    pub(super) session: Session,
+    pub(super) provider: Provider,
+    pub(super) tensor_rt_profile: Option<TensorRtSessionProfile>,
+    pub(super) tensor_rt_run_mode: TensorRtRunMode,
+    #[cfg(feature = "ort")]
+    pub(super) tensor_rt_binding: Option<HubertTensorRtBinding>,
+    native: Option<NativeFcpeEngine>,
+    output_scratch: Vec<f32>,
+}
+
+impl FcpePitchSession {
+    pub(super) fn load(
+        path: &Path,
+        provider: Provider,
+        tensor_rt_profile: Option<TensorRtSessionProfile>,
+        tensor_rt_run_mode: TensorRtRunMode,
+        tensor_rt_session_purpose: TensorRtSessionPurpose,
+    ) -> Result<Self> {
+        let io = read_model_io(path)?;
+        let contract = io.validate_fcpe_input_contract()?;
+        if let (Some(profile), Some(static_samples)) =
+            (tensor_rt_profile.as_ref(), contract.static_input_samples)
+        {
+            let profile_samples = profile
+                .fixed_input_dims("audio")?
+                .get(1)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow!("FCPE TensorRT profile audio shape must be [1, samples, 1]")
+                })?;
+            if profile_samples != static_samples {
+                bail!(
+                    "FCPE static ONNX input has {} samples but the selected fixed profile requires {}; use a matching FCPE export or a dynamic FCPE model",
+                    static_samples,
+                    profile_samples
+                );
+            }
+        }
+        let native = if provider.is_tensorrt() {
+            let profile = tensor_rt_profile
+                .as_ref()
+                .ok_or_else(|| anyhow!("native TensorRT FCPE requires a fixed-shape profile"))?;
+            Some(NativeFcpeEngine::load(path, profile)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "ort")]
+        let session = {
+            // Native TensorRT owns inference for Provider::TensorRt; retain a
+            // CPU ORT session only as a compile-time placeholder in combined
+            // builds, exactly like the existing RMVPE session.
+            let session_provider = if provider.is_tensorrt() {
+                Provider::Cpu
+            } else {
+                provider
+            };
+            load_session(
+                path,
+                session_provider,
+                ModelRole::Fcpe,
+                tensor_rt_profile.as_ref(),
+                tensor_rt_run_mode,
+                tensor_rt_session_purpose,
+            )?
+        };
+        info!(
+            "loaded FCPE f0 model: {} input=audio output=f0_hz static_input_samples={:?} static_output_frames={:?}",
+            path.display(),
+            contract.static_input_samples,
+            contract.static_output_frames
+        );
+        Ok(Self {
+            #[cfg(feature = "ort")]
+            session,
+            provider,
+            tensor_rt_profile,
+            tensor_rt_run_mode,
+            #[cfg(feature = "ort")]
+            tensor_rt_binding: None,
+            native,
+            output_scratch: Vec::new(),
+        })
+    }
+
+    pub(super) fn warmup_output_shape(&mut self, audio_samples: usize) -> Result<Vec<i64>> {
+        let input_shape = [1usize, audio_samples, 1usize];
+        validate_tensorrt_input_shape(
+            self.provider,
+            self.tensor_rt_profile.as_ref(),
+            "audio",
+            &input_shape,
+        )?;
+        if let Some(native) = self.native.as_ref() {
+            let shape = native.warmup_output_shape();
+            validate_fcpe_output_shape(&shape, audio_samples)?;
+            return Ok(shape);
+        }
+        #[cfg(feature = "ort")]
+        {
+            let audio = Tensor::from_array((input_shape, vec![0.0f32; audio_samples]))?;
+            let outputs = self.session.run(ort::inputs!["audio" => audio])?;
+            let value = outputs
+                .get("f0_hz")
+                .ok_or_else(|| anyhow!("FCPE output 'f0_hz' not found"))?;
+            let (shape, _) = value.try_extract_tensor::<f32>()?;
+            validate_fcpe_output_shape(shape, audio_samples)?;
+            Ok(shape.to_vec())
+        }
+        #[cfg(not(feature = "ort"))]
+        bail!("FCPE warmup requires the `ort` feature; native TensorRT reports its own shape")
+    }
+
+    #[cfg(feature = "ort")]
+    pub(super) fn enable_tensorrt_binding(&mut self, output_shape: &[i64]) -> Result<()> {
+        if !provider_uses_fixed_shape(self.provider) || self.native.is_some() {
+            return Ok(());
+        }
+        let profile = self
+            .tensor_rt_profile
+            .as_ref()
+            .ok_or_else(|| anyhow!("FCPE IoBinding requires a fixed-shape profile"))?;
+        let input_shape = profile.fixed_input_dims("audio")?;
+        let output_shape = i64_shape_to_usize(output_shape, "FCPE output")?;
+        let audio_samples = input_shape.get(1).copied().ok_or_else(|| {
+            anyhow!(
+                "FCPE TensorRT profile audio shape must be [1, samples, 1], got {}",
+                format_usize_shape(input_shape)
+            )
+        })?;
+        validate_fcpe_output_shape_usize(&output_shape, audio_samples)?;
+        let binding = match self.tensor_rt_run_mode {
+            TensorRtRunMode::PinnedCpu => {
+                HubertTensorRtBinding::Pinned(HubertTensorRtPinnedBinding::new(
+                    &self.session,
+                    "audio",
+                    input_shape,
+                    "f0_hz",
+                    &output_shape,
+                    profile.gpu_device_id,
+                )?)
+            }
+            TensorRtRunMode::DeviceIo | TensorRtRunMode::CudaGraph => {
+                let mut binding = HubertTensorRtGraphBinding::new(
+                    &self.session,
+                    "audio",
+                    input_shape,
+                    "f0_hz",
+                    &output_shape,
+                    None,
+                    profile.gpu_device_id,
+                )?;
+                binding.warmup_capture(
+                    &mut self.session,
+                    "f0_hz",
+                    ModelRole::Fcpe,
+                    self.provider,
+                    self.tensor_rt_run_mode.cuda_graph(),
+                )?;
+                HubertTensorRtBinding::CudaGraph(binding)
+            }
+        };
+        info!(
+            "GPU IoBinding enabled backend={} model_role={} mode={} cuda_graph={} device_io={} input=audio input_shape={} output=f0_hz output_shape={}",
+            self.provider.label(),
+            ModelRole::Fcpe.label(),
+            self.tensor_rt_run_mode.label(),
+            self.tensor_rt_run_mode.cuda_graph(),
+            self.tensor_rt_run_mode.device_io(),
+            format_usize_shape(input_shape),
+            format_usize_shape(&output_shape)
+        );
+        self.tensor_rt_binding = Some(binding);
+        Ok(())
+    }
+
+    /// Extract natural FCPE F0 into a reused buffer. NaN/non-positive values
+    /// are normalized to the shared unvoiced representation before fusion.
+    pub(super) fn extract(&mut self, audio_16k: &[f32]) -> Result<&[f32]> {
+        let input_shape = [1usize, audio_16k.len(), 1usize];
+        validate_tensorrt_input_shape(
+            self.provider,
+            self.tensor_rt_profile.as_ref(),
+            "audio",
+            &input_shape,
+        )?;
+        #[cfg(feature = "ort")]
+        if self.tensor_rt_binding.is_some() {
+            return self.extract_with_binding(audio_16k);
+        }
+        if let Some(native) = self.native.as_mut() {
+            self.output_scratch.clear();
+            native.extract_into(audio_16k, &mut self.output_scratch)?;
+            validate_fcpe_frame_count(self.output_scratch.len(), audio_16k.len())?;
+            normalize_f0_in_place(&mut self.output_scratch);
+            return Ok(self.output_scratch.as_slice());
+        }
+        #[cfg(feature = "ort")]
+        {
+            self.extract_with_session_run(audio_16k, &input_shape)
+        }
+        #[cfg(not(feature = "ort"))]
+        bail!("FCPE session inference requires the `ort` feature; this build supports native TensorRT only")
+    }
+
+    #[cfg(feature = "ort")]
+    fn extract_with_session_run(
+        &mut self,
+        audio_16k: &[f32],
+        input_shape: &[usize; 3],
+    ) -> Result<&[f32]> {
+        let input = TensorRef::from_array_view((*input_shape, audio_16k))?;
+        let run_start = Instant::now();
+        let outputs = self.session.run(ort::inputs!["audio" => input])?;
+        debug!(
+            "fcpe session.run backend={} input=audio shape={} elapsed_us={}",
+            self.provider.label(),
+            format_usize_shape(input_shape),
+            run_start.elapsed().as_micros()
+        );
+        let value = outputs
+            .get("f0_hz")
+            .ok_or_else(|| anyhow!("FCPE output 'f0_hz' not found"))?;
+        let (shape, data) = value.try_extract_tensor::<f32>()?;
+        validate_fcpe_output_shape(shape, audio_16k.len())?;
+        self.output_scratch.clear();
+        self.output_scratch.extend_from_slice(data);
+        normalize_f0_in_place(&mut self.output_scratch);
+        Ok(self.output_scratch.as_slice())
+    }
+
+    #[cfg(feature = "ort")]
+    fn extract_with_binding(&mut self, audio_16k: &[f32]) -> Result<&[f32]> {
+        let binding = self
+            .tensor_rt_binding
+            .as_mut()
+            .ok_or_else(|| anyhow!("TensorRT FCPE IoBinding is not initialized"))?;
+        match binding {
+            HubertTensorRtBinding::Pinned(binding) => {
+                copy_f32_tensor(&mut binding.audio, audio_16k, "audio")?;
+                binding
+                    .binding
+                    .bind_input("audio", &binding.audio)
+                    .context("failed to bind TensorRT FCPE input 'audio'")?;
+                let run_start = Instant::now();
+                let _outputs = self.session.run_binding(&binding.binding)?;
+                binding
+                    .binding
+                    .synchronize_outputs()
+                    .context("failed to synchronize TensorRT FCPE bound output")?;
+                let (shape, data) = binding.output.try_extract_tensor::<f32>()?;
+                validate_fcpe_output_shape(shape, audio_16k.len())?;
+                debug!(
+                    "fcpe session.run_binding backend={} cuda_graph=false input_shape={} output_shape={} elapsed_us={}",
+                    self.provider.label(),
+                    format_usize_shape(&binding.input_shape),
+                    format_usize_shape(&binding.output_shape),
+                    run_start.elapsed().as_micros()
+                );
+                self.output_scratch.clear();
+                self.output_scratch.extend_from_slice(data);
+                normalize_f0_in_place(&mut self.output_scratch);
+                Ok(self.output_scratch.as_slice())
+            }
+            HubertTensorRtBinding::CudaGraph(binding) => {
+                let h2d_us = binding
+                    .copy_audio_to_device_if_owned(audio_16k, "audio")?
+                    .unwrap_or(0);
+                let run_start = Instant::now();
+                let _outputs = self.session.run_binding(&binding.binding)?;
+                let run_us = run_start.elapsed().as_micros();
+                copy_f32_tensor_to_host(&binding.device_output, &mut binding.host_output, "f0_hz")?;
+                let (shape, data) = binding.host_output.try_extract_tensor::<f32>()?;
+                validate_fcpe_output_shape(shape, audio_16k.len())?;
+                debug!(
+                    "fcpe session.run_binding(device_io=true) backend={} cuda_graph={} input_shape={} output_shape={} h2d_us={} run_us={}",
+                    self.provider.label(),
+                    self.tensor_rt_run_mode.cuda_graph(),
+                    format_usize_shape(&binding.input_shape),
+                    format_usize_shape(&binding.output_shape),
+                    h2d_us,
+                    run_us
+                );
+                self.output_scratch.clear();
+                self.output_scratch.extend_from_slice(data);
+                normalize_f0_in_place(&mut self.output_scratch);
+                Ok(self.output_scratch.as_slice())
+            }
+        }
+    }
+}
+
+fn normalize_f0_in_place(values: &mut [f32]) {
+    for value in values {
+        if !value.is_finite() || *value <= 0.0 {
+            *value = 0.0;
+        }
+    }
+}
+
+fn validate_fcpe_frame_count(frames: usize, audio_samples: usize) -> Result<()> {
+    let expected_frames = audio_samples
+        .checked_div(160)
+        .and_then(|frames| frames.checked_add(1))
+        .ok_or_else(|| anyhow!("FCPE input sample count is too large: {audio_samples}"))?;
+    if frames != expected_frames {
+        bail!(
+            "FCPE output frame count {frames} does not match {audio_samples} input samples; the 160-sample contract requires {expected_frames}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_fcpe_output_shape(shape: &[i64], audio_samples: usize) -> Result<()> {
+    if shape.len() != 3 || shape[0] != 1 || shape[2] != 1 {
+        bail!("FCPE output must have shape [1, frames, 1], got {shape:?}");
+    }
+    let frames = usize::try_from(shape[1]).with_context(|| {
+        format!(
+            "FCPE output frame dimension is negative or too large: {}",
+            shape[1]
+        )
+    })?;
+    validate_fcpe_frame_count(frames, audio_samples)
+}
+
+fn validate_fcpe_output_shape_usize(shape: &[usize], audio_samples: usize) -> Result<()> {
+    if shape.len() != 3 || shape[0] != 1 || shape[2] != 1 {
+        bail!(
+            "FCPE output must have shape [1, frames, 1], got {}",
+            format_usize_shape(shape)
+        );
+    }
+    validate_fcpe_frame_count(shape[1], audio_samples)
+}
+
+// Per-session latent-noise state for RVC exports that take the VITS
 // reparameterization noise `z` (`rnd`) as a generator input. Present only when
-// the model exposes that input; the generator and scratch buffer are reused
-// across chunks so the realtime path never allocates a fresh noise Vec, and the
-// generator advances per chunk so successive chunks draw independent noise.
+// the model exposes that input. The scratch buffer is reused across chunks, and
+// the counter-based generator keys every value to the shared absolute timeline.
 #[cfg(feature = "ort")]
 struct RvcRndState {
     name: String,
@@ -739,15 +1287,20 @@ impl RvcRndState {
         }))
     }
 
-    /// Refresh the reused scratch with fresh `N(0, 1)` noise shaped
+    /// Refresh the reused scratch with timeline-stable `N(0, 1)` noise shaped
     /// `[1, channels, frame_len]` and return that shape.
-    fn refresh(&mut self, frame_len: usize) -> Result<[usize; 3]> {
+    fn refresh(&mut self, frame_len: usize, window_start_frame: i64) -> Result<[usize; 3]> {
         let len = self
             .channels
             .checked_mul(frame_len)
             .context("RVC rnd input length overflow")?;
         self.scratch.resize(len, 0.0);
-        self.generator.fill(&mut self.scratch);
+        self.generator.fill_window(
+            &mut self.scratch,
+            self.channels,
+            frame_len,
+            window_start_frame,
+        );
         Ok([1, self.channels, frame_len])
     }
 }
@@ -1036,7 +1589,9 @@ impl RvcModelSession {
             let value = outputs
                 .get(self.io_names.audio.as_str())
                 .ok_or_else(|| anyhow!("RVC output 'audio' not found"))?;
-            let (shape, _) = value.try_extract_tensor::<f32>()?;
+            let (shape, data) = value.try_extract_tensor::<f32>()?;
+            validate_rvc_audio_shape(shape, Some(data.len()))?;
+            validate_rvc_audio_data(data)?;
             Ok(shape.to_vec())
         }
     }
@@ -1164,6 +1719,7 @@ impl RvcModelSession {
         pitch: &[i64],
         pitchf: &[f32],
         speaker_id: i64,
+        window_start_frame: i64,
         out: &mut Vec<f32>,
     ) -> Result<()> {
         let feats_shape_usize = i64_shape_to_usize(feats_shape, "feats")?;
@@ -1187,13 +1743,32 @@ impl RvcModelSession {
             &pitch_shape,
         )?;
         if let Some(native) = self.native_rvc.as_mut() {
-            native.infer_into(feats, pitch, pitchf, speaker_id, out)?;
+            let expected_output_len = native.output_len();
+            native.infer_into(feats, pitch, pitchf, speaker_id, window_start_frame, out)?;
+            if out.len() != expected_output_len {
+                bail!(
+                    "native TensorRT RVC audio output has {} values; expected {}",
+                    out.len(),
+                    expected_output_len
+                );
+            }
+            if out.iter().any(|sample| !sample.is_finite()) {
+                bail!("native TensorRT RVC audio output contains non-finite values");
+            }
             return Ok(());
         }
         #[cfg(feature = "ort")]
         {
             if self.tensor_rt_binding.is_some() {
-                return self.infer_with_binding(feats, frame_len, pitch, pitchf, speaker_id, out);
+                return self.infer_with_binding(
+                    feats,
+                    frame_len,
+                    pitch,
+                    pitchf,
+                    speaker_id,
+                    window_start_frame,
+                    out,
+                );
             }
             if self.provider == Provider::Cpu
                 && self
@@ -1209,6 +1784,7 @@ impl RvcModelSession {
                     pitch,
                     pitchf,
                     speaker_id,
+                    window_start_frame,
                     &pitch_shape,
                     out,
                 );
@@ -1221,6 +1797,7 @@ impl RvcModelSession {
                 pitch,
                 pitchf,
                 speaker_id,
+                window_start_frame,
                 &pitch_shape,
                 out,
             )
@@ -1245,6 +1822,7 @@ impl RvcModelSession {
         pitch: &[i64],
         pitchf: &[f32],
         speaker_id: i64,
+        window_start_frame: i64,
         pitch_shape: &[usize; 2],
         out: &mut Vec<f32>,
     ) -> Result<()> {
@@ -1253,7 +1831,7 @@ impl RvcModelSession {
         // Refresh latent noise first (a self-disjoint mutable borrow of `rnd`),
         // then borrow the scratch immutably alongside the session below.
         let rnd_shape = match self.rnd.as_mut() {
-            Some(state) => Some(state.refresh(frame_len)?),
+            Some(state) => Some(state.refresh(frame_len, window_start_frame)?),
             None => None,
         };
         let feats = TensorRef::from_array_view((feats_shape, feats))?;
@@ -1305,6 +1883,8 @@ impl RvcModelSession {
                 .get(names.audio.as_str())
                 .ok_or_else(|| anyhow!("RVC output 'audio' not found"))?;
             let (shape, data) = value.try_extract_tensor::<f32>()?;
+            validate_rvc_audio_shape(shape, Some(data.len()))?;
+            validate_rvc_audio_data(data)?;
             let output_shape = i64_shape_to_usize(shape, "rvc output")?;
             out.clear();
             out.extend_from_slice(data);
@@ -1327,6 +1907,7 @@ impl RvcModelSession {
         pitch: &[i64],
         pitchf: &[f32],
         speaker_id: i64,
+        window_start_frame: i64,
         pitch_shape: &[usize; 2],
         out: &mut Vec<f32>,
     ) -> Result<()> {
@@ -1335,7 +1916,7 @@ impl RvcModelSession {
         // Refresh latent noise first (self-disjoint mutable borrow of `rnd`),
         // then bind the scratch alongside the other inputs below.
         let rnd_shape = match self.rnd.as_mut() {
-            Some(state) => Some(state.refresh(frame_len)?),
+            Some(state) => Some(state.refresh(frame_len, window_start_frame)?),
             None => None,
         };
         let feats = TensorRef::from_array_view((feats_shape, feats))?;
@@ -1410,6 +1991,8 @@ impl RvcModelSession {
             run_start.elapsed().as_micros()
         );
         let (shape, data) = binding.output.try_extract_tensor::<f32>()?;
+        validate_rvc_audio_shape(shape, Some(data.len()))?;
+        validate_rvc_audio_data(data)?;
         let actual_shape = i64_shape_to_usize(shape, "rvc output")?;
         if actual_shape != binding.output_shape {
             bail!(
@@ -1424,6 +2007,7 @@ impl RvcModelSession {
     }
 
     #[cfg(feature = "ort")]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn infer_with_binding(
         &mut self,
         feats: &[f32],
@@ -1431,6 +2015,7 @@ impl RvcModelSession {
         pitch: &[i64],
         pitchf: &[f32],
         speaker_id: i64,
+        window_start_frame: i64,
         out: &mut Vec<f32>,
     ) -> Result<()> {
         let binding = self
@@ -1460,7 +2045,7 @@ impl RvcModelSession {
                     .binding
                     .bind_input(binding.names.pitchf.as_str(), &binding.pitchf)
                     .context("failed to bind TensorRT RVC input 'pitchf'")?;
-                // Latent noise: stage fresh N(0,1) into the pinned buffer and
+                // Stage absolute-timeline noise into the pinned buffer and
                 // re-bind it (the pinned path copies inputs at bind time).
                 if let Some(rnd_tensor) = binding.rnd.as_mut() {
                     let rnd_name = binding
@@ -1473,7 +2058,7 @@ impl RvcModelSession {
                     let state = rnd_state
                         .take()
                         .ok_or_else(|| anyhow!("RVC rnd noise generator is not initialized"))?;
-                    state.refresh(frame_len)?;
+                    state.refresh(frame_len, window_start_frame)?;
                     copy_f32_tensor(rnd_tensor, &state.scratch, "rnd")?;
                     binding
                         .binding
@@ -1495,6 +2080,8 @@ impl RvcModelSession {
                     run_start.elapsed().as_micros()
                 );
                 let (shape, data) = binding.output.try_extract_tensor::<f32>()?;
+                validate_rvc_audio_shape(shape, Some(data.len()))?;
+                validate_rvc_audio_data(data)?;
                 let actual_shape = i64_shape_to_usize(shape, "rvc output")?;
                 if actual_shape != binding.output_shape {
                     bail!(
@@ -1519,16 +2106,16 @@ impl RvcModelSession {
                     &mut binding.device_pitchf,
                     "pitchf",
                 )?;
-                // Latent noise: stage fresh N(0,1) into host_rnd, then copy into
-                // the already-bound device_rnd (its address stays stable for the
-                // captured graph; only its contents change).
+                // Stage absolute-timeline noise into host_rnd, then copy into the
+                // already-bound device_rnd. Its address stays stable for the
+                // captured graph; only its contents change.
                 if let (Some(host_rnd), Some(device_rnd)) =
                     (binding.host_rnd.as_mut(), binding.device_rnd.as_mut())
                 {
                     let state = rnd_state
                         .take()
                         .ok_or_else(|| anyhow!("RVC rnd noise generator is not initialized"))?;
-                    state.refresh(frame_len)?;
+                    state.refresh(frame_len, window_start_frame)?;
                     copy_f32_tensor(host_rnd, &state.scratch, "rnd")?;
                     copy_f32_tensor_to_device(host_rnd, device_rnd, "rnd")?;
                 }
@@ -1553,6 +2140,8 @@ impl RvcModelSession {
                     h2d_us + run_us + d2h_us
                 );
                 let (shape, data) = binding.host_output.try_extract_tensor::<f32>()?;
+                validate_rvc_audio_shape(shape, Some(data.len()))?;
+                validate_rvc_audio_data(data)?;
                 let actual_shape = i64_shape_to_usize(shape, "rvc output")?;
                 if actual_shape != binding.output_shape {
                     bail!(
@@ -1952,5 +2541,120 @@ pub(super) fn describe_value_type(value_type: &ValueType) -> String {
     match value_type {
         ValueType::Tensor { ty, shape, .. } => format!("{ty:?} {shape}"),
         other => format!("{other:?}"),
+    }
+}
+
+// This is an opt-in integration check because FCPE weights are intentionally
+// not shipped with vc-rs.  Run it with
+// `VC_RS_FCPE_MODEL=<path> cargo test -p vc-core --features ort fcpe_ort_session`
+// to exercise the real Rust session (rather than only the provider-neutral
+// protobuf contract tests) at several dynamic input lengths.  Keeping the
+// model external also prevents a developer-local path or a 43 MB weight file
+// from entering a distributable crate.
+#[cfg(all(test, feature = "ort"))]
+mod fcpe_ort_session_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn fcpe_ort_session_runs_multiple_audio_lengths_when_model_is_provided() {
+        let Some(path) = std::env::var_os("VC_RS_FCPE_MODEL").map(PathBuf::from) else {
+            eprintln!("skip FCPE ORT integration test: VC_RS_FCPE_MODEL is unset");
+            return;
+        };
+        assert!(
+            path.is_file(),
+            "FCPE model does not exist: {}",
+            path.display()
+        );
+
+        let mut session = FcpePitchSession::load(
+            &path,
+            Provider::Cpu,
+            None,
+            TensorRtRunMode::PinnedCpu,
+            TensorRtSessionPurpose::Main,
+        )
+        .expect("FCPE ORT session should load");
+
+        for samples in [1_600usize, 4_960, 10_080, 15_200, 32_000] {
+            let audio: Vec<f32> = (0..samples)
+                .map(|index| (std::f32::consts::TAU * 220.0 * index as f32 / 16_000.0).sin() * 0.15)
+                .collect();
+            let f0 = session
+                .extract(&audio)
+                .expect("FCPE ORT inference should accept a dynamic length");
+            assert_eq!(f0.len(), samples / 160 + 1, "samples={samples}");
+            assert!(
+                f0.iter().all(|value| value.is_finite() && *value >= 0.0),
+                "FCPE output contains an invalid value for samples={samples}"
+            );
+        }
+    }
+}
+
+// Native TensorRT is likewise opt-in: the test builds/loads one fixed engine
+// per requested FCPE window through the same Rust wrapper used by the runtime,
+// then runs inference.  It intentionally does not share an engine between
+// lengths; fixed buffers and CUDA Graph capture are part of the contract.
+#[cfg(all(test, native_tensorrt, windows))]
+mod fcpe_native_tensorrt_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn native_fcpe_session_runs_each_requested_fixed_profile() {
+        let Some(path) = std::env::var_os("VC_RS_FCPE_MODEL").map(PathBuf::from) else {
+            eprintln!("skip native FCPE integration test: VC_RS_FCPE_MODEL is unset");
+            return;
+        };
+        assert!(
+            path.is_file(),
+            "FCPE model does not exist: {}",
+            path.display()
+        );
+
+        let samples = std::env::var("VC_RS_FCPE_SAMPLES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|part| {
+                        part.trim()
+                            .parse::<usize>()
+                            .expect("valid FCPE sample length")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![4_960, 10_080]);
+
+        for audio_samples in samples {
+            let model_cache_key =
+                tensor_rt_model_cache_key(&path).expect("FCPE model cache key should be readable");
+            let profile = TensorRtSessionProfile::new(
+                ModelRole::Fcpe,
+                vec![TensorRtInputShape {
+                    name: "audio".to_string(),
+                    dims: vec![1, audio_samples, 1],
+                }],
+            )
+            .with_optional_model_cache_key(Some(model_cache_key));
+            let mut session = FcpePitchSession::load(
+                &path,
+                Provider::TensorRt,
+                Some(profile),
+                TensorRtRunMode::PinnedCpu,
+                TensorRtSessionPurpose::Main,
+            )
+            .expect("native FCPE session should load");
+            let audio: Vec<f32> = (0..audio_samples)
+                .map(|index| (std::f32::consts::TAU * 220.0 * index as f32 / 16_000.0).sin() * 0.15)
+                .collect();
+            let f0 = session
+                .extract(&audio)
+                .expect("native FCPE inference should succeed");
+            assert_eq!(f0.len(), audio_samples / 160 + 1, "samples={audio_samples}");
+            assert!(f0.iter().all(|value| value.is_finite() && *value >= 0.0));
+        }
     }
 }

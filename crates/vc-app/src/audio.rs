@@ -277,45 +277,91 @@ impl RealtimeAudio {
         &self.monitor_name
     }
 
+    /// Build an input stream with an internally-owned lifecycle flag.
+    ///
+    /// Keep this compatibility wrapper for callers that do not need controller
+    /// error propagation; realtime sessions should use
+    /// [`Self::build_input_stream_with_running`] so device failures can stop the
+    /// shared session state without logging from the audio callback.
     pub fn build_input_stream<F>(&self, on_samples: F) -> Result<AudioStream>
+    where
+        F: FnMut(&[f32]) + Send + 'static,
+    {
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        self.build_input_stream_with_running(&running, on_samples)
+    }
+
+    pub fn build_input_stream_with_running<F>(
+        &self,
+        running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        on_samples: F,
+    ) -> Result<AudioStream>
     where
         F: FnMut(&[f32]) + Send + 'static,
     {
         match &self.input {
             InputEndpoint::Cpal { device, config } => Ok(AudioStream::Cpal(
-                build_cpal_input_stream(device, config, on_samples)?,
+                build_cpal_input_stream(device, config, running, on_samples)?,
             )),
             #[cfg(windows)]
             InputEndpoint::Wasapi(config) => Ok(AudioStream::Wasapi(
-                wasapi_audio::build_input_stream(config.clone(), on_samples)?,
+                wasapi_audio::build_input_stream(config.clone(), running, on_samples)?,
             )),
         }
     }
 
+    /// Compatibility wrapper; realtime sessions should use
+    /// [`Self::build_output_stream_with_running`].
     pub fn build_output_stream<F>(&self, fill: F) -> Result<AudioStream>
+    where
+        F: FnMut(&mut [f32]) + Send + 'static,
+    {
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        self.build_output_stream_with_running(&running, fill)
+    }
+
+    pub fn build_output_stream_with_running<F>(
+        &self,
+        running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fill: F,
+    ) -> Result<AudioStream>
     where
         F: FnMut(&mut [f32]) + Send + 'static,
     {
         match &self.output {
             OutputEndpoint::Cpal { device, config } => Ok(AudioStream::Cpal(
-                build_cpal_output_stream(device, config, fill)?,
+                build_cpal_output_stream(device, config, running, fill)?,
             )),
             #[cfg(windows)]
             OutputEndpoint::Wasapi(config) => Ok(AudioStream::Wasapi(
-                wasapi_audio::build_output_stream(config.clone(), fill)?,
+                wasapi_audio::build_output_stream(config.clone(), running, fill)?,
             )),
         }
     }
 
     /// Builds the monitor output stream. The monitor endpoint is always the
     /// shared cpal path, so a `Wasapi` endpoint here is a bug.
+    /// Compatibility wrapper; realtime sessions should use
+    /// [`Self::build_monitor_stream_with_running`].
     pub fn build_monitor_stream<F>(&self, fill: F) -> Result<AudioStream>
+    where
+        F: FnMut(&mut [f32]) + Send + 'static,
+    {
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        self.build_monitor_stream_with_running(&running, fill)
+    }
+
+    pub fn build_monitor_stream_with_running<F>(
+        &self,
+        running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fill: F,
+    ) -> Result<AudioStream>
     where
         F: FnMut(&mut [f32]) + Send + 'static,
     {
         match &self.monitor {
             Some(OutputEndpoint::Cpal { device, config }) => Ok(AudioStream::Cpal(
-                build_cpal_output_stream(device, config, fill)?,
+                build_cpal_output_stream(device, config, running, fill)?,
             )),
             #[cfg(windows)]
             Some(OutputEndpoint::Wasapi(_)) => {
@@ -440,15 +486,21 @@ fn host_label(host: AudioHost, exclusive: bool) -> &'static str {
 }
 
 pub fn input_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::Device> {
-    find_device(host.input_devices()?, name)
-        .or_else(|| host.default_input_device())
-        .ok_or_else(|| anyhow!("input device not found"))
+    if let Some(requested) = name {
+        return find_device(host.input_devices()?, Some(requested))
+            .ok_or_else(|| anyhow!("requested input device not found: {requested}"));
+    }
+    host.default_input_device()
+        .ok_or_else(|| anyhow!("default input device not found"))
 }
 
 pub fn output_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::Device> {
-    find_device(host.output_devices()?, name)
-        .or_else(|| host.default_output_device())
-        .ok_or_else(|| anyhow!("output device not found"))
+    if let Some(requested) = name {
+        return find_device(host.output_devices()?, Some(requested))
+            .ok_or_else(|| anyhow!("requested output device not found: {requested}"));
+    }
+    host.default_output_device()
+        .ok_or_else(|| anyhow!("default output device not found"))
 }
 
 pub fn cpal_input_names(host: AudioHost) -> Result<Vec<String>> {
@@ -554,6 +606,7 @@ where
 fn build_cpal_input_stream<F>(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
+    running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     mut on_samples: F,
 ) -> Result<cpal::Stream>
 where
@@ -564,7 +617,13 @@ where
     // chunk size below is too, so every chunk holds whole frames.
     let channels = config.channels().max(1) as usize;
     let frames = cpal_scratch_frames(config);
-    let err_fn = |err| tracing::warn!("input stream error: {err}");
+    // CPAL may invoke the error callback on its real-time thread.  Only publish
+    // an atomic stop signal here; the controller thread observes it and reports
+    // the failure, keeping logging/allocation/blocking off the callback path.
+    let error_running = std::sync::Arc::clone(running);
+    let err_fn = move |_err| {
+        error_running.store(false, std::sync::atomic::Ordering::Release);
+    };
     match config.sample_format() {
         cpal::SampleFormat::F32 if channels == 1 => device.build_input_stream(
             stream_config,
@@ -655,6 +714,7 @@ where
 fn build_cpal_output_stream<F>(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
+    running: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     mut fill: F,
 ) -> Result<cpal::Stream>
 where
@@ -664,7 +724,12 @@ where
     // Same framing guarantee as the input path: chunks hold whole frames.
     let channels = config.channels().max(1) as usize;
     let frames = cpal_scratch_frames(config);
-    let err_fn = |err| tracing::warn!("output stream error: {err}");
+    // See the input callback above: this closure must stay allocation-free and
+    // non-blocking because some CPAL backends run it on the audio thread.
+    let error_running = std::sync::Arc::clone(running);
+    let err_fn = move |_err| {
+        error_running.store(false, std::sync::atomic::Ordering::Release);
+    };
     match config.sample_format() {
         cpal::SampleFormat::F32 if channels == 1 => device.build_output_stream(
             stream_config,

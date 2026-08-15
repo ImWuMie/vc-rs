@@ -37,12 +37,14 @@ range required by DAW parameter automation and lets the shared core clamp
 smaller models.
 
 The shared conversion pipeline now defaults RMVPE to 0.03 and provides an
-explicit F0-continuity mode. Continuity linearly fills internal unvoiced runs
-bounded by valid F0 on both sides; it deliberately keeps leading and trailing
-runs unvoiced because a streaming window cannot safely distinguish an edge
-dropout from breath, silence, or a consonant. This is slightly more conservative
-than MXGF's `numpy.interp`, which also extends the nearest voiced value over
-both edges.
+explicit F0-continuity mode. Continuity repairs one/two-frame internal dropouts;
+three-to-five-frame gaps additionally require stable voiced support on both
+sides, while longer and edge runs stay unvoiced. This is intentionally more
+conservative than MXGF's `numpy.interp`: an unbounded rolling-window fill can
+turn a pause, breath, or clear consonant into synthetic voiced sound. When F0
+stabilization is enabled, a conservative local waveform-periodicity check also
+clears RMVPE voiced frames strongly contradicted by the 16 kHz signal. It is not
+an RMVPE posterior probability.
 
 GUI, CLI, WAV conversion, and VST3 all configure this same core
 post-processor. The standalone GUI also has a high-quality preset using the
@@ -57,10 +59,18 @@ use an `added_IVF*_Flat_*.index` file that matches the selected ONNX generator
 standard FAISS IVF-Flat layout emitted by RVC training, searches eight nearest
 entries, and uses the upstream inverse-squared-distance weighting. `index_rate`
 is a live 0..1 blend control; `protect` is the standard 0..0.5 unvoiced-frame
-consonant safeguard (`0.33` default; `0.5` off). Retrieval and protection run on
-the existing conversion worker with reusable buffers, never on a device or DAW
-audio callback. Locally supplied real v1 and v2 RVC indexes were parsed during
-validation, but their paths and contents are not embedded or distributed.
+consonant safeguard (`0.33` default; `0.5` off). vc-rs scales both controls per
+frame using retrieval quality, voicing, a natural-F0 temporal-reliability proxy, and
+ContentVec/F0 boundary evidence. That proxy is derived from natural-F0 support
+and pitch continuity; it is not an RMVPE posterior probability or confidence
+output. Schmitt-style boundary hysteresis and asymmetric smoothing reduce the
+controls quickly on weak evidence and restore them more slowly across frames.
+The state is rebuilt deterministically for every rolling context window rather
+than persisted as a cross-chunk EMA, because those windows replay overlapping
+history. Retrieval, protection, and this adaptation run in the shared conversion
+worker with reusable buffers, never in a device or DAW audio callback. Locally
+supplied real v1 and v2 RVC indexes were parsed during validation, but their
+paths and contents are not embedded or distributed.
 
 vc-rs additionally offers an optional `protect_transition_ms` control (default
 `0`, maximum `100`). This is not copied from or attributed to MXGF: it smooths
@@ -71,15 +81,17 @@ default at `0` until users opt in.
 
 The denoiser path is another vc-rs extension, not MXGF's private model code. For
 Gate, RNNoise, WebRTC, and DeepFilterNet3, the worker keeps a gain-scaled raw
-16 kHz branch alongside the cleaned branch. `denoiser_content_mix=0.25` blends
-those branches for ContentVec to retain fricatives and breath detail, while
-`denoiser_rmvpe_mix=1.0` (the compatibility default) sends the fully cleaned
-branch to RMVPE. Both controls accept `0..=1`; setting the RMVPE control to `0`
-uses the delay-aligned raw branch, and intermediate values linearly blend it
-with the cleaned pitch signal. RNNoise, WebRTC, GTCRN, and DeepFilterNet3 have
-fixed delay, so the raw branches pass through matching preallocated delay before
-mixing instead of combining delayed and undelayed audio. All buffers and
-denoiser work belong to the conversion worker, never the audio callback.
+16 kHz branch alongside the cleaned branch. `denoiser_content_mix=0.25` and
+`denoiser_rmvpe_mix=1.0` are base cleaned shares. A 10 ms worker-side detector
+uses aligned energy rise, denoiser residual, zero crossings, and first-difference
+shape to retain more raw ContentVec during a likely speech transient, then
+smoothly recovers to the base. RMVPE receives only a much smaller reduction on
+low-zero-crossing voiced onsets, so raw fricative noise is not reintroduced as
+pitch evidence. Both controls accept `0..=1`, with zero remaining exact raw
+input. RNNoise, WebRTC, GTCRN, and DeepFilterNet3 have fixed delay, so the raw
+branches pass through matching preallocated delay before analysis/mixing instead
+of combining delayed and undelayed audio. All state, buffers, and denoiser work
+belong to the conversion worker, never the audio callback.
 
 The initializer parser reads only protobuf names and dimensions. It skips raw
 weight bytes, runs only on the load/inspect path, and does not add any model

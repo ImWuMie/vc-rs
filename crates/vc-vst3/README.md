@@ -29,7 +29,8 @@ host process() ─┬─ downmix L/R → mono ─→ input ring ─┐
 Open the plugin's editor in your DAW ([`editor.rs`](src/editor.rs), egui). From
 there you can:
 
-- **Browse** for the RVC model, embedder, and F0 (RMVPE) `.onnx` files
+- **Browse** for the RVC model, embedder, and the RMVPE and/or FCPE `.onnx`
+  required by the selected F0 mode
 - choose the **backend** — the GUI lists only the providers this package was
   built with: the Windows ML package offers `windowsml` (auto), `windowsml-directml`,
   and `cpu`; the TensorRT package offers `tensorrt`
@@ -97,7 +98,8 @@ Run `download-models.ps1 -DeepFilterNet3` after unpacking and select the externa
 archive in the plugin editor; pretrained DFN3 weights are never distributed.
 
 Variant-specific options are forwarded to the populate script. Useful flags:
-`-OutDir <dir>` (default `dist\`), `-SkipBuild` (reuse `target\bundled`),
+`-OutDir <dir>` (default `dist\`), `-SkipBuild` (reuse `target\bundled` only
+after its backend/feature identity stamp and plugin/helper SHA-256 values match),
 `-NoZip` (populate only), `-Clean` (drop stale bundles first). For the `tensorrt`
 variant set up the matching CUDA/TensorRT toolchain on `PATH` first (e.g.
 dot-source [`scripts\activate.ps1`](../../scripts/activate.ps1)) — the script

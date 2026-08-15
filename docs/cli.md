@@ -106,6 +106,50 @@ The MXGF `f0G...pth` / `f0D...pth` files are **training base checkpoints**, not
 target voice models, so the command rejects them. Train a voice from the base
 first, then export the resulting compact `assets\weights\*.pth` checkpoint.
 
+For native TensorRT, export a model dedicated to the exact RVC generator frame
+count derived from the intended runtime chunk/context settings. Legacy RVC
+WebUI exporters trace attention at one Python frame count and then only label
+the public ONNX axes dynamic; TensorRT cannot safely rebuild those internal
+reshapes for another fixed profile. When the vc-rs profile log or a load error
+reports 99 required frames, export a fully static six-input ONNX like this:
+
+```powershell
+.\vc-rs.exe export-pth `
+    --model .\voice.pth `
+    --output .\voice-frames-99.onnx `
+    --rvc-root D:\path\to\your\trusted-rvc-installation `
+    --python D:\path\to\your\trusted-rvc-installation\runtime\python.exe `
+    --frames 99 `
+    --trust-rvc-root
+```
+
+`--frames` traces `phone`, `phone_lengths`, `pitch`, `pitchf`, `ds`, and `rnd`
+with static time dimensions and keeps the integer inputs as Int64. The resulting
+model is valid only for that frame count. Changing `--chunk-ms`, conversion
+context, model sample rate, or another setting that changes the reported RVC
+profile requires another fixed-frame export. Omitting `--frames` preserves the
+generic dynamic export used by non-TensorRT workflows.
+
+For a genuinely dynamic RVC ONNX, `run` and `wav` also accept
+`--rvc-frames <T>` to select one dedicated fixed runtime profile without
+re-exporting the model:
+
+```powershell
+.\vc-rs.exe run ... --provider tensorrt --rvc-frames 200
+```
+
+This is a load-time setting. vc-rs converts it to a larger fixed ContentVec
+left-context window, then creates distinct ContentVec/selected-F0/RVC engines
+and a CUDA Graph for that exact shape. The audio callback never changes shapes
+or builds engines. Omit the option for the normal timing-derived `auto` T.
+
+ONNX dynamic dimensions are symbols, not a numeric min/max declaration. For
+the current ContentVec/RVC time grid, a dynamic model accepts an even T not
+smaller than the automatic T required by `--chunk-ms` and conversion context;
+the application caps manually selected T at 2048. A static ONNX accepts only
+its exported T. Increasing T adds left history and GPU work but does not change
+the output chunk cadence; reduce it only by reducing the timing context first.
+
 ### Real-time conversion
 
 ```powershell
@@ -114,9 +158,39 @@ first, then export the resulting compact `assets\weights\*.pth` checkpoint.
     --f0-model .\assets\rmvpe.onnx `
     --index-path <matching-added-IVF.index> --index-rate 0.65 --protect 0.33 --protect-transition-ms 20 `
     --input "Microphone" --output "Speakers" `
-    --chunk-ms 500 --extra-convert-ms 100 `
+    --chunk-ms 500 --extra-convert-ms 100 --dynamic-tuning auto `
     --provider windowsml --speaker-id 0
 ```
+
+RMVPE remains the default F0 estimator. FCPE can run by itself without loading
+an RMVPE model:
+
+```powershell
+.\vc-rs.exe run --model <your-rvc-model>.onnx `
+    --embedder .\assets\content_vec_500.onnx `
+    --f0-mode fcpe --fcpe-model .\assets\fcpe.onnx `
+    --provider tensorrt
+```
+
+Hybrid mode loads both estimators and combines them on the same 10 ms frame
+grid:
+
+```powershell
+.\vc-rs.exe run --model <your-rvc-model>.onnx `
+    --embedder .\assets\content_vec_500.onnx `
+    --f0-model .\assets\rmvpe.onnx `
+    --f0-mode hybrid --fcpe-model .\assets\fcpe.onnx `
+    --provider tensorrt
+```
+
+`fcpe.onnx` is an external model (the community export contract is
+`audio [1,N,1] float32 @ 16 kHz` -> `f0_hz [1,N/160+1,1] float32`). Download it
+separately from the model publisher (the reference export is
+<https://huggingface.co/gzivdo/fcpe-onnx>) and review its MIT license; vc-rs does
+not embed or redistribute weights. FCPE-only and Hybrid loading validate the
+input/output names, rank, dtype, and 10 ms alignment before creating sessions.
+Non-finite or non-positive FCPE values are treated as unvoiced. Hybrid
+disagreements are settled with waveform periodicity and contour continuity.
 
 Pass a substring of the names shown by `devices` to `--input`/`--output`. On the
 tensorrt package use `--provider tensorrt`.
@@ -145,6 +219,10 @@ Balance dropouts, latency, and CPU/GPU load with `--chunk-ms` and
   values.
 - `--extra-convert-ms`: extra leading/trailing context handed to the conversion.
   Larger can be more stable but costs more. Start around `100` ms.
+- `--rvc-frames <T>`: optional fixed generator frame count for a dynamic ONNX.
+  Use an even value at or above the automatic T when you deliberately want more
+  left context or to reuse a known-good TensorRT profile. This reloads the
+  pipeline and increases VRAM/engine-build time; omit it for automatic sizing.
 
 When tuning, the safe order is to **first find a value with no dropouts, then
 lower `--chunk-ms`** to reduce latency.
@@ -157,10 +235,18 @@ lower `--chunk-ms`** to reduce latency.
   unpopulated `trained_*.index`. Its feature width must match the generator:
   RVC v1 indexes are 256-dimensional and v2 indexes are 768-dimensional.
   The file is decoded when the model loads, not by the audio callback.
-- `--index-rate 0.0..1.0`: blends ContentVec with the retrieved target-speaker
-  features. `0.0` is an exact no-retrieval path; start around `0.5` to `0.75`.
-  Higher values can improve target timbre but can make articulation less natural
-  with a sparse, noisy, or mismatched index.
+- `--index-rate 0.0..1.0`: base blend for ContentVec and retrieved target-speaker
+  features. The shared pipeline scales it per frame using match quality,
+  natural-F0 voicing and temporal reliability, and ContentVec/F0 transitions. This F0
+  reliability is a continuity-derived proxy, not an RMVPE probability or
+  confidence output. Boundary hysteresis plus fast reduction and slower recovery
+  keep both adaptive Index and Protect controls from chattering between adjacent
+  frames. Realtime processing rebuilds those controls deterministically from
+  each rolling inference window on the shared conversion worker; it does not
+  carry a cross-chunk EMA or run this work in an audio callback. `0.0` is an
+  exact no-retrieval path; start around `0.5` to `0.75`. Higher values can
+  improve target timbre but can make articulation less natural with a sparse,
+  noisy, or mismatched index.
 - `--protect 0.0..0.5`: standard RVC consonant protection for unvoiced F0
   frames when retrieval is enabled. `0.33` is the upstream default; `0.5`
   disables protection. Lower values preserve more original ContentVec in breaths
@@ -169,9 +255,38 @@ lower `--chunk-ms`** to reduce latency.
   boundary. `0` (the default) is exact standard RVC behavior. `20` ms is a
   useful starting point when full or high index retrieval leaves an obvious
   consonant edge: it gradually restores the retrieved features on the nearby
-  voiced frames while leaving the actual raw-F0-unvoiced frame protected. It
+  voiced frames while leaving the actual pre-continuity unvoiced frame protected. It
   only applies when an index is loaded, `--index-rate` is nonzero, and
   `--protect < 0.5`.
+- `--dynamic-tuning off|auto|chinese|english|japanese`: realtime-only optional
+  overlay for language-aware tuning. `auto` uses conservative acoustic cues
+  (voiced ratio, zero-crossing rate, and pitch variation), not text-level
+  language recognition, and stays neutral until evidence is stable across eight
+  chunks. Fixed language modes are deterministic. The overlay adjusts only
+  live-safe values gradually: F0 threshold, Index rate, Protect and its
+  transition, the ContentVec/RMVPE denoiser mixes, input gain, and output-only
+  silence suppression. It does not change chunk size, extra conversion context,
+  model paths, or denoiser topology; those remain restart-scoped.
+- `--f0-continuity true|false`: repair bounded internal F0 dropouts.
+  One/two 10 ms frames are interpolated directly; three-to-five frames require
+  stable voiced support on both sides, and longer/edge gaps stay unvoiced. This
+  avoids turning pauses, breaths, and clear consonants into synthetic pitch.
+- `--f0-stabilization true|false`: default `true`. Removes one-frame F0 islands,
+  corrects isolated/trailing near-octave mistakes, and filters an impulsive F0
+  frame only when its two voiced neighbors agree. It also rejects voiced RMVPE
+  frames that are strongly contradicted by local 16 kHz waveform periodicity;
+  this conservative autocorrelation check is not an RMVPE probability. It
+  deliberately preserves a real note or pitch transition; set it to `false` for
+  strict continuity-only compatibility testing.
+- `--f0-mode rmvpe|fcpe|hybrid`: choose RMVPE alone (the compatibility
+  default), FCPE alone, or reliability-fuse both. `fcpe` requires only
+  `--fcpe-model`; `hybrid` requires both `--f0-model` and `--fcpe-model`.
+  Changing the mode reloads the worker/model sessions; it never loads a model
+  or changes shape in the audio callback.
+- `--fcpe-model <PATH>`: external FCPE ONNX used by `--f0-mode fcpe` or
+  `hybrid`. The fixed CUDA/TensorRT path builds one FCPE engine for the exact F0
+  audio window selected by the current chunk/context settings. A separate
+  engine is built for each profile; one engine is not resized at runtime.
 - `--pitch-shift 0.0`: shift F0 in semitones (default: 0.0). `12.0` is one octave
   up, `-12.0` one octave down.
 - `--input-gain 1.0` / `--output-gain 1.0`: input/output gain (default: 1.0).
@@ -181,7 +296,7 @@ lower `--chunk-ms`** to reduce latency.
   gain, e.g. headphones while the primary output feeds a stream or DAW. Pass `""`
   for the system default device. `--monitor-gain 1.0` sets the monitor gain
   (default: 1.0). Not supported with an ASIO output host.
-- `--denoiser off|noise-gate|rnnoise|webrtc|gtcrn|deep-filter-net3`: exclusive input denoiser selection.
+- `--denoiser off|noise-gate|rnnoise|web-rtc|gtcrn|deep-filter-net3`: exclusive input denoiser selection.
   RNNoise uses an embedded model. GTCRN requires `--gtcrn-model <dir>` pointing
   at a directory containing `gtcrn_stream.onnx` (download with
   `download-models.ps1 -Gtcrn`). WebRTC is built in and accepts
@@ -189,16 +304,28 @@ lower `--chunk-ms`** to reduce latency.
   requires `--deepfilternet3-model <archive>` (download with
   `download-models.ps1 -DeepFilterNet3`). The old `--noise-gate` flag remains
   as an alias.
-- `--denoiser-content-mix 0.0..1.0`: share of the fully denoised branch mixed
-  into ContentVec. `0.0` preserves the raw articulation branch, `0.25` is the
-  recommended starting point, and `1.0` restores the legacy fully-denoised
-  ContentVec path. The setting is ignored when denoising is off. RNNoise and
-  GTCRN automatically delay the raw branch before mixing so their fixed output
-  latency cannot produce an echo.
-- `--denoiser-rmvpe-mix 0.0..1.0`: independent denoised share sent to RMVPE.
-  `1.0` (the default) preserves the historical fully denoised pitch input;
-  `0.0` uses the delay-aligned raw input. Intermediate values linearly blend
-  the two branches. The setting is ignored when denoising is off.
+- `--silence-suppressor`: independently mute generated RVC output after two
+  inactive chunks, while inference and a selected stateful input denoiser
+  continue advancing. It learns the stationary noise floor from the RMVPE input
+  branch and combines energy, zero-crossing shape, and pre-continuity F0 evidence; the
+  configured `--noise-gate-threshold` remains a soft calibration reference. It
+  fuses a streaming Silero neural VAD with acoustic evidence; low neural
+  confidence can reject weak F0 false positives without disabling transient
+  consonant protection. It can be combined with WebRTC, GTCRN, or
+  DeepFilterNet3, and closes/reopens the generated output with a 50 ms/8 ms
+  cross-chunk envelope rather than a hard mute.
+- `--denoiser-content-mix 0.0..1.0`: base share of the denoised branch mixed
+  into ContentVec. `0.0` is exact raw input and `0.25` is the recommended
+  starting point. A worker-side 10 ms transient detector can briefly reduce a
+  nonzero share when the denoiser removes a plosive or fricative, then smoothly
+  returns to the base; stationary room noise does not hold this protection open.
+  The setting is ignored when denoising is off. Fixed-delay denoisers align the
+  raw branch before analysis/mixing so no echo is introduced.
+- `--denoiser-rmvpe-mix 0.0..1.0`: independent base denoised share sent to
+  RMVPE. `1.0` is the default and `0.0` is exact delay-aligned raw input. The
+  automatic reduction is deliberately small and limited to low-zero-crossing
+  voiced onsets; noisy fricatives remain on the cleaned pitch path. The setting
+  is ignored when denoising is off.
 - `--silence-threshold 0.0001`: threshold below which input is treated as
   silence.
 - `--rms-mix-rate <0.0-1.0>`: closer to 0.0 follows the input's loudness
@@ -239,7 +366,7 @@ ASIO loads a single driver globally, so when **both** directions are ASIO they
 must name the same driver. ASIO buffer size is set in the driver's own control
 panel, not by `--wasapi-buffer-ms`.
 
-`wav --denoiser rnnoise`, `wav --denoiser webrtc`, and `wav --denoiser gtcrn`
+`wav --denoiser rnnoise`, `wav --denoiser web-rtc`, and `wav --denoiser gtcrn`
 compensate each denoiser's
 fixed streaming delay and keep the output WAV at the original sample count.
 RNNoise and GTCRN are available only in the standalone CLI/GUI packages, not

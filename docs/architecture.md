@@ -131,19 +131,24 @@ flowchart TD
     gain --> denoise["Off / Gate / RNNoise / WebRTC / DFN3<br/>(device rate)"]
     denoise --> pitch16["Pitch 16 kHz branch"]
     pitch16 --> gtcrn["GTCRN or passthrough"]
-    raw16 --> blend["ContentVec blend<br/>(raw + denoised share)"]
+    raw16 --> blend["ContentVec 10 ms adaptive blend<br/>(raw + denoised base share)"]
     gtcrn --> blend
-    raw16 --> rmvpeblend["RMVPE blend<br/>(raw + denoised share)"]
-    gtcrn --> rmvpeblend
+    raw16 --> pitchblend["Pitch 10 ms adaptive blend<br/>(raw + denoised base share)"]
+    gtcrn --> pitchblend
     blend --> embed["Content embedder"]
-    rmvpeblend --> f0["F0 estimator / RMVPE"]
-    embed --> retrieve["Optional IVF-Flat feature retrieval"]
+    pitchblend --> rmvpe["RMVPE when selected"]
+    pitchblend --> fcpe["FCPE when selected"]
+    rmvpe --> select["Mode selection / hybrid reliability fusion"]
+    fcpe --> select
+    select --> periodicity["Waveform periodicity check<br/>(stabilization mode)"]
+    periodicity --> rawf0["Natural F0 alignment"]
+    embed --> retrieve["Optional IVF-Flat retrieval<br/>(adaptive per frame)"]
+    rawf0 --> retrieve
     retrieve --> feats["Content feature 2x upsampling"]
-    f0 --> rawf0["Natural F0 alignment"]
-    feats --> protect["Optional consonant protection + boundary easing<br/>(raw-F0 unvoiced frames)"]
+    feats --> protect["Optional consonant protection + boundary easing<br/>(pre-continuity unvoiced frames)"]
     rawf0 --> protect
     protect --> rvc["RVC generator"]
-    rawf0 --> pitchf["F0 continuity + pitch shift"]
+    rawf0 --> pitchf["F0 continuity + stabilization + pitch shift"]
     pitchf --> coarse["Coarse pitch bins"]
     pitchf --> rvc
     coarse --> rvc
@@ -179,15 +184,62 @@ is an external-model opt-in package variant: it includes DFN3 runtime code and
 matching license notices, but never the model archive.
 
 For Gate, RNNoise, WebRTC, GTCRN, and DeepFilterNet3, `denoiser_content_mix` and
-`denoiser_rmvpe_mix` are live worker-side controls:
-for ContentVec, `0` sends raw input, `0.25` is the residual-preserving default,
-and `1` uses the fully denoised path. RMVPE's control uses the same `0..=1`
-meaning, but defaults to `1.0` for compatibility with the former full-denoise
-pitch path. RNNoise and GTCRN have fixed output delay, so both raw branches pass
-through matching preallocated alignment before mixing; this prevents an earlier
-voice from being combined with the cleaned signal. All branch buffers,
-resampling, and denoiser work stay on the conversion worker; callbacks continue
-to move samples only through lock-free queues.
+`denoiser_rmvpe_mix` are live worker-side base controls. For ContentVec, `0`
+sends raw input and `0.25` is the residual-preserving default. RMVPE uses the
+same `0..=1` scale and defaults to `1.0`. Every new aligned 16 kHz increment is
+analysed in 10 ms frames before either branch is mixed. An energy rise confirmed
+by denoiser residual and zero-crossing/first-difference shape can quickly lower
+the ContentVec denoised share, retaining a plosive or fricative that the denoiser
+removed. The RMVPE reduction is deliberately much smaller and limited to
+low-zero-crossing voiced onsets, because raw fricative noise is not useful pitch
+evidence. Per-sample one-pole envelopes attack in about 2 ms and recover in about
+52 ms, so frame decisions cannot create a discontinuity. A stationary room-noise
+frame has no continuing energy rise and returns to the configured base instead
+of holding the raw path open.
+
+RNNoise and GTCRN have fixed output delay, so both raw branches pass through
+matching preallocated alignment before analysis and mixing; this prevents an
+earlier voice from being combined with the cleaned signal. The detector carries
+only scalar state, resets with the model timeline, and processes each new sample
+once. All analysis, branch buffers, resampling, and denoiser work stay on the
+conversion worker; callbacks continue to move samples only through lock-free
+queues.
+
+The optional **silence suppressor** is downstream of conversion and separate
+from the exclusive input denoiser choice. Its worker-owned adaptive activity
+detector observes the newest 16 kHz RMVPE branch and fuses a streaming Silero
+neural VAD result with an acoustic fallback: learned stationary RMS floor,
+energy above that floor, zero-crossing shape, and pre-continuity F0 evidence. The
+configured/calibrated threshold is a minimum reference for opening the gate.
+Raw F0 never opens it by itself, because RMVPE can assign pitch to fan hum,
+mains noise, or music bleed; low neural confidence can veto that weak pitch
+path, while energy/transient evidence remains available for unvoiced consonants
+and word starts. A stationary/periodic signal also needs a larger energy margin
+than modulated speech. The detector is worker-owned and runs only while the
+suppressor is enabled; it is neither ASR nor a language classifier.
+
+After two inactive chunks, generated output passes through a shared cross-chunk
+envelope rather than being hard-zeroed: it closes over 50 ms and reopens over
+8 ms. Inference, rolling ContentVec/F0 state, and denoiser state still advance
+during muting. A startup grace period and 180 ms speech hangover preserve initial
+syllables and short pauses while preventing a steady idle room noise from being
+re-synthesized. The detector and envelope reset with the model stream, input
+branch, and device-rate timeline, and never run in an audio callback. Dynamic
+tuning latches an automatically enabled suppressor for the current mode/session,
+so SNR fluctuations cannot repeatedly reset the detector.
+
+The standalone realtime runtime also has an optional worker-owned dynamic
+tuner. It starts from the front-end's atomic `LiveParams` snapshot, applies a
+bounded overlay only before the next conversion chunk, and then updates that
+overlay from raw input RMS/zero-crossing observations plus the completed
+chunk's voiced ratio and F0 variation. `Auto` is deliberately a conservative
+acoustic profile heuristic rather than ASR or text-level language ID: it remains
+neutral unless one candidate stays high-confidence for eight chunks. Fixed
+Chinese, English, and Japanese profiles bypass that classification. Publishing
+its small diagnostic snapshot uses a best-effort worker `try_lock`; audio
+callbacks do not observe or lock it. Chunk sizing, extra context, model paths,
+and denoiser topology remain reload-scoped because changing them would rebuild
+streaming state and can make an audible discontinuity.
 
 Changing denoiser mode restarts its model-side rolling windows and matching
 delay lines, and the owning front-end discards the SOLA/PSOLA join history at the
@@ -209,32 +261,90 @@ kept both as continuous `pitchf` and quantized coarse pitch. Misaligning these
 streams usually sounds like timing drift, pitch lag, or unstable consonants, so
 frame-grid changes should be treated as audio-quality changes, not cleanup.
 
+The default F0 path is RMVPE. `F0Mode::Fcpe` instead loads only an external FCPE
+ONNX model; it does not require, inspect, build, or run RMVPE. `F0Mode::Hybrid`
+loads both on the same worker-owned 16 kHz window. FCPE's `[1, samples, 1]`
+input and `[1, frames, 1]` output are checked at load time and normalized onto
+the shared 10 ms grid. In Hybrid mode agreement is averaged in log-Hz;
+disagreements use waveform periodicity and short-term contour continuity, with
+the FCPE right-edge frames treated conservatively because that model has less
+future context there. This is a reliability fusion, not a claim that FCPE's
+thresholded output is a calibrated confidence probability.
+
+For CUDA/TensorRT fixed-shape providers, each selected F0 session is specialized
+to the same audio window. Each derived window length owns a separate profile,
+engine, fixed IoBinding, and (where enabled) CUDA Graph. A dynamic FCPE ONNX may
+therefore be reused to build engines for several lengths, but no engine is
+resized and no profile/shape or memory is rebuilt in the realtime callback.
+Missing or incompatible mode-specific paths fail during configuration/load,
+before the worker starts processing audio. Model files remain external
+user-owned assets and are never embedded in a distribution.
+
 When configured, the pipeline reads a standard RVC
 `added_IVF*_Flat_*.index` FAISS `IndexIVFFlat` file during model construction.
 It rejects unsupported index families, unpopulated `trained_*.index` files, and
 feature widths that do not match the generator (v1 = 256, v2 = 768). The worker
 searches its reusable IVF scratch buffers for the eight nearest vectors and
-applies upstream RVC inverse-squared-distance blending before feature doubling.
-`index_rate=0` is an exact no-op. If `protect < 0.5`, the worker also retains the
-pre-retrieval ContentVec tensor and, after the same trim/repeat transformation,
-mixes it back only for raw-F0-unvoiced frames. It intentionally uses raw,
-unshifted F0 so continuity/pitch-shift postprocessing cannot turn a consonant
-into a retrieval-voiced frame. Index file I/O, parsing, retrieval, and this
-extra scratch memory are all outside the audio callback.
+applies the configured `index_rate` as a base rate, then scales it per frame
+using nearest-vector confidence, natural-F0 voicing, natural-F0 temporal
+reliability, and ContentVec/F0 boundary evidence. With stabilization enabled,
+the natural voiced/unvoiced mask has already passed the waveform-periodicity
+check described below. The reliability value is still a proxy derived from F0
+support and pitch continuity, not an RMVPE posterior
+probability or confidence output. Boundary evidence uses Schmitt-style
+hysteresis, while the effective Index and Protect scales fall quickly when
+evidence weakens and recover more slowly across adjacent frames. Strong, stable
+voiced matches therefore retain the target timbre; weak matches and sharp
+consonant or voicing transitions keep more of the source content.
+
+These control states are reconstructed deterministically from every rolling
+context window. They are not carried forward as a terminal cross-chunk EMA,
+because realtime windows replay an overlapping historical prefix and doing so
+would advance the same old frames twice. `index_rate=0` remains an exact no-op.
+If `protect < 0.5`, the worker also retains the pre-retrieval ContentVec tensor
+and, after the same trim/repeat transformation, mixes it back on pre-continuity unvoiced
+frames using the corresponding adaptive scale. It intentionally uses natural,
+pre-continuity and unshifted F0 so later interpolation/pitch shifting cannot turn a consonant
+into a retrieval-voiced frame. Index file I/O, parsing, retrieval, adaptive
+smoothing, and scratch memory all remain in the shared conversion worker,
+outside every device or DAW audio callback.
 
 `protect_transition_ms` is a vc-rs extension, not an MXGF/upstream-RVC setting.
 At its default of zero it takes the exact binary upstream Protect path. A
 positive value is rounded up to the 10 ms generator feature grid and blends the
 nearby *voiced* frames progressively from the Protect mix back to full retrieval;
-the raw-F0-unvoiced frame itself remains protected. The bounded 0..100 ms scan
+the pre-continuity unvoiced frame itself remains protected. The bounded 0..100 ms scan
 uses the existing worker-owned tensors and no extra scratch allocation. It is
 skipped entirely without an index, with `index_rate=0`, or with `protect=0.5`.
 
-The default RMVPE confidence threshold is 0.03. Optional F0 continuity runs
-after alignment on the worker and linearly interpolates only zero runs bounded
-by voiced frames; leading/trailing runs stay unvoiced to avoid extrapolating a
-breath or consonant beyond the known streaming window. Coarse pitch is derived
-from the resulting continuous F0 so the generator inputs remain consistent.
+The default RMVPE confidence threshold is 0.03. With F0 stabilization enabled,
+each thresholded voiced frame is first checked against normalized waveform
+autocorrelation near its expected period in the exact 16 kHz RMVPE window. Only
+strongly contradicted frames are cleared; insufficient edge context and middling
+periodicity retain RMVPE's decision. This filters aperiodic room-noise pitch
+without pretending to expose an RMVPE posterior, and the corrected natural mask
+is shared by speech activity, adaptive retrieval, Protect, and synthesis.
+
+Optional F0 continuity then runs after alignment on the worker. One/two-frame
+dropouts are repaired with log-F0 interpolation. Three-to-five-frame gaps are
+filled only when two voiced frames on each side are locally stable and the two
+bounds remain within three semitones. Gaps over 50 ms, unstable bounds, and
+leading/trailing runs stay unvoiced; this prevents a later vowel in a long rolling
+window from voicing a pause, breath, or clear consonant. Stabilization also
+removes isolated voiced islands, repairs isolated/trailing near-octave mistakes,
+and applies a three-frame voiced median only when both neighbors agree. Coarse
+pitch is derived from the resulting F0 so the generator inputs remain consistent.
+
+Some RVC exports expose the VITS latent `rnd` tensor as an input with layout
+`[1, channels, frames]`. The shared pipeline assigns this noise on the absolute
+10 ms generator timeline, keyed by seed, channel, and frame. When a rolling
+window replays historical features, those features therefore receive exactly
+the same latent values even though their local tensor indices moved. ORT CPU,
+ORT IoBinding, TensorRT CUDA Graph, and native TensorRT all use the same Rust
+counter-based Gaussian generator. Only the reusable staging buffer differs by
+backend. The timeline follows newly appended feature frames, handles changing
+offline tail-window lengths, and resets with every model-stream restart. Models
+without an exported `rnd` input keep their original inference contract.
 
 After generation, the output may be shaped by volume envelope, RMS mixing, and
 manual or automatic gain. These operations happen before chunk joining so the

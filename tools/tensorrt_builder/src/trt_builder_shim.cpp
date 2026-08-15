@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -104,6 +105,43 @@ char const* dtype_name(nvinfer1::DataType dtype) {
     }
 }
 
+struct RvcInputDtypeContract {
+    char const* name;
+    nvinfer1::DataType expected;
+};
+
+// Keep this alias table in lockstep with vc-core::model_rvc::onnx_meta. RVC's
+// public integer controls are Int64 in the ONNX contract; silently coercing
+// them to Int32 changes the model ABI and can make a cached engine appear valid
+// until inference. TensorRT 11 strongly typed networks preserve these types, so
+// reject an incompatible export instead of rewriting it.
+constexpr RvcInputDtypeContract RVC_INPUT_DTYPE_CONTRACT[] = {
+    {"feats", nvinfer1::DataType::kFLOAT},
+    {"phone", nvinfer1::DataType::kFLOAT},
+    {"p_len", nvinfer1::DataType::kINT64},
+    {"phone_lengths", nvinfer1::DataType::kINT64},
+    {"pitch", nvinfer1::DataType::kINT64},
+    {"pitchf", nvinfer1::DataType::kFLOAT},
+    {"nsff0", nvinfer1::DataType::kFLOAT},
+    {"sid", nvinfer1::DataType::kINT64},
+    {"ds", nvinfer1::DataType::kINT64},
+    {"rnd", nvinfer1::DataType::kFLOAT},
+    {"z", nvinfer1::DataType::kFLOAT},
+};
+
+bool expected_rvc_input_dtype(char const* name, nvinfer1::DataType& expected) {
+    if (name == nullptr) {
+        return false;
+    }
+    for (auto const& contract : RVC_INPUT_DTYPE_CONTRACT) {
+        if (std::strcmp(name, contract.name) == 0) {
+            expected = contract.expected;
+            return true;
+        }
+    }
+    return false;
+}
+
 std::size_t dtype_size(nvinfer1::DataType dtype) {
     switch (dtype) {
     case nvinfer1::DataType::kFLOAT:
@@ -147,6 +185,11 @@ nvinfer1::Dims input_dims_for(char const* name, nvinfer1::Dims dims, int32_t fra
         dims.d[0] = 1;
         dims.d[1] = frames;
         dims.d[2] = channels;
+    } else if (tensor == "rnd") {
+        dims.nbDims = 3;
+        dims.d[0] = 1;
+        dims.d[1] = 192;
+        dims.d[2] = frames;
     } else if (tensor == "pitch" || tensor == "pitchf" || tensor == "nsff0") {
         dims.nbDims = 2;
         dims.d[0] = 1;
@@ -165,6 +208,46 @@ bool has_dynamic_dim(nvinfer1::Dims const& dims) {
         }
     }
     return false;
+}
+
+bool is_rvc_profile(std::map<std::string, nvinfer1::Dims> const& profile) {
+    // RVC generator exports have the feature sequence plus coarse and continuous
+    // F0 inputs. Keep this deliberately name-based: the helper is also used for
+    // ContentVec/RMVPE, whose faster tactics remain valid on the same GPU.
+    bool const has_features = profile.find("phone") != profile.end()
+        || profile.find("feats") != profile.end();
+    bool const has_pitch = profile.find("pitch") != profile.end();
+    bool const has_pitchf = profile.find("pitchf") != profile.end()
+        || profile.find("nsff0") != profile.end();
+    return has_features && has_pitch && has_pitchf;
+}
+
+bool validate_rvc_network_input_dtypes(
+    nvinfer1::INetworkDefinition const& network,
+    Message& msg
+) {
+    for (int32_t i = 0; i < network.getNbInputs(); ++i) {
+        auto const* tensor = network.getInput(i);
+        if (tensor == nullptr) {
+            continue;
+        }
+        nvinfer1::DataType expected{};
+        char const* name = tensor->getName();
+        if (!expected_rvc_input_dtype(name, expected)) {
+            continue;
+        }
+        auto const actual = tensor->getType();
+        if (actual != expected) {
+            msg.append(
+                "RVC ONNX input dtype mismatch: name=%s actual=%s expected=%s\n",
+                name,
+                dtype_name(actual),
+                dtype_name(expected)
+            );
+            return false;
+        }
+    }
+    return true;
 }
 
 bool same_dims(nvinfer1::Dims const& a, nvinfer1::Dims const& b) {
@@ -405,12 +488,26 @@ extern "C" int trt_build_engine(
     config->setFlag(nvinfer1::BuilderFlag::kFP16);
 #endif
     config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 4ULL * 1024ULL * 1024ULL * 1024ULL);
-    // Max builder optimization level (0..=5, default 3). Level 5 explores and
-    // compiles the most kernel tactics for the fastest engine; the build is
-    // slower but its result is cached to disk per (model, profile), so the cost
-    // is paid once. Worth it for the real-time RVC path, especially on the FP32
-    // strongly-typed engines TensorRT 11 produces.
-    config->setBuilderOptimizationLevel(5);
+    bool const rvc_profile = is_rvc_profile(profile);
+    if (rvc_profile && !validate_rvc_network_input_dtypes(*network, msg)) {
+        return 1;
+    }
+    if (rvc_profile) {
+        // TensorRT 11.2.1.2 on this runtime can serialize an RVC engine at
+        // optimization levels 3-5, then fault inside nvinfer_11.dll while
+        // creating its execution context. NVIDIA's trtexec reproduces it with
+        // the same ONNX and exact fixed profile. Level 0 with TF32 disabled is
+        // the tested stable specialization for T=62 and T=200. This is a
+        // load/build-time choice only; it does not relax the fixed profile or
+        // add work to the realtime callback.
+        config->setBuilderOptimizationLevel(0);
+        config->clearFlag(nvinfer1::BuilderFlag::kTF32);
+        msg.append("RVC TensorRT compatibility build: optimization_level=0 tf32=false\n");
+    } else {
+        // Non-RVC models have not reproduced the context-creation fault, so
+        // retain the existing tactic search level for their cached engines.
+        config->setBuilderOptimizationLevel(5);
+    }
 
     // Persistent timing cache: reuse tactic timings measured by previous builds
     // so high optimization levels don't re-time every tactic from scratch. This
@@ -430,6 +527,39 @@ extern "C" int trt_build_engine(
         }
     }
 
+    msg.append("parsed ONNX inputs:\n");
+    for (int32_t i = 0; i < network->getNbInputs(); ++i) {
+        auto* tensor = network->getInput(i);
+        if (tensor == nullptr) {
+            continue;
+        }
+        auto const dims = tensor->getDimensions();
+        std::string const name = tensor->getName();
+        int32_t time_axis = -1;
+        // Keep the diagnostic axis map in sync with the model contracts in
+        // vc-core::onnx_meta.  FCPE uses `audio [1, samples, 1]` and RMVPE
+        // uses `waveform [1, samples]`; omitting those names made a perfectly
+        // valid dynamic FCPE graph look as though it had no dynamic time axis
+        // in build failures.  This is load/build-time reporting only and does
+        // not affect the fixed profile or realtime execution path.
+        if (name == "feats" || name == "phone" || name == "pitch" || name == "pitchf" || name == "nsff0" || name == "audio" || name == "waveform") {
+            time_axis = 1;
+        } else if (name == "rnd") {
+            time_axis = 2;
+        }
+        int64_t const time_dim = time_axis >= 0 && dims.nbDims > time_axis ? dims.d[time_axis] : 0;
+        msg.append(
+            "  %s dtype=%s shape=%s dynamic=%s time_axis=%d time_dim=%lld time_dynamic=%s\n",
+            name.c_str(),
+            dtype_name(tensor->getType()),
+            dims_to_string(dims).c_str(),
+            has_dynamic_dim(dims) ? "true" : "false",
+            time_axis,
+            static_cast<long long>(time_dim),
+            time_axis >= 0 && time_dim < 0 ? "true" : "false"
+        );
+    }
+
     bool has_dynamic_input = false;
     for (auto const& item : profile) {
         nvinfer1::ITensor* tensor = nullptr;
@@ -445,6 +575,20 @@ extern "C" int trt_build_engine(
             return 1;
         }
         auto model_dims = tensor->getDimensions();
+        // Always print all three selectors, including for a statically shaped
+        // input (where TensorRT does not need an optimization-profile object).
+        // Seeing the requested profile beside the model shape makes it clear
+        // whether a failure is a static-frame mismatch or a parser/build
+        // failure, without requiring a second diagnostic command.
+        msg.append(
+            "  profile %s min=%s opt=%s max=%s model_shape=%s model_dynamic=%s\n",
+            item.first.c_str(),
+            dims_to_string(item.second).c_str(),
+            dims_to_string(item.second).c_str(),
+            dims_to_string(item.second).c_str(),
+            dims_to_string(model_dims).c_str(),
+            has_dynamic_dim(model_dims) ? "true" : "false"
+        );
         if (has_dynamic_dim(model_dims)) {
             has_dynamic_input = true;
             if (!opt->setDimensions(item.first.c_str(), nvinfer1::OptProfileSelector::kMIN, item.second)

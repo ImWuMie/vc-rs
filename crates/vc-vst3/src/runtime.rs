@@ -229,18 +229,34 @@ impl PluginRuntime {
         if channels.is_empty() {
             return;
         }
-        let n = channels[0].len();
+        // Hosts normally honour `max_buffer_size`, but the VST3 contract does
+        // not make a malformed/oversized block impossible (some hosts briefly
+        // do this while changing block size).  Never resize the callback
+        // scratch buffers here: an unexpected block must be truncated and its
+        // unprocessed output explicitly silenced, preserving the RT
+        // no-allocation invariant.  Use the shortest channel as the readable
+        // input span as a second guard against a malformed channel layout.
+        let host_n = channels
+            .iter()
+            .map(|channel| channel.len())
+            .min()
+            .unwrap_or(0);
+        let n = host_n.min(self.mono_in.capacity()).min(self.mono_out.len());
 
         // Downmix to mono.
         self.mono_in.clear();
-        self.mono_in.resize(n, 0.0);
-        if channels.len() >= 2 {
-            let (left, right) = (&channels[0], &channels[1]);
-            for i in 0..n {
-                self.mono_in[i] = 0.5 * (left[i] + right[i]);
+        if n > 0 {
+            // `n <= capacity` above is intentional; Vec::resize is therefore
+            // length-only and cannot allocate on the audio callback.
+            self.mono_in.resize(n, 0.0);
+            if channels.len() >= 2 {
+                let (left, right) = (&channels[0], &channels[1]);
+                for i in 0..n {
+                    self.mono_in[i] = 0.5 * (left[i] + right[i]);
+                }
+            } else {
+                self.mono_in.copy_from_slice(&channels[0][..n]);
             }
-        } else {
-            self.mono_in.copy_from_slice(&channels[0][..n]);
         }
 
         // Queue input; drop on overflow (worker is behind, audio keeps flowing).
@@ -252,10 +268,8 @@ impl PluginRuntime {
             self.worker_thread.unpark();
         }
 
-        // Pull up to n converted samples; pad the remainder with silence.
-        if self.mono_out.len() < n {
-            self.mono_out.resize(n, 0.0);
-        }
+        // Pull up to n converted samples; pad the remainder with silence.  Do
+        // not grow `mono_out` here: `n` is bounded by its startup allocation.
         let want = n.min(self.output_consumer.slots());
         let mut filled = 0;
         if want > 0 {
@@ -271,9 +285,14 @@ impl PluginRuntime {
             *sample = 0.0;
         }
 
-        // Fan out mono to every output channel.
+        // Fan out mono to every output channel.  Any host frames beyond the
+        // preallocated span (or beyond a shorter malformed channel) must be
+        // deterministic silence rather than stale samples from the previous
+        // callback.
         for channel in channels.iter_mut() {
-            channel[..n].copy_from_slice(&self.mono_out[..n]);
+            let copy_n = n.min(channel.len());
+            channel[..copy_n].copy_from_slice(&self.mono_out[..copy_n]);
+            channel[copy_n..].fill(0.0);
         }
     }
 }
@@ -326,6 +345,11 @@ impl WorkerCtx {
     fn run(mut self) {
         let initial_settings = self.params.settings.read().unwrap().clone();
         let mut chunk_samples = self.chunk_samples(&initial_settings);
+        // F0 threshold is staged in PluginConfig and takes effect at the same
+        // explicit Load / Reload boundary as its model-side settings. Keep the
+        // worker's scalar copy so the per-chunk LiveParams snapshot does not
+        // read the editor-owned settings lock on the host's audio schedule.
+        let mut f0_threshold = initial_settings.f0_threshold;
         let mut input_acc = Vec::<f32>::with_capacity(chunk_samples * 2);
         // Reused output buffer for the converted chunk, filled by `process_chunk`.
         let mut chunk_out = Vec::<f32>::with_capacity(chunk_samples * 2);
@@ -359,6 +383,7 @@ impl WorkerCtx {
                 }
                 // chunk_ms may have changed; recompute and re-report latency.
                 chunk_samples = self.chunk_samples(&settings);
+                f0_threshold = settings.f0_threshold;
                 self.latency
                     .store(self.latency_samples(chunk_samples), Ordering::Relaxed);
                 // Drop the old pipeline (releasing its CUDA context) before
@@ -423,12 +448,14 @@ impl WorkerCtx {
             let denoiser_changed = converter.model_mut().apply_live(&LiveParams {
                 pitch_shift: self.params.pitch_shift.value(),
                 speaker_id: self.params.speaker_id.value() as i64,
+                f0_threshold,
                 input_gain: util::db_to_gain(self.params.input_gain_db.value()),
                 output_gain: util::db_to_gain(self.params.output_gain_db.value()),
                 // The VST3 has no monitor output (it plays through the host), so
                 // the monitor gain stays at unity.
                 monitor_gain: 1.0,
                 noise_gate_enabled: self.params.noise_gate.value(),
+                silence_gate_enabled: self.params.noise_gate.value(),
                 noise_gate_threshold: util::db_to_gain(self.params.noise_gate_threshold_db.value()),
                 denoiser_content_mix: self.params.denoiser_content_mix.value(),
                 denoiser_rmvpe_mix: self.params.denoiser_rmvpe_mix.value(),
@@ -606,7 +633,11 @@ impl WorkerCtx {
             model: &settings.model,
             embedder: &settings.embedder,
             embedder_output: settings.embedder_output.as_deref(),
-            f0_model: &settings.f0_model,
+            f0_model: (!settings.f0_model.as_os_str().is_empty())
+                .then_some(settings.f0_model.as_path()),
+            f0_mode: settings.f0_mode()?,
+            fcpe_model: (!settings.fcpe_model.as_os_str().is_empty())
+                .then_some(settings.fcpe_model.as_path()),
             provider,
             gpu_priority: settings.gpu_priority(),
             gpu_device_id: settings.gpu_device_id,
@@ -620,7 +651,10 @@ impl WorkerCtx {
             f0: F0Config {
                 f0_threshold: settings.f0_threshold,
                 silence_threshold: settings.silence_threshold,
-                postprocess: F0PostprocessConfig::continuity(settings.f0_continuity),
+                postprocess: F0PostprocessConfig::continuity_with_stabilization(
+                    settings.f0_continuity,
+                    settings.f0_stabilization,
+                ),
             },
             retrieval: FeatureRetrievalConfig {
                 index_path: (!settings.index_path.as_os_str().is_empty())
@@ -636,6 +670,7 @@ impl WorkerCtx {
             // (overwriting these load-time placeholders); attack/release/floor
             // are static and shape the gate built here.
             noise_gate_enabled: false,
+            silence_gate_enabled: false,
             noise_gate_threshold: 0.01,
             noise_gate_shaping: NoiseGateShaping {
                 attack_ms: settings.noise_gate_attack_ms,
@@ -645,6 +680,7 @@ impl WorkerCtx {
             output_extra_ms: self.output_extra_ms(),
             volume_excluded_ms: self.crossfade_ms,
             extra_convert_ms: settings.extra_convert_ms,
+            rvc_frames: (settings.rvc_frames != 0).then_some(settings.rvc_frames),
             output_gain: 1.0,
             output_dynamics: OutputDynamicsConfig {
                 volume_envelope: settings.volume_envelope,

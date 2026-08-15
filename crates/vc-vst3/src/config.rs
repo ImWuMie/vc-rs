@@ -13,7 +13,7 @@ use vc_core::denoise_config::{
     WebRtcSuppressionLevel, DEFAULT_DFN3_ATTENUATION_LIMIT_DB, DEFAULT_DFN3_POST_FILTER_BETA,
     MAX_DFN3_ATTENUATION_LIMIT_DB, MAX_DFN3_POST_FILTER_BETA,
 };
-use vc_core::model_rvc::InputDenoiserMode;
+use vc_core::model_rvc::{F0Mode, InputDenoiserMode};
 use vc_core::model_rvc::{GpuPriority, DEFAULT_F0_THRESHOLD};
 use vc_core::validation::{
     validate_conversion_timing, validate_non_negative_f32, validate_unit_interval,
@@ -28,6 +28,10 @@ use vc_core::Provider;
 pub const CONFIG_ENV: &str = "VC_RS_VST3_CONFIG";
 pub const PLUGIN_MIN_EXTRA_CONVERT_MS: u32 = 100;
 
+fn default_f0_stabilization() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Lenient: unknown/legacy keys (e.g. `pitch_shift`, now a DAW parameter) are
 // ignored rather than rejected, so older config files keep parsing.
@@ -36,6 +40,10 @@ pub struct PluginConfig {
     pub model: PathBuf,
     pub embedder: PathBuf,
     pub f0_model: PathBuf,
+    /// "rmvpe" | "fcpe" | "hybrid". Selection is reload-scoped; no
+    /// model/session work occurs in the DAW callback.
+    pub f0_mode: String,
+    pub fcpe_model: PathBuf,
     /// Optional target-speaker FAISS `added_IVF*_Flat_*.index`. It is read
     /// only when the worker loads/reloads the pipeline.
     pub index_path: PathBuf,
@@ -64,6 +72,8 @@ pub struct PluginConfig {
     pub gpu_device_id: u32,
     pub f0_threshold: f32,
     pub f0_continuity: bool,
+    #[serde(default = "default_f0_stabilization")]
+    pub f0_stabilization: bool,
     pub silence_threshold: f32,
     /// Noise gate attack/release/floor. Static (applied at Load/Reload); the
     /// gate's on/off and threshold are DAW parameters (see `VcRvcParams`).
@@ -75,6 +85,9 @@ pub struct PluginConfig {
     pub sola_search_ms: u32,
     pub rvc_output_tail_discard_ms: u32,
     pub extra_convert_ms: u32,
+    /// `0` = derive T from the timing configuration. A positive value selects
+    /// a fixed dynamic-ONNX profile when the plugin worker is reloaded.
+    pub rvc_frames: usize,
     /// "sola" | "psola".
     pub smoother: String,
     pub volume_envelope: bool,
@@ -91,6 +104,8 @@ impl Default for PluginConfig {
             model: PathBuf::new(),
             embedder: PathBuf::new(),
             f0_model: PathBuf::new(),
+            f0_mode: "rmvpe".to_string(),
+            fcpe_model: PathBuf::new(),
             index_path: PathBuf::new(),
             denoiser: "off".to_string(),
             webrtc_suppression_level: "moderate".to_string(),
@@ -104,6 +119,7 @@ impl Default for PluginConfig {
             gpu_device_id: 0,
             f0_threshold: DEFAULT_F0_THRESHOLD,
             f0_continuity: true,
+            f0_stabilization: true,
             silence_threshold: 0.0001,
             noise_gate_attack_ms: 5.0,
             noise_gate_release_ms: 50.0,
@@ -113,6 +129,7 @@ impl Default for PluginConfig {
             sola_search_ms: 12,
             rvc_output_tail_discard_ms: 10,
             extra_convert_ms: 100,
+            rvc_frames: 0,
             smoother: "sola".to_string(),
             volume_envelope: false,
             rms_mix_rate: 0.0,
@@ -124,12 +141,25 @@ impl Default for PluginConfig {
 }
 
 impl PluginConfig {
-    /// True when all three required model paths are set. When false the plugin
-    /// runs in silent mode (the worker never loads a pipeline).
+    /// True when the shared models and mode-specific F0 paths are set. When
+    /// false the plugin runs in silent mode (the worker never loads a pipeline).
     pub fn has_models(&self) -> bool {
+        let Ok(f0_mode) = self.f0_mode() else {
+            return false;
+        };
         !self.model.as_os_str().is_empty()
             && !self.embedder.as_os_str().is_empty()
-            && !self.f0_model.as_os_str().is_empty()
+            && (!f0_mode.uses_rmvpe() || !self.f0_model.as_os_str().is_empty())
+            && (!f0_mode.uses_fcpe() || !self.fcpe_model.as_os_str().is_empty())
+    }
+
+    pub fn f0_mode(&self) -> anyhow::Result<F0Mode> {
+        match self.f0_mode.trim().to_ascii_lowercase().as_str() {
+            "rmvpe" => Ok(F0Mode::Rmvpe),
+            "fcpe" => Ok(F0Mode::Fcpe),
+            "hybrid" => Ok(F0Mode::Hybrid),
+            other => anyhow::bail!("unsupported F0 mode '{other}'; use rmvpe, fcpe, or hybrid"),
+        }
     }
 
     pub fn provider(&self) -> Provider {
@@ -223,6 +253,10 @@ impl PluginConfig {
         validate_unit_interval("RMS mix rate", self.rms_mix_rate)?;
         validate_non_negative_f32("target output RMS", self.target_output_rms)?;
         validate_non_negative_f32("max output gain", self.max_output_gain)?;
+        let f0_mode = self.f0_mode()?;
+        if f0_mode.uses_fcpe() && self.fcpe_model.as_os_str().is_empty() {
+            anyhow::bail!("{} F0 mode requires fcpe_model", f0_mode.label());
+        }
         let denoiser = self.denoiser_mode()?;
         let _ = self.webrtc_level()?;
         if !self.dfn3_attenuation_limit_db.is_finite()
@@ -399,9 +433,11 @@ mod tests {
         let config = PluginConfig::default();
         assert_eq!(config.f0_threshold, DEFAULT_F0_THRESHOLD);
         assert!(config.f0_continuity);
+        assert!(config.f0_stabilization);
         let parsed: PluginConfig = toml::from_str("").unwrap();
         assert_eq!(parsed.f0_threshold, DEFAULT_F0_THRESHOLD);
         assert!(parsed.f0_continuity);
+        assert!(parsed.f0_stabilization);
     }
 
     #[test]
@@ -409,6 +445,60 @@ mod tests {
         assert!(PluginConfig::default().index_path.as_os_str().is_empty());
         let config: PluginConfig = toml::from_str("index_path = 'voice.index'").unwrap();
         assert_eq!(config.index_path, PathBuf::from("voice.index"));
+    }
+
+    #[test]
+    fn custom_rvc_frames_default_to_auto_and_parse() {
+        assert_eq!(PluginConfig::default().rvc_frames, 0);
+        let config: PluginConfig = toml::from_str("rvc_frames = 200").unwrap();
+        assert_eq!(config.rvc_frames, 200);
+    }
+
+    #[test]
+    fn hybrid_f0_mode_requires_and_parses_fcpe_model() {
+        let mut config = PluginConfig {
+            model: PathBuf::from("model.onnx"),
+            embedder: PathBuf::from("embedder.onnx"),
+            f0_model: PathBuf::from("rmvpe.onnx"),
+            f0_mode: "hybrid".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.f0_mode().unwrap(), F0Mode::Hybrid);
+        assert!(config.validate().is_err());
+
+        config.fcpe_model = PathBuf::from("fcpe.onnx");
+        assert!(config.has_models());
+        assert!(config.validate().is_ok());
+
+        let parsed: PluginConfig = toml::from_str(
+            "model = 'model.onnx'\nembedder = 'embedder.onnx'\nf0_model = 'rmvpe.onnx'\nf0_mode = 'hybrid'\nfcpe_model = 'fcpe.onnx'",
+        )
+        .unwrap();
+        assert_eq!(parsed.f0_mode().unwrap(), F0Mode::Hybrid);
+        assert_eq!(parsed.fcpe_model, PathBuf::from("fcpe.onnx"));
+    }
+
+    #[test]
+    fn fcpe_f0_mode_does_not_require_rmvpe_model() {
+        let config = PluginConfig {
+            model: PathBuf::from("model.onnx"),
+            embedder: PathBuf::from("embedder.onnx"),
+            f0_model: PathBuf::new(),
+            f0_mode: "fcpe".to_string(),
+            fcpe_model: PathBuf::from("fcpe.onnx"),
+            ..Default::default()
+        };
+
+        assert_eq!(config.f0_mode().unwrap(), F0Mode::Fcpe);
+        assert!(config.has_models());
+        assert!(config.validate().is_ok());
+
+        let missing_fcpe = PluginConfig {
+            fcpe_model: PathBuf::new(),
+            ..config
+        };
+        assert!(!missing_fcpe.has_models());
+        assert!(missing_fcpe.validate().is_err());
     }
 
     #[test]

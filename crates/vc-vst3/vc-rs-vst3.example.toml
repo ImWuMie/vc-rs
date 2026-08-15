@@ -22,7 +22,12 @@
 # --- Models (required for conversion) ---
 model = "/path/to/models/rvc/your_model.onnx"
 embedder = "/path/to/models/hubert/contentvec.onnx"
+# Required for f0_mode = "rmvpe" or "hybrid"; unused by "fcpe".
 f0_model = "/path/to/models/rmvpe/rmvpe.onnx"
+# "rmvpe" uses RMVPE only, "fcpe" uses FCPE only, and "hybrid" fuses both.
+f0_mode = "rmvpe"
+# Required for f0_mode = "fcpe" or "hybrid"; unused by "rmvpe".
+fcpe_model = "/path/to/models/fcpe/fcpe.onnx"
 # Optional: RVC retrieval index. Use an `added_IVF*_Flat_*.index` matching
 # the generator feature width (v1 = 256, v2 = 768), not a `trained_*.index`.
 # index_path = "/path/to/models/rvc/added_IVF256_Flat_nprobe_1.index"
@@ -65,6 +70,7 @@ gpu_device_id = 0
 # --- Detection thresholds ---
 f0_threshold = 0.03
 f0_continuity = true
+f0_stabilization = true
 silence_threshold = 0.0001
 
 # --- Latency / chunking (milliseconds) ---
@@ -73,6 +79,10 @@ crossfade_ms = 85
 sola_search_ms = 12
 rvc_output_tail_discard_ms = 10
 extra_convert_ms = 100
+# Optional fixed RVC generator T for a dynamic ONNX. 0 derives it from the
+# timings above. Use an even value at least as large as automatic T; applying a
+# different value requires the plugin worker to reload its fixed engine.
+rvc_frames = 0
 smoother = "sola"          # "sola" | "psola"
 
 # --- Volume handling ---

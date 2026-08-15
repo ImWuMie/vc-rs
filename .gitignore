@@ -21,6 +21,9 @@
 .DS_Store
 Thumbs.db
 *.log
+/.idea/
+/INSTALL.txt
+/.webui_secret_key
 /docs/plans/
 
 # Local model assets (do not redistribute by default)

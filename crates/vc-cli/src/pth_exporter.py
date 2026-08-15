@@ -75,7 +75,7 @@ class GeneratorExport(nn.Module):
         return audio
 
 
-def export(model_path, output_path):
+def export(model_path, output_path, fixed_frames=None):
     checkpoint = load_checkpoint(model_path)
     weights = checkpoint["weight"]
     embedding = weights.get("emb_g.weight")
@@ -90,37 +90,78 @@ def export(model_path, output_path):
     feature_channels = 256 if version == "v1" else 768
 
     torch.manual_seed(0)
-    generator_type = (
-        SynthesizerTrnMs256NSFsid if version == "v1" else SynthesizerTrnMs768NSFsid
-    )
-    generator = generator_type(*config, is_half=False)
-    generator.load_state_dict(weights, strict=False)
-    generator.eval()
-    model = GeneratorExport(generator).eval()
-
-    frames = 200
-    feats = torch.rand(1, frames, feature_channels)
-    p_len = torch.tensor([frames], dtype=torch.long)
-    pitch = torch.randint(low=5, high=255, size=(1, frames), dtype=torch.long)
-    pitchf = torch.rand(1, frames)
-    speaker = torch.zeros(1, dtype=torch.long)
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        model,
-        (feats, p_len, pitch, pitchf, speaker),
-        output_path,
-        dynamic_axes={"feats": [1], "pitch": [1], "pitchf": [1]},
-        # The legacy exporter emits invalid dynamic attention reshapes without
-        # folding. Keep this enabled: it is required for frame lengths other
-        # than the 200-frame tracing example and produces the compact graph
-        # accepted by both ONNX Runtime and TensorRT.
-        do_constant_folding=True,
-        opset_version=20,
-        verbose=False,
-        input_names=["feats", "p_len", "pitch", "pitchf", "sid"],
-        output_names=["audio"],
-    )
+    if fixed_frames is None:
+        # Preserve the existing generic export byte-for-byte in spirit: it uses
+        # the normal infer path, samples latent noise inside the graph, traces at
+        # 200 frames, and marks only its historical time axes dynamic.
+        generator_type = (
+            SynthesizerTrnMs256NSFsid
+            if version == "v1"
+            else SynthesizerTrnMs768NSFsid
+        )
+        generator = generator_type(*config, is_half=False)
+        generator.load_state_dict(weights, strict=False)
+        generator.eval()
+        model = GeneratorExport(generator).eval()
+
+        frames = 200
+        feats = torch.rand(1, frames, feature_channels)
+        p_len = torch.tensor([frames], dtype=torch.long)
+        pitch = torch.randint(low=5, high=255, size=(1, frames), dtype=torch.long)
+        pitchf = torch.rand(1, frames)
+        speaker = torch.zeros(1, dtype=torch.long)
+        torch.onnx.export(
+            model,
+            (feats, p_len, pitch, pitchf, speaker),
+            output_path,
+            dynamic_axes={"feats": [1], "pitch": [1], "pitchf": [1]},
+            # The legacy exporter emits invalid dynamic attention reshapes without
+            # folding. Keep this enabled for compatibility with existing exports.
+            do_constant_folding=True,
+            opset_version=20,
+            verbose=False,
+            input_names=["feats", "p_len", "pitch", "pitchf", "sid"],
+            output_names=["audio"],
+        )
+    else:
+        # RVC WebUI's legacy dynamic export traces attention at one Python T and
+        # only relabels the public axes. TensorRT then sees internally fixed
+        # reshapes when vc-rs requests another fixed profile. Trace the WebUI
+        # six-input graph at the exact runtime T and leave every axis static.
+        from infer.lib.infer_pack.models_onnx import SynthesizerTrnMsNSFsidM
+
+        generator = SynthesizerTrnMsNSFsidM(
+            *config, version=version, is_half=False
+        )
+        generator.load_state_dict(weights, strict=False)
+        generator.eval()
+
+        frames = fixed_frames
+        phone = torch.rand(1, frames, feature_channels, dtype=torch.float32)
+        phone_lengths = torch.tensor([frames], dtype=torch.int64)
+        pitch = torch.randint(
+            low=5, high=255, size=(1, frames), dtype=torch.int64
+        )
+        pitchf = torch.rand(1, frames, dtype=torch.float32)
+        ds = torch.zeros(1, dtype=torch.int64)
+        inter_channels = int(config[2])
+        rnd = torch.rand(
+            1, inter_channels, frames, dtype=torch.float32
+        )
+        torch.onnx.export(
+            generator,
+            (phone, phone_lengths, pitch, pitchf, ds, rnd),
+            output_path,
+            # Keep the legacy tracer explicitly: its Python shape decisions are
+            # intentional here because this artifact is dedicated to one T.
+            dynamo=False,
+            do_constant_folding=True,
+            opset_version=20,
+            verbose=False,
+            input_names=["phone", "phone_lengths", "pitch", "pitchf", "ds", "rnd"],
+            output_names=["audio"],
+        )
 
     # Preserve the source model's F0/sample-rate facts so vc-rs can size the
     # shared streaming pipeline correctly for 32/40/48 kHz exports.
@@ -149,8 +190,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--frames", type=int)
     arguments = parser.parse_args()
-    export(arguments.model, arguments.output)
+    if arguments.frames is not None and arguments.frames <= 0:
+        parser.error("--frames must be greater than zero")
+    export(arguments.model, arguments.output, arguments.frames)
 
 
 if __name__ == "__main__":

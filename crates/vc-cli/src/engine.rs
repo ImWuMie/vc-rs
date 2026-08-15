@@ -28,12 +28,14 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
     let live = LiveParams {
         pitch_shift: args.pitch_shift,
         speaker_id: args.speaker_id,
+        f0_threshold: args.f0_threshold,
         input_gain: args.input_gain,
         output_gain: args.output_gain,
         monitor_gain: args.monitor_gain,
         // Gate on/off is static for the CLI session (no live denoiser control),
         // so derive it from the selected mode; the unified live path applies it.
         noise_gate_enabled: denoiser_mode == DenoiserMode::NoiseGate,
+        silence_gate_enabled: args.silence_suppressor || denoiser_mode == DenoiserMode::NoiseGate,
         noise_gate_threshold: args.noise_gate_threshold,
         denoiser_content_mix: args.denoiser_content_mix,
         denoiser_rmvpe_mix: args.denoiser_rmvpe_mix,
@@ -46,11 +48,14 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
     let input_host = args.effective_input_host();
     let output_host = args.effective_output_host();
     let controller = EngineController::new(live);
+    controller.set_dynamic_tuning_mode(args.dynamic_tuning.into());
     controller.apply_config(RealtimeConfig {
         model: args.model,
         embedder: args.embedder,
         embedder_output: args.embedder_output,
         f0_model: args.f0_model,
+        f0_mode: args.f0_mode,
+        fcpe_model: args.fcpe_model,
         feature_index: args.index_path,
         provider: args.provider,
         gpu_priority: args.gpu_priority.into(),
@@ -70,10 +75,14 @@ pub fn run_realtime(args: RunArgs) -> Result<()> {
         smoother: args.smoother.into(),
         rvc_output_tail_discard_ms: args.rvc_output_tail_discard_ms,
         extra_convert_ms: args.extra_convert_ms,
+        rvc_frames: args.rvc_frames,
         f0: F0Config {
             f0_threshold: args.f0_threshold,
             silence_threshold: args.silence_threshold,
-            postprocess: F0PostprocessConfig::continuity(args.f0_continuity),
+            postprocess: F0PostprocessConfig::continuity_with_stabilization(
+                args.f0_continuity,
+                args.f0_stabilization,
+            ),
         },
         denoiser_mode,
         gtcrn_model_dir: args.gtcrn_model,
@@ -165,7 +174,9 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         model: &args.model,
         embedder: &args.embedder,
         embedder_output: args.embedder_output.as_deref(),
-        f0_model: &args.f0_model,
+        f0_model: args.f0_model.as_deref(),
+        f0_mode: args.f0_mode,
+        fcpe_model: args.fcpe_model.as_deref(),
         provider: args.provider,
         gpu_priority,
         gpu_device_id: args.gpu_device_id,
@@ -177,7 +188,10 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
             f0_threshold: args.f0_threshold,
             // WAV mode treats nothing as silence so the whole clip converts.
             silence_threshold: 0.0,
-            postprocess: F0PostprocessConfig::continuity(args.f0_continuity),
+            postprocess: F0PostprocessConfig::continuity_with_stabilization(
+                args.f0_continuity,
+                args.f0_stabilization,
+            ),
         },
         retrieval: FeatureRetrievalConfig {
             index_path: args.index_path.as_deref(),
@@ -187,6 +201,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         },
         input_gain: args.input_gain,
         noise_gate_enabled: denoiser_mode == Denoiser::NoiseGate,
+        silence_gate_enabled: false,
         noise_gate_threshold: args.noise_gate_threshold,
         denoiser_content_mix: args.denoiser_content_mix,
         denoiser_rmvpe_mix: args.denoiser_rmvpe_mix,
@@ -198,6 +213,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         output_extra_ms,
         volume_excluded_ms: args.crossfade_ms,
         extra_convert_ms: args.extra_convert_ms,
+        rvc_frames: args.rvc_frames,
         output_gain: args.output_gain,
         output_dynamics: OutputDynamicsConfig {
             volume_envelope: args.volume_envelope,
@@ -326,7 +342,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
 fn load_wav_pipeline(
     denoiser_mode: Denoiser,
     _gtcrn_model: Option<&std::path::Path>,
-    webrtc_level: vc_core::denoise_config::WebRtcSuppressionLevel,
+    _webrtc_level: vc_core::denoise_config::WebRtcSuppressionLevel,
     _deepfilternet3_model: Option<&std::path::Path>,
     _dfn3_attenuation_limit_db: f32,
     _dfn3_post_filter_beta: f32,
@@ -345,7 +361,7 @@ fn load_wav_pipeline(
         Denoiser::WebRtc => {
             #[cfg(feature = "webrtc")]
             {
-                RvcPipeline::load_with_webrtc(config, webrtc_level)
+                RvcPipeline::load_with_webrtc(config, _webrtc_level)
             }
             #[cfg(not(feature = "webrtc"))]
             anyhow::bail!("WebRTC denoising support is not enabled in this build")

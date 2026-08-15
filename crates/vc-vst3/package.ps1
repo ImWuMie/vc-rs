@@ -32,7 +32,8 @@
 
 .PARAMETER SkipBuild
     Reuse an existing target\bundled bundle instead of running cargo xtask
-    bundle. The populate step and archiving still run.
+    bundle. The populate step and archiving still run, but only after a build
+    identity stamp proves the backend/features and plugin/helper SHA-256 values.
 
 .PARAMETER NoZip
     Populate the staged bundle but stop before creating the .zip (useful for
@@ -136,6 +137,7 @@ if (-not (Get-Command cargo-about -ErrorAction SilentlyContinue)) {
 # Sets CARGO_ENCODED_RUSTFLAGS, inherited by the cargo xtask bundle subprocess
 # below and the tensorrt builder-helper build.
 . (Join-Path $repoRoot 'scripts\rustflags.ps1')
+. (Join-Path $repoRoot 'scripts\package-artifact-stamp.ps1')
 $installBundleStem = "vc-vst3-$Variant"
 if ($DeepFilterNet3) { $installBundleStem += '-dfn3' }
 $installBundleName = "$installBundleStem.vst3"
@@ -149,6 +151,9 @@ $bundleFeatures = switch ($Variant) {
 }
 if ($DeepFilterNet3) { $bundleFeatures += ',deepfilternet3' }
 $bundleFeatureArgs = @('--no-default-features', '--features', $bundleFeatures)
+$packageStamp = Join-Path $bundleDir '.vc-rs-vst3-package-build.json'
+$defaultBuilderExe = Join-Path $repoRoot 'tools\tensorrt_builder\target\release\vc-tensorrt-builder.exe'
+$builderWasSupplied = -not [string]::IsNullOrWhiteSpace($BuilderExe)
 
 Push-Location $repoRoot
 try {
@@ -169,16 +174,15 @@ try {
 
         # The TensorRT engine-builder helper is a separate ORT-free binary. Build
         # it here (unless skipped) so package-tensorrt.ps1 can bundle it.
-        if ($Variant -eq 'tensorrt' -and -not $RuntimeOnly -and -not $BuilderExe) {
-            $helper = Join-Path $repoRoot 'tools\tensorrt_builder\target\release\vc-tensorrt-builder.exe'
+        if ($Variant -eq 'tensorrt' -and -not $RuntimeOnly -and -not $builderWasSupplied) {
             Write-Host "==> cargo build --release (vc-tensorrt-builder helper)" -ForegroundColor Cyan
             cargo build --release --manifest-path (Join-Path $repoRoot 'tools\tensorrt_builder\Cargo.toml')
             if ($LASTEXITCODE -ne 0) { throw "building vc-tensorrt-builder failed (exit $LASTEXITCODE)." }
-            if (Test-Path $helper) { $BuilderExe = $helper }
+            $BuilderExe = $defaultBuilderExe
         }
     }
     else {
-        Write-Host "==> Skipping build (-SkipBuild); reusing $bundleDir" -ForegroundColor Yellow
+        Write-Host "==> Skipping build (-SkipBuild); validating VST3 artifact identity" -ForegroundColor Yellow
     }
 
     # 3. Locate the raw, DLL-only bundle that `cargo xtask bundle` produced. We do
@@ -187,6 +191,44 @@ try {
     #    build output and variants can never cross-contaminate each other.
     $rawVst3 = Join-Path $bundleDir 'vc-vst3.vst3'
     if (-not (Test-Path $rawVst3)) { throw "No vc-vst3.vst3 found in $bundleDir." }
+    $rawPluginBinary = Join-Path $rawVst3 'Contents\x86_64-win\vc-vst3.vst3'
+    if (-not (Test-Path -LiteralPath $rawPluginBinary -PathType Leaf)) {
+        throw "Raw VST3 plugin binary not found: $rawPluginBinary"
+    }
+
+    if ($Variant -eq 'tensorrt' -and -not $RuntimeOnly -and -not $BuilderExe) {
+        $BuilderExe = $defaultBuilderExe
+    }
+    $stampArtifacts = [ordered]@{
+        'vc-vst3.vst3' = $rawPluginBinary
+    }
+    if ($Variant -eq 'tensorrt' -and -not $RuntimeOnly) {
+        $stampArtifacts['vc-tensorrt-builder.exe'] = $BuilderExe
+    }
+
+    if ($SkipBuild) {
+        Assert-PackageArtifactStamp `
+            -Path $packageStamp `
+            -PackageKind 'vst3' `
+            -Variant $Variant `
+            -Features $bundleFeatures `
+            -Asio $false `
+            -DeepFilterNet3 ([bool]$DeepFilterNet3) `
+            -RuntimeOnly ([bool]$RuntimeOnly) `
+            -Artifacts $stampArtifacts
+        Write-Host "==> Verified package artifact identity and SHA-256 values." -ForegroundColor Green
+    }
+    else {
+        Write-PackageArtifactStamp `
+            -Path $packageStamp `
+            -PackageKind 'vst3' `
+            -Variant $Variant `
+            -Features $bundleFeatures `
+            -Asio $false `
+            -DeepFilterNet3 ([bool]$DeepFilterNet3) `
+            -RuntimeOnly ([bool]$RuntimeOnly) `
+            -Artifacts $stampArtifacts
+    }
 
     # Resolve version/tag/stem now so the staging dir can be built up front.
     $version = '0.0.0'
@@ -264,20 +306,21 @@ try {
         }
     }
 
-    if ($NoZip) {
-        Write-Host "==> -NoZip: populated bundle ready in $staging (skipping archive)." -ForegroundColor Green
-        return
-    }
-
     $license = Join-Path $repoRoot 'LICENSE'
-    if (Test-Path $license) { Copy-Item $license (Join-Path $staging 'LICENSE') -Force }
+    if (-not (Test-Path -LiteralPath $license -PathType Leaf)) {
+        throw "Required LICENSE file is missing: $license"
+    }
+    Copy-Item -LiteralPath $license -Destination (Join-Path $staging 'LICENSE') -Force
 
     # Ship the optional model downloader at the package root — NOT inside the
     # .vst3 bundle, which installs into %CommonProgramFiles% (admin-only). It
     # fetches the shared models into .\assets\ beside itself; point the plugin
     # GUI at those files (model paths are not auto-discovered).
     $modelDl = Join-Path $repoRoot 'download-models.ps1'
-    if (Test-Path $modelDl) { Copy-Item $modelDl (Join-Path $staging 'download-models.ps1') -Force }
+    if (-not (Test-Path -LiteralPath $modelDl -PathType Leaf)) {
+        throw "Required model downloader is missing: $modelDl"
+    }
+    Copy-Item -LiteralPath $modelDl -Destination (Join-Path $staging 'download-models.ps1') -Force
 
     $trtNote = if ($Variant -eq 'tensorrt' -and -not $RuntimeOnly) {
         @"
@@ -325,6 +368,14 @@ $trtNote
 See licenses\ inside each bundle for third-party license texts.
 "@
     Set-Content -Path (Join-Path $staging 'INSTALL.txt') -Value $install -Encoding UTF8
+
+    # Keep -NoZip install-ready: callers use this mode for smoke tests and
+    # manual inspection, so it must include LICENSE, INSTALL.txt, and the
+    # downloader just like the archived package.
+    if ($NoZip) {
+        Write-Host "==> -NoZip: populated bundle ready in $staging (skipping archive)." -ForegroundColor Green
+        return
+    }
 
     # 5. Archive.
     $zip = Join-Path $OutDir "$stem.zip"

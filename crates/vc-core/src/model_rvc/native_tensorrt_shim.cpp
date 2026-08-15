@@ -124,6 +124,24 @@ Logger& trt_logger() {
     return logger;
 }
 
+bool native_diagnostics_enabled() {
+    char const* value = std::getenv("VC_RS_TENSORRT_DIAGNOSTICS");
+    return value != nullptr && (
+        std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0
+        || std::strcmp(value, "on") == 0 || std::strcmp(value, "yes") == 0
+    );
+}
+
+void native_diagnostic_stage(char const* stage) {
+    // Failures inside NVIDIA's runtime can terminate the process before the
+    // caller can read MessageBuffer. Keep this opt-in and load-time-only so
+    // diagnostics do not add I/O to normal realtime inference.
+    if (native_diagnostics_enabled()) {
+        std::fprintf(stderr, "[vc-rs TensorRT diagnostics] %s\n", stage);
+        std::fflush(stderr);
+    }
+}
+
 std::string dims_to_string(nvinfer1::Dims const& dims) {
     if (dims.nbDims < 0) {
         return "<invalid>";
@@ -155,6 +173,100 @@ std::size_t dtype_size(nvinfer1::DataType dtype) {
     default:
         return 0;
     }
+}
+
+char const* dtype_name(nvinfer1::DataType dtype) {
+    switch (dtype) {
+    case nvinfer1::DataType::kFLOAT:
+        return "float32";
+    case nvinfer1::DataType::kHALF:
+        return "float16";
+    case nvinfer1::DataType::kINT8:
+        return "int8";
+    case nvinfer1::DataType::kINT32:
+        return "int32";
+    case nvinfer1::DataType::kINT64:
+        return "int64";
+    case nvinfer1::DataType::kBOOL:
+        return "bool";
+    case nvinfer1::DataType::kUINT8:
+        return "uint8";
+    case nvinfer1::DataType::kBF16:
+        return "bf16";
+    default:
+        return "other";
+    }
+}
+
+struct RvcInputDtypeContract {
+    char const* name;
+    nvinfer1::DataType expected;
+};
+
+// This is the runtime half of the builder contract. Re-check the serialized
+// engine because an existing cache entry may predate the current ONNX/type
+// validation. Never narrow the Int64 RVC controls to make an engine load.
+constexpr RvcInputDtypeContract RVC_INPUT_DTYPE_CONTRACT[] = {
+    {"feats", nvinfer1::DataType::kFLOAT},
+    {"phone", nvinfer1::DataType::kFLOAT},
+    {"p_len", nvinfer1::DataType::kINT64},
+    {"phone_lengths", nvinfer1::DataType::kINT64},
+    {"pitch", nvinfer1::DataType::kINT64},
+    {"pitchf", nvinfer1::DataType::kFLOAT},
+    {"nsff0", nvinfer1::DataType::kFLOAT},
+    {"sid", nvinfer1::DataType::kINT64},
+    {"ds", nvinfer1::DataType::kINT64},
+    {"rnd", nvinfer1::DataType::kFLOAT},
+    {"z", nvinfer1::DataType::kFLOAT},
+};
+
+bool expected_rvc_input_dtype(char const* name, nvinfer1::DataType& expected) {
+    if (name == nullptr) {
+        return false;
+    }
+    for (auto const& contract : RVC_INPUT_DTYPE_CONTRACT) {
+        if (std::strcmp(name, contract.name) == 0) {
+            expected = contract.expected;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_rvc_profile(std::map<std::string, nvinfer1::Dims> const& profile) {
+    bool const has_features = profile.find("phone") != profile.end()
+        || profile.find("feats") != profile.end();
+    bool const has_pitch = profile.find("pitch") != profile.end();
+    bool const has_pitchf = profile.find("pitchf") != profile.end()
+        || profile.find("nsff0") != profile.end();
+    return has_features && has_pitch && has_pitchf;
+}
+
+bool validate_rvc_engine_input_dtypes(
+    nvinfer1::ICudaEngine const& engine,
+    Message& msg
+) {
+    for (int32_t i = 0; i < engine.getNbIOTensors(); ++i) {
+        char const* name = engine.getIOTensorName(i);
+        if (name == nullptr || engine.getTensorIOMode(name) != nvinfer1::TensorIOMode::kINPUT) {
+            continue;
+        }
+        nvinfer1::DataType expected{};
+        if (!expected_rvc_input_dtype(name, expected)) {
+            continue;
+        }
+        auto const actual = engine.getTensorDataType(name);
+        if (actual != expected) {
+            msg.append(
+                "RVC TensorRT engine input dtype mismatch: name=%s actual=%s expected=%s\n",
+                name,
+                dtype_name(actual),
+                dtype_name(expected)
+            );
+            return false;
+        }
+    }
+    return true;
 }
 
 std::size_t volume(nvinfer1::Dims const& dims) {
@@ -376,6 +488,65 @@ bool record_io(NativeEngine& native, Message& msg) {
     return true;
 }
 
+int64_t rvc_frame_count_for_seed(std::map<std::string, nvinfer1::Dims> const& profile) {
+    // All supported RVC exports expose one of these public time axes. The graph
+    // capture warmup needs a valid length before the first real worker input has
+    // been staged; it must agree with the fixed profile selected at model load.
+    for (auto const* name : {"pitch", "phone", "feats"}) {
+        auto const iter = profile.find(name);
+        if (iter == profile.end()) {
+            continue;
+        }
+        auto const& dims = iter->second;
+        if (dims.nbDims > 1 && dims.d[1] > 0) {
+            return dims.d[1];
+        }
+    }
+    return 1;
+}
+
+bool seed_input_staging_for_capture(NativeEngine& native, Message& msg) {
+    int64_t const rvc_frames = rvc_frame_count_for_seed(native.input_dims);
+    for (std::size_t i = 0; i < native.buffers.size(); ++i) {
+        char const* name = native.engine->getIOTensorName(static_cast<int32_t>(i));
+        if (native.engine->getTensorIOMode(name) != nvinfer1::TensorIOMode::kINPUT) {
+            continue;
+        }
+        auto& buffer = native.buffers[i];
+        if (buffer.host == nullptr || buffer.bytes == 0) {
+            msg.append("cannot seed TensorRT input %s: missing host staging buffer\n", name);
+            return false;
+        }
+        // CUDA graph warmup executes `record_io` before the first inference has
+        // copied caller data into the fixed host staging buffers. Zero all bytes
+        // first, then supply valid RVC Int64 controls so the warmup cannot index
+        // an arbitrary speaker or use an invalid sequence length. This is a
+        // load-time-only seed; every worker inference overwrites these addresses.
+        std::memset(buffer.host, 0, buffer.bytes);
+        auto const dtype = native.engine->getTensorDataType(name);
+        if (dtype == nvinfer1::DataType::kINT64) {
+            if (buffer.bytes % sizeof(int64_t) != 0) {
+                msg.append("cannot seed Int64 TensorRT input %s: byte count %zu is not aligned\n", name, buffer.bytes);
+                return false;
+            }
+            auto* values = static_cast<int64_t*>(buffer.host);
+            std::size_t const count = buffer.bytes / sizeof(int64_t);
+            if (std::strcmp(name, "p_len") == 0 || std::strcmp(name, "phone_lengths") == 0) {
+                std::fill(values, values + count, rvc_frames);
+            } else if (std::strcmp(name, "pitch") == 0) {
+                std::fill(values, values + count, int64_t{1});
+            }
+        }
+        msg.append(
+            "seeded native TensorRT input %s dtype=%s runtime_shape=%s\n",
+            name,
+            dtype_name(dtype),
+            dims_to_string(native.context->getTensorShape(name)).c_str()
+        );
+    }
+    return true;
+}
+
 bool enqueue_and_copy(NativeEngine& native, float* output, std::size_t output_len, Message& msg) {
     // Replay the captured graph when available; otherwise issue the sequence
     // directly. Both leave the result in the output tensor's pinned host buffer.
@@ -477,6 +648,7 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
     if (!read_file(engine_file, plan, msg, "TensorRT engine")) {
         return nullptr;
     }
+    native_diagnostic_stage("engine plan read");
 
     std::unique_ptr<NativeEngine> native(new NativeEngine());
     native->input_dims = profile;
@@ -488,9 +660,14 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
         msg.append("createInferRuntime failed\n");
         return nullptr;
     }
+    native_diagnostic_stage("TensorRT runtime created");
     native->engine.reset(native->runtime->deserializeCudaEngine(plan.data(), plan.size()));
     if (!native->engine) {
         msg.append("deserializeCudaEngine failed\n");
+        return nullptr;
+    }
+    native_diagnostic_stage("TensorRT engine deserialized");
+    if (is_rvc_profile(profile) && !validate_rvc_engine_input_dtypes(*native->engine, msg)) {
         return nullptr;
     }
     native->context.reset(native->engine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kSTATIC));
@@ -498,6 +675,7 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
         msg.append("createExecutionContext failed\n");
         return nullptr;
     }
+    native_diagnostic_stage("TensorRT execution context created");
     if (high_priority != 0) {
         int least_priority = 0;
         int greatest_priority = 0;
@@ -526,6 +704,7 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
         }
         msg.append("created native TensorRT CUDA stream priority=normal\n");
     }
+    native_diagnostic_stage("CUDA stream created");
 
     int32_t const nb_io = native->engine->getNbIOTensors();
     native->buffers.resize(static_cast<std::size_t>(nb_io));
@@ -554,6 +733,7 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
             }
         }
     }
+    native_diagnostic_stage("TensorRT input shapes resolved");
 
     int32_t output_index = tensor_index(*native, output_name);
     if (output_index < 0) {
@@ -569,6 +749,7 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
         msg.append("engine output %s has zero volume\n", output_name);
         return nullptr;
     }
+    native_diagnostic_stage("TensorRT output shape resolved");
 
     for (int32_t i = 0; i < nb_io; ++i) {
         char const* name = native->engine->getIOTensorName(i);
@@ -584,9 +765,15 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
         }
     }
 
+    if (!seed_input_staging_for_capture(*native, msg)) {
+        return nullptr;
+    }
+    native_diagnostic_stage("TensorRT IO buffers bound and seeded");
+
     // Device buffers and tensor addresses are fixed for the engine's lifetime, so
     // the inference sequence can be captured once into a CUDA graph and replayed.
     try_capture_graph(*native, msg);
+    native_diagnostic_stage("TensorRT CUDA graph setup complete");
 
     msg.append("loaded native TensorRT engine output=%s output_len=%zu profile=%s\n", output_name, native->output_len, profile_shapes);
     return native.release();
@@ -619,6 +806,29 @@ extern "C" int vc_rs_trt_contentvec_infer(
         return 2;
     }
     if (!copy_to_device(*native, input_name, audio, audio_len * sizeof(float), msg)) {
+        return 1;
+    }
+    return enqueue_and_copy(*native, output, output_len, msg) ? 0 : 1;
+}
+
+extern "C" int vc_rs_trt_fcpe_infer(
+    NativeEngine* native,
+    float const* audio,
+    std::size_t audio_len,
+    float* output,
+    std::size_t output_len,
+    char* message,
+    std::size_t message_len
+) {
+    Message msg{message, message_len};
+    if (message_len > 0) {
+        message[0] = '\0';
+    }
+    if (native == nullptr || audio == nullptr || output == nullptr) {
+        msg.append("null argument passed to TensorRT FCPE infer\n");
+        return 2;
+    }
+    if (!copy_to_device(*native, "audio", audio, audio_len * sizeof(float), msg)) {
         return 1;
     }
     return enqueue_and_copy(*native, output, output_len, msg) ? 0 : 1;

@@ -3779,6 +3779,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "silero-vad-pure"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0abf30794e6660d518ea199048c484d0e72b0f80f398b462b0e59bccae6fff9"
+dependencies = [
+ "matrixmultiply",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4576,6 +4585,7 @@ dependencies = [
  "ort",
  "realfft",
  "rubato 3.0.0",
+ "silero-vad-pure",
  "tracing",
  "tract-core",
  "tract-hir",

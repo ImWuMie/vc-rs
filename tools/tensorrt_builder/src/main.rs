@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::CString,
     os::raw::{c_char, c_int},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 unsafe extern "C" {
@@ -45,7 +45,7 @@ enum Mode {
     },
 }
 
-fn utf16_path(path: &PathBuf, label: &str) -> Vec<u16> {
+fn utf16_path(path: &Path, label: &str) -> Vec<u16> {
     #[cfg(windows)]
     use std::os::windows::ffi::OsStrExt;
 

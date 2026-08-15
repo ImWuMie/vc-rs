@@ -63,6 +63,17 @@ pub(super) struct ModelIo {
     pub(super) metadata: Vec<(String, String)>,
 }
 
+/// The small structural contract needed by the FCPE session. FCPE exports one
+/// rank-3 waveform input and one rank-3 F0 output; the first and last axes are
+/// fixed while the sample/frame axes may be symbolic. Keeping this check here
+/// lets the ORT and native TensorRT loaders reject an unrelated one-input ONNX
+/// before either backend allocates a session or engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FcpeIoContract {
+    pub(super) static_input_samples: Option<usize>,
+    pub(super) static_output_frames: Option<usize>,
+}
+
 /// The RVC generator's I/O tensor names, resolved to whatever aliases a given
 /// model actually exports. RVC ONNX exporters disagree on names: vcclient emits
 /// `feats`/`p_len`/`pitch`/`pitchf`/`sid`, RVC WebUI's own ONNX export emits
@@ -109,6 +120,8 @@ const RVC_AUDIO_ALIASES: &[&str] = &["audio", "out", "output"];
 // Latent-noise input is optional, so it has no canonical fallback: a model
 // either exports it under one of these names or samples noise internally.
 const RVC_RND_ALIASES: &[&str] = &["rnd", "z"];
+const ONNX_FLOAT32: i32 = 1;
+const ONNX_INT64: i32 = 7;
 
 impl RvcIoNames {
     /// The canonical vcclient names, for tests/benchmarks that synthesize a
@@ -167,6 +180,140 @@ impl ModelIo {
         if self.output(name).is_none() {
             let actual: Vec<&str> = self.outputs.iter().map(|t| t.name.as_str()).collect();
             bail!("required output '{name}' not found; model outputs are {actual:?}");
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_fcpe_input_contract(&self) -> Result<FcpeIoContract> {
+        let audio = self.input("audio").ok_or_else(|| {
+            anyhow!(
+                "FCPE model must expose input 'audio'; inputs are {:?}",
+                self.inputs
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })?;
+        if audio.elem_type != ONNX_FLOAT32 {
+            bail!(
+                "FCPE input 'audio' must be float32; got {}",
+                audio.describe()
+            );
+        }
+        if audio.dims.len() != 3 || audio.dims[0] != 1 || audio.dims[2] != 1 {
+            bail!(
+                "FCPE input 'audio' must have shape [1, samples, 1] (symbolic samples allowed); got {}",
+                audio.describe()
+            );
+        }
+        if audio.dims[1] < 0 {
+            bail!(
+                "FCPE input 'audio' has a negative sample dimension: {}",
+                audio.describe()
+            );
+        }
+
+        let f0 = self.output("f0_hz").ok_or_else(|| {
+            anyhow!(
+                "FCPE model must expose output 'f0_hz'; outputs are {:?}",
+                self.outputs
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })?;
+        if f0.elem_type != ONNX_FLOAT32 {
+            bail!("FCPE output 'f0_hz' must be float32; got {}", f0.describe());
+        }
+        if f0.dims.len() != 3 || !matches!(f0.dims[0], 0 | 1) || f0.dims[2] != 1 {
+            bail!(
+                "FCPE output 'f0_hz' must have shape [1, frames, 1] (symbolic axes allowed); got {}",
+                f0.describe()
+            );
+        }
+        if f0.dims[1] < 0 {
+            bail!(
+                "FCPE output 'f0_hz' has a negative frame dimension: {}",
+                f0.describe()
+            );
+        }
+
+        // The published FCPE export is tied to the 160-sample (10 ms) hop:
+        // every input window of N samples must expose N/160+1 predictions.
+        // Check this when both axes are static so an unrelated rank-3 model
+        // fails during load instead of reaching the worker and later causing a
+        // less actionable RMVPE/FCPE frame mismatch. Dynamic exports are
+        // checked against the actual window after their first inference.
+        if let (Some(samples), Some(frames)) = (
+            usize::try_from(audio.dims[1])
+                .ok()
+                .filter(|value| *value > 0),
+            usize::try_from(f0.dims[1]).ok().filter(|value| *value > 0),
+        ) {
+            let expected_frames = samples / 160 + 1;
+            if frames != expected_frames {
+                bail!(
+                    "FCPE output 'f0_hz' exposes {frames} frames for {samples} input samples; the 160-sample contract requires {expected_frames}"
+                );
+            }
+        }
+
+        Ok(FcpeIoContract {
+            static_input_samples: usize::try_from(audio.dims[1]).ok().filter(|v| *v > 0),
+            static_output_frames: usize::try_from(f0.dims[1]).ok().filter(|v| *v > 0),
+        })
+    }
+
+    /// Validate the provider-neutral RMVPE I/O contract before ORT or
+    /// TensorRT allocates a session.  Compatible exports use float32
+    /// `waveform [1, samples]`, float32 `threshold [1]`, and float32 `pitchf`
+    /// with one frame axis (rank 1/2/3 is accepted because community exports
+    /// differ in whether they retain singleton batch/channel axes).
+    pub(super) fn validate_rmvpe_contract(&self) -> Result<()> {
+        let waveform = self
+            .input("waveform")
+            .ok_or_else(|| anyhow!("RMVPE model has no 'waveform' input"))?;
+        if waveform.elem_type != ONNX_FLOAT32
+            || waveform.dims.len() != 2
+            || waveform.dims[0] != 1
+            || waveform.dims[1] < 0
+        {
+            bail!(
+                "RMVPE input 'waveform' must be float32 [1, samples] (symbolic samples allowed); got {}",
+                waveform.describe()
+            );
+        }
+
+        let threshold = self
+            .input("threshold")
+            .ok_or_else(|| anyhow!("RMVPE model has no 'threshold' input"))?;
+        if threshold.elem_type != ONNX_FLOAT32
+            || threshold.dims.len() != 1
+            || threshold.dims[0] != 1
+        {
+            bail!(
+                "RMVPE input 'threshold' must be float32 [1]; got {}",
+                threshold.describe()
+            );
+        }
+
+        let pitchf = self
+            .output("pitchf")
+            .ok_or_else(|| anyhow!("RMVPE model has no 'pitchf' output"))?;
+        let valid_shape = match pitchf.dims.as_slice() {
+            [_frames] => true,
+            [batch, _frames] => matches!(*batch, 0 | 1),
+            [batch, _frames, channels] => matches!(*batch, 0 | 1) && matches!(*channels, 0 | 1),
+            _ => false,
+        };
+        if pitchf.elem_type != ONNX_FLOAT32
+            || !valid_shape
+            || pitchf.dims.iter().any(|dim| *dim < 0)
+        {
+            bail!(
+                "RMVPE output 'pitchf' must be float32 with shape [frames], [1, frames], or [1, frames, 1]; got {}",
+                pitchf.describe()
+            );
         }
         Ok(())
     }
@@ -248,6 +395,92 @@ impl ModelIo {
         })
     }
 
+    /// Validate the exact tensor contract consumed by the shared RVC session
+    /// and return the common static time dimension. `None` means every time axis
+    /// is symbolic/dynamic. A partially static graph is rejected because a
+    /// fixed TensorRT profile cannot make inconsistent public axes coherent.
+    pub(super) fn validate_rvc_input_contract(&self, names: &RvcIoNames) -> Result<Option<usize>> {
+        let feats = self.require_rvc_input(&names.feats, ONNX_FLOAT32, "float32", 3)?;
+        validate_fixed_dim(feats, 0, 1, "batch")?;
+        validate_positive_dim(feats, 2, "feature channels")?;
+
+        let p_len = self.require_rvc_input(&names.p_len, ONNX_INT64, "int64", 1)?;
+        validate_fixed_dim(p_len, 0, 1, "length vector")?;
+
+        let pitch = self.require_rvc_input(&names.pitch, ONNX_INT64, "int64", 2)?;
+        validate_fixed_dim(pitch, 0, 1, "batch")?;
+        let pitchf = self.require_rvc_input(&names.pitchf, ONNX_FLOAT32, "float32", 2)?;
+        validate_fixed_dim(pitchf, 0, 1, "batch")?;
+
+        let sid = self.require_rvc_input(&names.sid, ONNX_INT64, "int64", 1)?;
+        validate_fixed_dim(sid, 0, 1, "speaker vector")?;
+
+        let mut time_dims = vec![
+            (names.feats.as_str(), feats.dims[1]),
+            (names.pitch.as_str(), pitch.dims[1]),
+            (names.pitchf.as_str(), pitchf.dims[1]),
+        ];
+        if let Some(rnd) = names.rnd.as_ref() {
+            let noise = self.require_rvc_input(&rnd.name, ONNX_FLOAT32, "float32", 3)?;
+            validate_fixed_dim(noise, 0, 1, "batch")?;
+            validate_fixed_dim(noise, 1, rnd.channels, "latent channels")?;
+            time_dims.push((rnd.name.as_str(), noise.dims[2]));
+        }
+
+        if let Some((name, dim)) = time_dims.iter().find(|(_, dim)| *dim < 0) {
+            bail!("RVC input '{name}' has invalid negative time dimension {dim}");
+        }
+        let static_dims: Vec<(&str, i64)> = time_dims
+            .iter()
+            .copied()
+            .filter(|(_, dim)| *dim > 0)
+            .collect();
+        if static_dims.is_empty() {
+            return Ok(None);
+        }
+        if static_dims.len() != time_dims.len() {
+            bail!(
+                "RVC ONNX time dimensions must be either all dynamic or all static; got {:?}",
+                time_dims
+            );
+        }
+        let expected = static_dims[0].1;
+        if static_dims.iter().any(|(_, dim)| *dim != expected) {
+            bail!(
+                "RVC ONNX static time dimensions must match across inputs; got {:?}",
+                time_dims
+            );
+        }
+        usize::try_from(expected)
+            .context("RVC ONNX static frame count does not fit usize")
+            .map(Some)
+    }
+
+    fn require_rvc_input(
+        &self,
+        name: &str,
+        expected_elem_type: i32,
+        expected_type_name: &str,
+        expected_rank: usize,
+    ) -> Result<&TensorInfo> {
+        let input = self
+            .input(name)
+            .ok_or_else(|| anyhow!("RVC model has no '{name}' input"))?;
+        if input.elem_type != expected_elem_type {
+            bail!(
+                "RVC input '{name}' must be {expected_type_name} (ONNX elem_type={expected_elem_type}); got {}",
+                input.describe()
+            );
+        }
+        if input.dims.len() != expected_rank {
+            bail!(
+                "RVC input '{name}' must have rank {expected_rank}; got {}",
+                input.describe()
+            );
+        }
+        Ok(input)
+    }
+
     pub(super) fn validate_rvc_metadata(&self) -> Result<()> {
         if let Some(metadata) = self.metadata_value("metadata") {
             // Exporters format the `f0` flag differently: vcclient emits the
@@ -268,20 +501,41 @@ impl ModelIo {
 
     /// The model's native audio sample rate from the metadata `samplingRate`
     /// field, when present and parseable. RVC exporters (RVC_CONVERTER /
-    /// rvc-onnx-web / RVC WebUI) record it as a JSON number; vcclient's
-    /// `{"f0": 1}` blob omits it. `None` means "unknown", and the pipeline falls
-    /// back to the [`RVC_SAMPLE_RATE`](super::shape::RVC_SAMPLE_RATE) default.
+    /// rvc-onnx-web / RVC WebUI) normally record it as a JSON number, although
+    /// some conversion tools serialize the same value as a JSON string;
+    /// vcclient's `{"f0": 1}` blob omits it. `None` means "unknown", and the
+    /// pipeline falls back to the
+    /// [`RVC_SAMPLE_RATE`](super::shape::RVC_SAMPLE_RATE) default.
     /// Dependency-free string parse, matching `validate_rvc_metadata`.
     pub(super) fn rvc_sample_rate(&self) -> Option<u32> {
-        let metadata = self.metadata_value("metadata")?;
-        let compact: String = metadata.chars().filter(|c| !c.is_whitespace()).collect();
-        const KEY: &str = r#""samplingRate":"#;
-        let start = compact.find(KEY)? + KEY.len();
-        let digits: String = compact[start..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        digits.parse::<u32>().ok().filter(|rate| *rate > 0)
+        // Most RVC exporters put the value inside a JSON `metadata` blob,
+        // while some ONNX writers emit `samplingRate` as a standalone custom
+        // metadata property.  Accept both forms so the model's declared rate
+        // is never silently replaced by the 48 kHz fallback.
+        if let Some(metadata) = self.metadata_value("metadata") {
+            let compact: String = metadata.chars().filter(|c| !c.is_whitespace()).collect();
+            const KEY: &str = r#""samplingRate":"#;
+            if let Some(start) = compact.find(KEY).map(|index| index + KEY.len()) {
+                // ONNX metadata is a compatibility boundary, so accept both
+                // `48000` and `"48000"`. This remains deliberately narrower
+                // than a general JSON parser: rates must be positive decimal
+                // integers, and malformed values fall back to the standalone
+                // property or the pipeline default.
+                let value = compact[start..]
+                    .strip_prefix('"')
+                    .unwrap_or(&compact[start..]);
+                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Some(rate) = digits.parse::<u32>().ok().filter(|rate| *rate > 0) {
+                    return Some(rate);
+                }
+            }
+        }
+
+        self.metadata
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("samplingRate"))
+            .and_then(|(_, value)| value.trim().trim_matches('"').parse::<u32>().ok())
+            .filter(|rate| *rate > 0)
     }
 
     /// Number of speaker embeddings compiled into an RVC generator.
@@ -331,13 +585,18 @@ impl ModelIo {
         };
         if let Some(name) = preferred_output {
             for output in &self.outputs {
-                if output.name == name && output.last_dim_channels() == Some(expected_channels) {
+                if output.name == name
+                    && output.elem_type == ONNX_FLOAT32
+                    && output.last_dim_channels() == Some(expected_channels)
+                {
                     return Ok(output.name.clone());
                 }
             }
         }
         for output in &self.outputs {
-            if output.last_dim_channels() == Some(expected_channels) {
+            if output.elem_type == ONNX_FLOAT32
+                && output.last_dim_channels() == Some(expected_channels)
+            {
                 return Ok(output.name.clone());
             }
         }
@@ -351,8 +610,33 @@ impl ModelIo {
             return Ok(output.name.clone());
         }
         let actual: Vec<String> = self.outputs.iter().map(|t| t.describe()).collect();
-        bail!("no embedder output matches {expected_channels} channels; outputs are {actual:?}");
+        bail!(
+            "no float32 embedder output matches {expected_channels} channels; outputs are {actual:?}"
+        );
     }
+}
+
+fn validate_fixed_dim(tensor: &TensorInfo, axis: usize, expected: i64, label: &str) -> Result<()> {
+    let actual = tensor.dims[axis];
+    if actual != expected {
+        bail!(
+            "RVC input '{}' {label} axis {axis} must be {expected}; got {}",
+            tensor.name,
+            tensor.describe()
+        );
+    }
+    Ok(())
+}
+
+fn validate_positive_dim(tensor: &TensorInfo, axis: usize, label: &str) -> Result<()> {
+    if tensor.dims[axis] <= 0 {
+        bail!(
+            "RVC input '{}' {label} axis {axis} must be statically positive; got {}",
+            tensor.name,
+            tensor.describe()
+        );
+    }
+    Ok(())
 }
 
 fn validate_embedder_output_selection(
@@ -363,6 +647,13 @@ fn validate_embedder_output_selection(
     if !tensor.is_tensor() {
         bail!(
             "{label} '{}' must be a tensor, got {}",
+            tensor.name,
+            tensor.describe()
+        );
+    }
+    if tensor.elem_type != ONNX_FLOAT32 {
+        bail!(
+            "{label} '{}' must be float32 (ONNX elem_type={ONNX_FLOAT32}), got {}",
             tensor.name,
             tensor.describe()
         );
@@ -792,6 +1083,50 @@ mod tests {
         }
     }
 
+    fn typed_webui_rvc_io(frames: i64) -> ModelIo {
+        ModelIo {
+            inputs: vec![
+                TensorInfo {
+                    name: "phone".to_string(),
+                    elem_type: ONNX_FLOAT32,
+                    dims: vec![1, frames, 768],
+                },
+                TensorInfo {
+                    name: "phone_lengths".to_string(),
+                    elem_type: ONNX_INT64,
+                    dims: vec![1],
+                },
+                TensorInfo {
+                    name: "pitch".to_string(),
+                    elem_type: ONNX_INT64,
+                    dims: vec![1, frames],
+                },
+                TensorInfo {
+                    name: "pitchf".to_string(),
+                    elem_type: ONNX_FLOAT32,
+                    dims: vec![1, frames],
+                },
+                TensorInfo {
+                    name: "ds".to_string(),
+                    elem_type: ONNX_INT64,
+                    dims: vec![1],
+                },
+                TensorInfo {
+                    name: "rnd".to_string(),
+                    elem_type: ONNX_FLOAT32,
+                    dims: vec![1, 192, frames],
+                },
+            ],
+            outputs: vec![TensorInfo {
+                name: "audio".to_string(),
+                elem_type: ONNX_FLOAT32,
+                dims: vec![1, 1, 0],
+            }],
+            initializers: Vec::new(),
+            metadata: Vec::new(),
+        }
+    }
+
     fn io_with_metadata(json: &str) -> ModelIo {
         let mut io = rvc_io(&["feats", "p_len", "pitch", "pitchf", "sid"], &["audio"]);
         io.metadata = vec![("metadata".to_string(), json.to_string())];
@@ -842,12 +1177,72 @@ mod tests {
             io_with_metadata(r#"{"samplingRate": 40000, "f0": 1}"#).rvc_sample_rate(),
             Some(40_000)
         );
+        assert_eq!(
+            io_with_metadata(r#"{"samplingRate":"48000","f0":true}"#).rvc_sample_rate(),
+            Some(48_000)
+        );
         // No samplingRate field, or no metadata blob -> unknown (pipeline default).
         assert_eq!(io_with_metadata(r#"{"f0": 1}"#).rvc_sample_rate(), None);
         assert_eq!(
             rvc_io(&["feats", "p_len", "pitch", "pitchf", "sid"], &["audio"]).rvc_sample_rate(),
             None
         );
+
+        let mut direct = rvc_io(&["feats", "p_len", "pitch", "pitchf", "sid"], &["audio"]);
+        direct.metadata = vec![("samplingRate".to_string(), "48000".to_string())];
+        assert_eq!(direct.rvc_sample_rate(), Some(48_000));
+
+        let mut quoted = rvc_io(&["feats", "p_len", "pitch", "pitchf", "sid"], &["audio"]);
+        quoted.metadata = vec![("samplingrate".to_string(), "\"32000\"".to_string())];
+        assert_eq!(quoted.rvc_sample_rate(), Some(32_000));
+    }
+
+    #[test]
+    fn embedder_output_selection_requires_float32() {
+        let io = ModelIo {
+            outputs: vec![
+                TensorInfo {
+                    name: "unit12".to_string(),
+                    elem_type: ONNX_INT64,
+                    dims: vec![1, 0, 768],
+                },
+                TensorInfo {
+                    name: "float_units".to_string(),
+                    elem_type: ONNX_FLOAT32,
+                    dims: vec![1, 0, 768],
+                },
+            ],
+            ..ModelIo::default()
+        };
+        assert_eq!(io.select_embedder_output(768, None).unwrap(), "float_units");
+
+        let error = io
+            .select_embedder_output(768, Some("unit12"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unit12"), "{error}");
+        assert!(error.contains("float32"), "{error}");
+
+        let only_integer = ModelIo {
+            outputs: vec![
+                TensorInfo {
+                    name: "unit12".to_string(),
+                    elem_type: ONNX_INT64,
+                    dims: vec![1, 0, 768],
+                },
+                TensorInfo {
+                    name: "other".to_string(),
+                    elem_type: ONNX_INT64,
+                    dims: vec![1, 0, 768],
+                },
+            ],
+            ..ModelIo::default()
+        };
+        let error = only_integer
+            .select_embedder_output(768, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no float32 embedder output"), "{error}");
     }
 
     #[test]
@@ -908,6 +1303,161 @@ mod tests {
         let rnd = names.rnd.expect("rnd should resolve");
         assert_eq!(rnd.name, "rnd");
         assert_eq!(rnd.channels, 192);
+    }
+
+    #[test]
+    fn validates_static_webui_shapes_and_int64_inputs() {
+        let io = typed_webui_rvc_io(99);
+        let names = io.resolve_rvc_io_names().unwrap();
+        assert_eq!(io.validate_rvc_input_contract(&names).unwrap(), Some(99));
+    }
+
+    #[test]
+    fn rejects_non_int64_length_pitch_and_speaker_inputs() {
+        for input_name in ["phone_lengths", "pitch", "ds"] {
+            let mut io = typed_webui_rvc_io(99);
+            io.inputs
+                .iter_mut()
+                .find(|input| input.name == input_name)
+                .unwrap()
+                .elem_type = ONNX_FLOAT32;
+            let names = io.resolve_rvc_io_names().unwrap();
+            let error = io
+                .validate_rvc_input_contract(&names)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(input_name), "{error}");
+            assert!(error.contains("int64"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_inconsistent_static_rvc_time_axes() {
+        let mut io = typed_webui_rvc_io(99);
+        io.inputs
+            .iter_mut()
+            .find(|input| input.name == "pitch")
+            .unwrap()
+            .dims[1] = 200;
+        let names = io.resolve_rvc_io_names().unwrap();
+        let error = io
+            .validate_rvc_input_contract(&names)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must match"), "{error}");
+        assert!(error.contains("99"), "{error}");
+        assert!(error.contains("200"), "{error}");
+    }
+
+    #[test]
+    fn generic_rvc_time_axes_remain_dynamic() {
+        let io = typed_webui_rvc_io(0);
+        let names = io.resolve_rvc_io_names().unwrap();
+        assert_eq!(io.validate_rvc_input_contract(&names).unwrap(), None);
+    }
+
+    #[test]
+    fn validates_fcpe_rank_dtype_and_dynamic_axes() {
+        let io = ModelIo {
+            inputs: vec![TensorInfo {
+                name: "audio".to_string(),
+                elem_type: ONNX_FLOAT32,
+                dims: vec![1, 0, 1],
+            }],
+            outputs: vec![TensorInfo {
+                name: "f0_hz".to_string(),
+                elem_type: ONNX_FLOAT32,
+                dims: vec![0, 0, 1],
+            }],
+            ..ModelIo::default()
+        };
+        assert_eq!(
+            io.validate_fcpe_input_contract().unwrap(),
+            FcpeIoContract {
+                static_input_samples: None,
+                static_output_frames: None,
+            }
+        );
+    }
+
+    #[test]
+    fn validates_fcpe_static_hop_frame_count() {
+        let mut io = ModelIo {
+            inputs: vec![TensorInfo {
+                name: "audio".to_string(),
+                elem_type: ONNX_FLOAT32,
+                dims: vec![1, 1_600, 1],
+            }],
+            outputs: vec![TensorInfo {
+                name: "f0_hz".to_string(),
+                elem_type: ONNX_FLOAT32,
+                dims: vec![1, 11, 1],
+            }],
+            ..ModelIo::default()
+        };
+        assert!(io.validate_fcpe_input_contract().is_ok());
+
+        io.outputs[0].dims[1] = 10;
+        let error = io.validate_fcpe_input_contract().unwrap_err().to_string();
+        assert!(error.contains("1600 input samples"), "{error}");
+        assert!(error.contains("requires 11"), "{error}");
+    }
+
+    #[test]
+    fn rejects_fcpe_int_input_and_wrong_output_shape() {
+        let mut io = ModelIo {
+            inputs: vec![TensorInfo {
+                name: "audio".to_string(),
+                elem_type: ONNX_INT64,
+                dims: vec![1, 1600, 1],
+            }],
+            outputs: vec![TensorInfo {
+                name: "f0_hz".to_string(),
+                elem_type: ONNX_FLOAT32,
+                dims: vec![1, 11, 2],
+            }],
+            ..ModelIo::default()
+        };
+        let err = io.validate_fcpe_input_contract().unwrap_err().to_string();
+        assert!(err.contains("float32"), "{err}");
+        io.inputs[0].elem_type = ONNX_FLOAT32;
+        let err = io.validate_fcpe_input_contract().unwrap_err().to_string();
+        assert!(err.contains("[1, frames, 1]"), "{err}");
+    }
+
+    #[test]
+    fn validates_rmvpe_contract_and_rejects_bad_bindings() {
+        let mut io = ModelIo {
+            inputs: vec![
+                TensorInfo {
+                    name: "waveform".to_string(),
+                    elem_type: ONNX_FLOAT32,
+                    dims: vec![1, 0],
+                },
+                TensorInfo {
+                    name: "threshold".to_string(),
+                    elem_type: ONNX_FLOAT32,
+                    dims: vec![1],
+                },
+            ],
+            outputs: vec![TensorInfo {
+                name: "pitchf".to_string(),
+                elem_type: ONNX_FLOAT32,
+                dims: vec![1, 0],
+            }],
+            ..ModelIo::default()
+        };
+        assert!(io.validate_rmvpe_contract().is_ok());
+
+        io.inputs[0].elem_type = ONNX_INT64;
+        let error = io.validate_rmvpe_contract().unwrap_err().to_string();
+        assert!(error.contains("waveform"), "{error}");
+        assert!(error.contains("float32"), "{error}");
+
+        io.inputs[0].elem_type = ONNX_FLOAT32;
+        io.outputs[0].dims = vec![1, 0, 2];
+        let error = io.validate_rmvpe_contract().unwrap_err().to_string();
+        assert!(error.contains("pitchf"), "{error}");
     }
 
     #[test]

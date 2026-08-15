@@ -28,6 +28,7 @@ pub mod windows_ml;
 pub mod denoise;
 pub mod denoise_config;
 pub mod dsp;
+pub mod dynamic_tuning;
 pub mod gpu;
 pub mod model_rvc;
 pub mod sola;

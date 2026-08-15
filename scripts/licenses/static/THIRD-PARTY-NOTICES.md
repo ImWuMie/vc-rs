@@ -32,6 +32,18 @@ DeepFilterNet3 can be included only in an explicitly requested `-DeepFilterNet3`
 package. Its external model archive is never bundled; distributors must review
 the upstream MIT/Apache-2.0 DeepFilterNet license separately.
 
+All package variants include the pure-Rust `silero-vad-pure` speech-activity
+detector. It embeds generic Silero VAD weights from
+<https://github.com/snakers4/silero-vad>, under MIT; the dependency runtime and
+its full MIT notice appear in the generated Rust third-party license file. This
+does not bundle RVC, ContentVec, RMVPE, retrieval-index, or target voice model
+weights, which remain external user-selected assets.
+
+FCPE is an optional external F0 model, not a package component. The reference
+ONNX export is available from <https://huggingface.co/gzivdo/fcpe-onnx> (model
+card marked MIT); users and distributors must obtain it separately and review
+its current terms.
+
 | Component | DLLs | License |
 |---|---|---|
 | NVIDIA TensorRT | `nvinfer_<N>.dll`, `nvinfer_plugin_<N>.dll`, `nvonnxparser_<N>.dll`, `nvinfer_builder_resource_sm*_<N>.dll` | [NVIDIA TensorRT SDK License Agreement](https://docs.nvidia.com/deeplearning/tensorrt/latest/reference/sla.html) |

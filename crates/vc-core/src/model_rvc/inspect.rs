@@ -114,6 +114,25 @@ pub fn validate_rvc_model(path: &Path) -> Result<()> {
     inspect_rvc_model(path).map(|_| ())
 }
 
+/// Validate an ONNX emitted by `export-pth`. A fixed-frame request must produce
+/// a truly static public tensor contract at exactly that frame count; generic
+/// exports retain the normal dynamic-or-static loader validation.
+pub fn validate_exported_rvc_model(path: &Path, expected_frames: Option<usize>) -> Result<()> {
+    let info = inspect_rvc_model(path)?;
+    if let Some(expected_frames) = expected_frames {
+        match info.static_feature_frames {
+            Some(actual_frames) if actual_frames == expected_frames => {}
+            Some(actual_frames) => bail!(
+                "fixed-frame exporter produced {actual_frames} ONNX frames, expected {expected_frames}"
+            ),
+            None => bail!(
+                "fixed-frame exporter produced dynamic ONNX time axes, expected {expected_frames} static frames"
+            ),
+        }
+    }
+    Ok(())
+}
+
 fn reject_pth_checkpoint(path: &Path) -> Result<()> {
     if path
         .extension()
@@ -164,6 +183,9 @@ fn describe_tensor(tensor: &super::onnx_meta::TensorInfo) -> String {
 
 pub(super) struct RvcModelInfo {
     pub(super) expected_feat_channels: i64,
+    /// Common static time dimension across feats/pitch/pitchf/rnd. `None` means
+    /// all model time axes are dynamic.
+    pub(super) static_feature_frames: Option<usize>,
     /// Generator I/O names resolved to this model's export convention; threaded
     /// to every binding site so vcclient, RVC WebUI, and third-party converter
     /// exports all load.
@@ -200,6 +222,7 @@ pub(super) fn inspect_rvc_model(path: &Path) -> Result<RvcModelInfo> {
     let io = read_model_io(path)?;
     let io_names = io.resolve_rvc_io_names()?;
     let expected_feat_channels = io.feat_channels(&io_names.feats)?;
+    let static_feature_frames = io.validate_rvc_input_contract(&io_names)?;
     io.validate_rvc_metadata()?;
     let rvc_sample_rate = io.rvc_sample_rate();
     let speaker_count = io.rvc_speaker_count();
@@ -209,7 +232,7 @@ pub(super) fn inspect_rvc_model(path: &Path) -> Result<RvcModelInfo> {
         .map(|rnd| format!("{}[1,{},frames]", rnd.name, rnd.channels))
         .unwrap_or_else(|| "none".to_string());
     info!(
-        "inspected RVC model: {} inputs=[{},{},{},{},{}] rnd={} output={} feat_channels={} sample_rate={} speakers={}",
+        "inspected RVC model: {} inputs=[{},{},{},{},{}] rnd={} output={} feat_channels={} frames={} sample_rate={} speakers={}",
         path.display(),
         io_names.feats,
         io_names.p_len,
@@ -219,6 +242,9 @@ pub(super) fn inspect_rvc_model(path: &Path) -> Result<RvcModelInfo> {
         rnd_desc,
         io_names.audio,
         expected_feat_channels,
+        static_feature_frames
+            .map(|frames| frames.to_string())
+            .unwrap_or_else(|| "dynamic".to_string()),
         rvc_sample_rate
             .map(|rate| rate.to_string())
             .unwrap_or_else(|| "default".to_string()),
@@ -228,6 +254,7 @@ pub(super) fn inspect_rvc_model(path: &Path) -> Result<RvcModelInfo> {
     );
     Ok(RvcModelInfo {
         expected_feat_channels,
+        static_feature_frames,
         io_names,
         rvc_sample_rate,
         speaker_count,

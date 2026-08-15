@@ -69,7 +69,9 @@ pub fn run(mut args: ExportPthArgs) -> Result<()> {
         return Err(error);
     }
 
-    if let Err(error) = vc_core::model_rvc::validate_rvc_model(&temporary_output) {
+    if let Err(error) =
+        vc_core::model_rvc::validate_exported_rvc_model(&temporary_output, args.frames)
+    {
         let _ = fs::remove_file(&temporary_output);
         return Err(error).with_context(|| {
             format!(
@@ -187,13 +189,7 @@ fn unique_name(prefix: &str, extension: &str, attempt: u32) -> String {
 }
 
 fn invoke_exporter(args: &ExportPthArgs, script: &Path, temporary_output: &Path) -> Result<()> {
-    let output = Command::new(&args.python)
-        .current_dir(&args.rvc_root)
-        .arg(script)
-        .arg("--model")
-        .arg(&args.model)
-        .arg("--output")
-        .arg(temporary_output)
+    let output = exporter_command(args, script, temporary_output)
         .output()
         .with_context(|| format!("failed to start Python exporter {}", args.python.display()))?;
     if output.status.success() {
@@ -214,6 +210,21 @@ fn invoke_exporter(args: &ExportPthArgs, script: &Path, temporary_output: &Path)
     )
 }
 
+fn exporter_command(args: &ExportPthArgs, script: &Path, temporary_output: &Path) -> Command {
+    let mut command = Command::new(&args.python);
+    command
+        .current_dir(&args.rvc_root)
+        .arg(script)
+        .arg("--model")
+        .arg(&args.model)
+        .arg("--output")
+        .arg(temporary_output);
+    if let Some(frames) = args.frames {
+        command.arg("--frames").arg(frames.to_string());
+    }
+    command
+}
+
 fn tail(text: &str) -> &str {
     const MAX_ERROR_CHARS: usize = 16 * 1024;
     if text.len() <= MAX_ERROR_CHARS {
@@ -230,6 +241,17 @@ fn tail(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn export_args(frames: Option<usize>) -> ExportPthArgs {
+        ExportPthArgs {
+            model: PathBuf::from("voice.pth"),
+            output: PathBuf::from("voice.onnx"),
+            rvc_root: PathBuf::from("rvc-root"),
+            python: PathBuf::from("python.exe"),
+            frames,
+            trust_rvc_root: true,
+        }
+    }
 
     #[test]
     fn generated_temp_names_include_the_requested_extension() {
@@ -253,5 +275,29 @@ mod tests {
         let output = absolute_path(Path::new("voice.onnx")).unwrap();
         assert!(output.is_absolute());
         assert_eq!(output.file_name().unwrap(), "voice.onnx");
+    }
+
+    #[test]
+    fn fixed_frames_are_forwarded_to_the_python_exporter() {
+        let command = exporter_command(
+            &export_args(Some(99)),
+            Path::new("exporter.py"),
+            Path::new("temporary.onnx"),
+        );
+        let arguments: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert!(arguments.windows(2).any(|pair| pair == ["--frames", "99"]));
+    }
+
+    #[test]
+    fn generic_export_does_not_pass_frames() {
+        let command = exporter_command(
+            &export_args(None),
+            Path::new("exporter.py"),
+            Path::new("temporary.onnx"),
+        );
+        assert!(command.get_args().all(|argument| argument != "--frames"));
     }
 }

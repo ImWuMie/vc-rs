@@ -151,6 +151,8 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
         model,
         embedder,
         f0_model,
+        f0_mode,
+        fcpe_model,
         index_path,
         denoiser,
         webrtc_level,
@@ -163,6 +165,8 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
             s.model.clone(),
             s.embedder.clone(),
             s.f0_model.clone(),
+            s.f0_mode.clone(),
+            s.fcpe_model.clone(),
             s.index_path.clone(),
             s.denoiser.clone(),
             s.webrtc_suppression_level.clone(),
@@ -179,8 +183,37 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     if file_row(ui, "Embedder", &embedder) {
         spawn_picker(state, ModelKind::Embedder);
     }
-    if file_row(ui, "F0 (RMVPE)", &f0_model) {
+    if f0_mode != "fcpe" && file_row(ui, "F0 (RMVPE)", &f0_model) {
         spawn_picker(state, ModelKind::F0);
+    }
+    ui.horizontal(|ui| {
+        ui.label("F0 mode");
+        egui::ComboBox::from_id_salt("f0-mode")
+            .selected_text(match f0_mode.as_str() {
+                "fcpe" => "FCPE",
+                "hybrid" => "Hybrid (RMVPE + FCPE)",
+                _ => "RMVPE",
+            })
+            .show_ui(ui, |ui| {
+                for (value, label) in [
+                    ("rmvpe", "RMVPE"),
+                    ("fcpe", "FCPE"),
+                    ("hybrid", "Hybrid (RMVPE + FCPE)"),
+                ] {
+                    if ui.selectable_label(f0_mode == value, label).clicked() {
+                        state.params.settings.write().unwrap().f0_mode = value.to_string();
+                        mark_dirty(state);
+                    }
+                }
+            });
+    });
+    if f0_mode != "rmvpe" {
+        if file_row(ui, "FCPE", &fcpe_model) {
+            spawn_picker(state, ModelKind::Fcpe);
+        }
+        ui.small(
+            "FCPE loads only on Load / Reload; fixed GPU buffers stay off the audio callback.",
+        );
     }
     if file_row(ui, "Feature index (.index)", &index_path) {
         spawn_picker(state, ModelKind::Index);
@@ -311,9 +344,9 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
         state.params.settings.write().unwrap().extra_convert_ms = v;
         mark_dirty(state);
     }
-    let (f0_threshold, f0_continuity) = {
+    let (f0_threshold, f0_continuity, f0_stabilization) = {
         let s = state.params.settings.read().unwrap();
-        (s.f0_threshold, s.f0_continuity)
+        (s.f0_threshold, s.f0_continuity, s.f0_stabilization)
     };
     if let Some(v) = f32_slider(ui, "F0 threshold", f0_threshold, 0.001, 0.5, "") {
         state.params.settings.write().unwrap().f0_threshold = v;
@@ -322,6 +355,15 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     let mut continuity = f0_continuity;
     if ui.checkbox(&mut continuity, "F0 continuity").changed() {
         state.params.settings.write().unwrap().f0_continuity = continuity;
+        mark_dirty(state);
+    }
+    let mut stabilization = f0_stabilization;
+    if ui
+        .checkbox(&mut stabilization, "F0 stabilization")
+        .on_hover_text("Correct isolated octave jumps and short F0 spikes.")
+        .changed()
+    {
+        state.params.settings.write().unwrap().f0_stabilization = stabilization;
         mark_dirty(state);
     }
     ui.small("Chunk = latency vs. context. Extra convert = extra model context.");
@@ -487,6 +529,7 @@ enum ModelKind {
     Rvc,
     Embedder,
     F0,
+    Fcpe,
     Index,
     DeepFilterNet3,
 }
@@ -506,7 +549,7 @@ fn spawn_picker(state: &EditorState, kind: ModelKind) {
             ModelKind::DeepFilterNet3 => {
                 rfd::FileDialog::new().add_filter("DeepFilterNet3 archive", &["gz"])
             }
-            ModelKind::Rvc | ModelKind::Embedder | ModelKind::F0 => {
+            ModelKind::Rvc | ModelKind::Embedder | ModelKind::F0 | ModelKind::Fcpe => {
                 rfd::FileDialog::new().add_filter("ONNX model", &["onnx"])
             }
         };
@@ -516,6 +559,7 @@ fn spawn_picker(state: &EditorState, kind: ModelKind) {
                     ModelKind::Rvc => settings.model = path,
                     ModelKind::Embedder => settings.embedder = path,
                     ModelKind::F0 => settings.f0_model = path,
+                    ModelKind::Fcpe => settings.fcpe_model = path,
                     ModelKind::Index => settings.index_path = path,
                     ModelKind::DeepFilterNet3 => settings.deepfilternet3_model = path,
                 }

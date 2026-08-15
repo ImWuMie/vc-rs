@@ -45,6 +45,15 @@ mod ffi {
             message: *mut c_char,
             message_len: usize,
         ) -> c_int;
+        pub(super) fn vc_rs_trt_fcpe_infer(
+            native: *mut c_void,
+            audio: *const f32,
+            audio_len: usize,
+            output: *mut f32,
+            output_len: usize,
+            message: *mut c_char,
+            message_len: usize,
+        ) -> c_int;
         pub(super) fn vc_rs_trt_rmvpe_infer(
             native: *mut c_void,
             waveform: *const f32,
@@ -123,6 +132,16 @@ pub(super) struct NativeRmvpeEngine {
     message: MessageBuffer,
 }
 
+#[cfg_attr(not(native_tensorrt), allow(dead_code))]
+pub(super) struct NativeFcpeEngine {
+    #[cfg(native_tensorrt)]
+    handle: std::ptr::NonNull<c_void>,
+    audio_len: NonZeroUsize,
+    output_len: NonZeroUsize,
+    #[cfg(native_tensorrt)]
+    message: MessageBuffer,
+}
+
 // GTCRN is optional independently of the native TensorRT backend. Keep its
 // native adapter out of non-GTCRN binaries so CPU/Windows ML packages do not
 // retain an unused engine role or its cache-profile code.
@@ -153,9 +172,9 @@ struct NativeRvcInputNames {
     sid: CString,
 }
 
-// Per-engine latent-noise generator for RVC exports that take the `rnd` input.
-// The engine owns it so the native path matches the ORT path: fresh N(0,1) noise
-// shaped [1, channels, frames] each chunk, reusing one scratch buffer.
+// Per-engine latent-noise state for RVC exports that take the `rnd` input. The
+// engine reuses one scratch buffer, while the shared counter-based generator
+// makes native TensorRT bit-identical to ORT for an absolute window position.
 #[cfg(native_tensorrt)]
 struct NativeRvcRnd {
     name: CString,
@@ -185,6 +204,7 @@ pub(super) struct NativeRvcEngine {
 // &mut self so concurrent enqueue on one context is not exposed.
 unsafe impl Send for NativeContentVecEngine {}
 unsafe impl Send for NativeRmvpeEngine {}
+unsafe impl Send for NativeFcpeEngine {}
 unsafe impl Send for NativeRvcEngine {}
 #[cfg(feature = "gtcrn")]
 unsafe impl Send for NativeGtcrnEngine {}
@@ -293,7 +313,9 @@ impl NativeRmvpeEngine {
         let waveform_shape = profile.fixed_input_dims("waveform")?;
         let waveform_len = shape_volume(waveform_shape, "RMVPE waveform")?;
         let load_profile = profile_with_scalars(profile, &[("threshold", &[1usize])]);
-        let path = ensure_native_engine(model_path, profile, profile.profile_shapes.as_str())?;
+        // RMVPE's threshold is a fixed scalar input, but TensorRT still
+        // requires it in the optimization-profile string on a cache miss.
+        let path = ensure_native_engine(model_path, profile, load_profile.as_str())?;
         // `handle` is unit in the no-TensorRT stub build; see the equivalent
         // binding in NativeContentVecEngine::load for the cfg rationale.
         #[cfg_attr(not(native_tensorrt), allow(clippy::let_unit_value))]
@@ -350,6 +372,69 @@ impl NativeRmvpeEngine {
             *value *= factor;
         }
         Ok(())
+    }
+}
+
+impl NativeFcpeEngine {
+    pub(super) fn load(model_path: &Path, profile: &TensorRtSessionProfile) -> Result<Self> {
+        let audio_shape = profile.fixed_input_dims("audio")?;
+        if audio_shape.len() != 3 || audio_shape[0] != 1 || audio_shape[2] != 1 {
+            bail!(
+                "native TensorRT FCPE profile audio shape must be [1, samples, 1], got {}",
+                format_usize_shape(audio_shape)
+            );
+        }
+        let audio_len = shape_volume(audio_shape, "FCPE audio")?;
+        let path = ensure_native_engine(model_path, profile, profile.profile_shapes.as_str())?;
+        #[cfg_attr(not(native_tensorrt), allow(clippy::let_unit_value))]
+        let handle = load_engine(
+            &path,
+            profile.profile_shapes.as_str(),
+            "f0_hz",
+            profile.gpu_priority,
+            profile.gpu_device_id,
+        )?;
+        let output_len = engine_output_len(handle)?;
+        let expected_frames = audio_shape[1] / 160 + 1;
+        if output_len.get() != expected_frames {
+            bail!(
+                "native TensorRT FCPE output length {} does not match audio samples {} -> expected {} frames",
+                output_len,
+                audio_shape[1],
+                expected_frames
+            );
+        }
+        info!(
+            "loaded native TensorRT FCPE engine model={} engine={} audio_shape={} output=f0_hz output_shape=1x{}x1",
+            model_path.display(),
+            path.display(),
+            format_usize_shape(audio_shape),
+            output_len
+        );
+        Ok(Self {
+            #[cfg(native_tensorrt)]
+            handle,
+            audio_len,
+            output_len,
+            #[cfg(native_tensorrt)]
+            message: MessageBuffer::new(),
+        })
+    }
+
+    pub(super) fn warmup_output_shape(&self) -> Vec<i64> {
+        vec![1, self.output_len.get() as i64, 1]
+    }
+
+    pub(super) fn extract_into(&mut self, audio: &[f32], output: &mut Vec<f32>) -> Result<()> {
+        if audio.len() != self.audio_len.get() {
+            bail!(
+                "native TensorRT FCPE audio length mismatch: got {}, expected {}",
+                audio.len(),
+                self.audio_len
+            );
+        }
+        output.resize(self.output_len.get(), 0.0);
+        infer_fcpe(self, audio, output)
     }
 }
 
@@ -437,8 +522,43 @@ impl NativeGtcrnEngine {
                 self.enh_len.get()
             );
         }
-        infer_gtcrn(self, mix, conv, tra, inter, enh)
+        infer_gtcrn(self, mix, conv, tra, inter, enh)?;
+        if let Err(error) = validate_native_gtcrn_outputs(conv, tra, inter, enh) {
+            // Recurrent tensors are both outputs and the next frame's inputs.
+            // Do not leave a malformed engine result resident in those caches:
+            // a caller that elects to recover or reset after the error must not
+            // feed NaN/Inf back into TensorRT indefinitely.
+            conv.fill(0.0);
+            tra.fill(0.0);
+            inter.fill(0.0);
+            enh.fill(0.0);
+            return Err(error);
+        }
+        Ok(())
     }
+}
+
+#[cfg(feature = "gtcrn")]
+fn validate_native_gtcrn_outputs(
+    conv: &[f32],
+    tra: &[f32],
+    inter: &[f32],
+    enh: &[f32],
+) -> Result<()> {
+    // This mirrors the ORT GTCRN output boundary. It runs on the inference
+    // worker after the fixed-buffer native call; the successful path performs
+    // only linear scans and no allocation, lock, or I/O.
+    for (name, values) in [
+        ("conv_cache_out", conv),
+        ("tra_cache_out", tra),
+        ("inter_cache_out", inter),
+        ("enh", enh),
+    ] {
+        if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+            bail!("native TensorRT GTCRN output '{name}' contains a non-finite value at index {index}");
+        }
+    }
+    Ok(())
 }
 
 impl NativeRvcEngine {
@@ -466,7 +586,11 @@ impl NativeRvcEngine {
                 (names.sid.as_str(), &[1usize]),
             ],
         );
-        let path = ensure_native_engine(model_path, profile, profile.profile_shapes.as_str())?;
+        // `phone_lengths`/`p_len` and `ds`/`sid` are fixed Int64 scalar inputs,
+        // but TensorRT still requires them in the optimization-profile string
+        // when an engine is built from a cache miss. Keep this build profile in
+        // lockstep with the profile passed to the native runtime shim.
+        let path = ensure_native_engine(model_path, profile, load_profile.as_str())?;
         // `handle` is unit in the no-TensorRT stub build; see the equivalent
         // binding in NativeContentVecEngine::load for the cfg rationale.
         #[cfg_attr(not(native_tensorrt), allow(clippy::let_unit_value))]
@@ -513,6 +637,7 @@ impl NativeRvcEngine {
         pitch: &[i64],
         pitchf: &[f32],
         speaker_id: i64,
+        window_start_frame: i64,
         out: &mut Vec<f32>,
     ) -> Result<()> {
         if feats.len() != self.frames.get() * self.channels.get() {
@@ -532,7 +657,15 @@ impl NativeRvcEngine {
         }
         #[cfg(native_tensorrt)]
         out.resize(self.output_len.get(), 0.0);
-        infer_rvc(self, feats, pitch, pitchf, speaker_id, out)
+        infer_rvc(
+            self,
+            feats,
+            pitch,
+            pitchf,
+            speaker_id,
+            window_start_frame,
+            out,
+        )
     }
 
     pub(super) fn frames(&self) -> usize {
@@ -559,6 +692,13 @@ impl Drop for NativeContentVecEngine {
 
 #[cfg(native_tensorrt)]
 impl Drop for NativeRmvpeEngine {
+    fn drop(&mut self) {
+        unsafe { ffi::vc_rs_trt_engine_destroy(self.handle.as_ptr()) };
+    }
+}
+
+#[cfg(native_tensorrt)]
+impl Drop for NativeFcpeEngine {
     fn drop(&mut self) {
         unsafe { ffi::vc_rs_trt_engine_destroy(self.handle.as_ptr()) };
     }
@@ -619,10 +759,24 @@ fn native_gtcrn_profile(
     .with_gpu_device_id(gpu_device_id))
 }
 
+const RVC_COMPATIBILITY_ENGINE_FILE: &str = "native-rvc-compat-v1.engine";
+
+fn native_engine_file_name(role: super::tensorrt::ModelRole) -> &'static str {
+    if role == super::tensorrt::ModelRole::Rvc {
+        RVC_COMPATIBILITY_ENGINE_FILE
+    } else {
+        "native.engine"
+    }
+}
+
 fn native_engine_path(profile: &TensorRtSessionProfile) -> Result<PathBuf> {
+    // The builder policy is part of an engine's ABI. RVC engines previously
+    // built at aggressive TensorRT 11 tactic levels can deserialize but fault
+    // before inference, so never reuse their old `native.engine` cache entry.
+    // Other model roles retain their cache file and their existing performance.
     Ok(profile
         .cache_dir_from_root(&tensor_rt_cache_root()?)?
-        .join("native.engine"))
+        .join(native_engine_file_name(profile.role)))
 }
 
 pub(super) fn native_engine_is_cached(profile: &TensorRtSessionProfile) -> bool {
@@ -1078,6 +1232,34 @@ fn infer_contentvec(
     Ok(())
 }
 
+#[cfg(native_tensorrt)]
+fn infer_fcpe(engine: &mut NativeFcpeEngine, audio: &[f32], output: &mut [f32]) -> Result<()> {
+    engine.message.reset();
+    let status = unsafe {
+        ffi::vc_rs_trt_fcpe_infer(
+            engine.handle.as_ptr(),
+            audio.as_ptr(),
+            audio.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            engine.message.as_mut_ptr(),
+            engine.message.len(),
+        )
+    };
+    if status != 0 {
+        bail!(
+            "native TensorRT FCPE inference failed: {}",
+            engine.message.text()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(native_tensorrt))]
+fn infer_fcpe(_engine: &mut NativeFcpeEngine, _audio: &[f32], _output: &mut [f32]) -> Result<()> {
+    bail!("native TensorRT FCPE inference is unavailable in this binary")
+}
+
 #[cfg(not(native_tensorrt))]
 fn infer_contentvec(
     _engine: &mut NativeContentVecEngine,
@@ -1143,11 +1325,6 @@ fn native_rvc_input_names(names: &RvcIoNames) -> Result<NativeRvcInputNames> {
     })
 }
 
-// Fixed seed for the native RVC latent-noise generator (mirrors the ORT path):
-// reproducible across runs, advances per chunk for independent noise.
-#[cfg(native_tensorrt)]
-const RVC_RND_SEED: u64 = 0x0000_5256_4352_4e44;
-
 #[cfg(native_tensorrt)]
 fn native_rvc_rnd(names: &RvcIoNames) -> Result<Option<NativeRvcRnd>> {
     let Some(rnd) = names.rnd.as_ref() else {
@@ -1166,7 +1343,7 @@ fn native_rvc_rnd(names: &RvcIoNames) -> Result<Option<NativeRvcRnd>> {
     Ok(Some(NativeRvcRnd {
         name,
         channels,
-        generator: super::noise::GaussianNoise::new(RVC_RND_SEED),
+        generator: super::noise::GaussianNoise::new(super::noise::RVC_RND_SEED),
         scratch: Vec::new(),
     }))
 }
@@ -1178,6 +1355,7 @@ fn infer_rvc(
     pitch: &[i64],
     pitchf: &[f32],
     speaker_id: i64,
+    window_start_frame: i64,
     output: &mut [f32],
 ) -> Result<()> {
     // Refresh latent noise (when this export takes it) into the reused scratch;
@@ -1193,7 +1371,12 @@ fn infer_rvc(
                 .checked_mul(frames)
                 .context("native TensorRT RVC rnd length overflow")?;
             rnd.scratch.resize(len, 0.0);
-            rnd.generator.fill(&mut rnd.scratch);
+            rnd.generator.fill_window(
+                &mut rnd.scratch,
+                rnd.channels.get(),
+                frames,
+                window_start_frame,
+            );
             (rnd.name.as_ptr(), rnd.scratch.as_ptr(), rnd.scratch.len())
         }
         None => (std::ptr::null(), std::ptr::null(), 0usize),
@@ -1239,6 +1422,7 @@ fn infer_rvc(
     _pitch: &[i64],
     _pitchf: &[f32],
     _speaker_id: i64,
+    _window_start_frame: i64,
     _output: &mut Vec<f32>,
 ) -> Result<()> {
     bail!("native TensorRT RVC inference is unavailable in this binary")
@@ -1362,6 +1546,7 @@ impl MessageBuffer {
 #[cfg(all(test, native_tensorrt, windows))]
 mod tests {
     use super::*;
+    use crate::model_rvc::tensorrt::ModelRole;
 
     // The test binary statically links vc-core, so the module containing this
     // code IS the test exe — its module dir must equal the exe dir. This proves
@@ -1398,5 +1583,103 @@ mod tests {
         assert!(wide.ends_with(&[0]));
         assert!(wide.contains(&0x6a21));
         assert!(wide.contains(&0x578b));
+    }
+
+    #[test]
+    fn rvc_compatibility_policy_invalidates_only_rvc_native_engines() {
+        assert_eq!(
+            native_engine_file_name(ModelRole::Rvc),
+            RVC_COMPATIBILITY_ENGINE_FILE
+        );
+        assert_eq!(
+            native_engine_file_name(ModelRole::ContentVec),
+            "native.engine"
+        );
+        assert_eq!(native_engine_file_name(ModelRole::Rmvpe), "native.engine");
+    }
+}
+
+#[cfg(all(test, feature = "gtcrn"))]
+mod gtcrn_output_contract_tests {
+    use super::validate_native_gtcrn_outputs;
+
+    #[test]
+    fn native_gtcrn_rejects_non_finite_audio_and_recurrent_outputs() {
+        validate_native_gtcrn_outputs(&[0.0], &[1.0], &[-1.0], &[0.5]).unwrap();
+
+        for (name, conv, tra, inter, enh) in [
+            ("conv_cache_out", [f32::NAN], [0.0], [0.0], [0.0]),
+            ("tra_cache_out", [0.0], [f32::INFINITY], [0.0], [0.0]),
+            ("inter_cache_out", [0.0], [0.0], [f32::NEG_INFINITY], [0.0]),
+            ("enh", [0.0], [0.0], [0.0], [f32::NAN]),
+        ] {
+            let error = validate_native_gtcrn_outputs(&conv, &tra, &inter, &enh)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(name), "{error}");
+            assert!(error.contains("non-finite"), "{error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod rvc_dtype_contract_source_tests {
+    const NATIVE_SHIM: &str = include_str!("native_tensorrt_shim.cpp");
+    const BUILDER_SHIM: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/tensorrt_builder/src/trt_builder_shim.cpp"
+    ));
+
+    const CONTRACT: &[(&str, &str)] = &[
+        ("feats", "kFLOAT"),
+        ("phone", "kFLOAT"),
+        ("p_len", "kINT64"),
+        ("phone_lengths", "kINT64"),
+        ("pitch", "kINT64"),
+        ("pitchf", "kFLOAT"),
+        ("nsff0", "kFLOAT"),
+        ("sid", "kINT64"),
+        ("ds", "kINT64"),
+        ("rnd", "kFLOAT"),
+        ("z", "kFLOAT"),
+    ];
+
+    fn assert_contract_table(source: &str, label: &str) {
+        for (name, dtype) in CONTRACT {
+            let entry = format!("{{\"{name}\", nvinfer1::DataType::{dtype}}}");
+            assert!(
+                source.contains(&entry),
+                "{label} is missing RVC dtype contract entry {entry}"
+            );
+        }
+        assert!(
+            source.contains("name=%s actual=%s expected=%s"),
+            "{label} dtype mismatch must report the actual name/type and expected type"
+        );
+    }
+
+    #[test]
+    fn builder_and_runtime_cover_every_rvc_dtype_alias() {
+        assert_contract_table(BUILDER_SHIM, "builder shim");
+        assert_contract_table(NATIVE_SHIM, "native runtime shim");
+    }
+
+    #[test]
+    fn dtype_checks_guard_build_and_cached_engine_context_creation() {
+        let parsed = BUILDER_SHIM.find("parser->parse(").unwrap();
+        let builder_check = BUILDER_SHIM
+            .find("if (rvc_profile && !validate_rvc_network_input_dtypes(*network, msg))")
+            .unwrap();
+        let build = BUILDER_SHIM
+            .find("builder->buildSerializedNetwork(")
+            .unwrap();
+        assert!(parsed < builder_check && builder_check < build);
+
+        let deserialized = NATIVE_SHIM.find("deserializeCudaEngine(").unwrap();
+        let runtime_check = NATIVE_SHIM
+            .find("if (is_rvc_profile(profile) && !validate_rvc_engine_input_dtypes(*native->engine, msg))")
+            .unwrap();
+        let context = NATIVE_SHIM.find("createExecutionContext(").unwrap();
+        assert!(deserialized < runtime_check && runtime_check < context);
     }
 }

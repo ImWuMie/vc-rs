@@ -13,6 +13,11 @@ links = "vc_rs_native_tensorrt"
 workspace = true
 
 [features]
+# Neural 16 kHz speech activity detection. This pure-Rust Silero implementation
+# embeds its MIT-licensed general VAD weights, so it also works in native
+# TensorRT packages where ONNX Runtime must remain absent.
+default = ["silero-vad"]
+silero-vad = ["dep:silero-vad-pure"]
 # Enables `clap::ValueEnum` derivation on shared config enums (e.g. `Provider`)
 # so the CLI can use them directly as `value_enum` args. Plugins leave it off.
 clap = ["dep:clap"]
@@ -72,6 +77,9 @@ audioadapter-buffers = "3"
 xxhash-rust = { version = "0.8.15", default-features = false, features = ["xxh3"] }
 clap = { version = "4.5", features = ["derive"], optional = true }
 nnnoiseless = { version = "0.5.2", default-features = false, optional = true }
+# Keep the neural VAD dependency framework-free so enabling silence suppression
+# never pulls ONNX Runtime into native TensorRT distributions.
+silero-vad-pure = { version = "=0.1.1", default-features = false, optional = true }
 # STFT/iSTFT for the GTCRN denoiser. Pinned exactly: this is an audio-quality
 # dependency whose FFT planning must not drift under us, and the plan requires a
 # fixed rev cleared via cargo-about/cargo-deny. Pure Rust (wraps `rustfft`), no

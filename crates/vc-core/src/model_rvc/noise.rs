@@ -1,113 +1,178 @@
-//! Latent-noise generation for RVC exports that expose the VITS
-//! reparameterization noise `z` (`rnd`) as a generator input instead of sampling
-//! it inside the graph. Those models expect a fresh `N(0, 1)` tensor of shape
-//! `[1, inter_channels, frames]` each call, exactly like the reference
-//! `torch.randn(1, 192, T)`.
+//! Timeline-stable latent noise for RVC exports that expose the VITS `z`
+//! (`rnd`) tensor as a generator input. The tensor layout is
+//! `[1, channels, frames]`, so contiguous memory is channel-major.
 //!
-//! Dependency-free on purpose: pulling `rand` in would add to the cargo-deny
-//! allow-list for a few lines of well-understood arithmetic. SplitMix64 supplies
-//! the uniform stream and Box-Muller maps it to a standard normal. The generator
-//! is seeded deterministically so a stream is reproducible across runs, while
-//! still advancing per chunk so successive chunks draw independent noise (what
-//! the reference does). It is worker-thread state — never touched from the audio
-//! callback — so the per-chunk arithmetic here is fine.
+//! Rolling inference replays most feature frames on every chunk. A stateful
+//! random stream would assign different noise to those replayed frames and can
+//! make the generator's overlap sound grainy or unstable. This module instead
+//! maps `(seed, channel, absolute_frame)` directly to a standard-normal value.
+//! It is deterministic, independent of call order, and shared by every backend.
 
-/// SplitMix64-backed standard-normal generator. Caches the second Box-Muller
-/// value so two normals cost one transcendental pair.
+/// Fixed seed for all RVC backends. The value spells `RVCRND` in ASCII, which
+/// keeps captures reproducible while the absolute frame coordinate prevents
+/// adjacent chunks from repeating the same window.
+pub(super) const RVC_RND_SEED: u64 = 0x0000_5256_4352_4e44;
+
+/// Counter-based standard-normal generator for an RVC `rnd` tensor.
+#[derive(Clone, Copy)]
 pub(super) struct GaussianNoise {
-    state: u64,
-    spare: Option<f32>,
+    seed: u64,
 }
 
 impl GaussianNoise {
-    /// Seeded generator. A fixed seed keeps output reproducible across runs; the
-    /// stream still advances per draw, so chunks see independent noise.
-    pub(super) fn new(seed: u64) -> Self {
-        Self {
-            state: seed,
-            spare: None,
+    pub(super) const fn new(seed: u64) -> Self {
+        Self { seed }
+    }
+
+    /// Fill a channel-major `[1, channels, frames]` window. Frames with the
+    /// same absolute coordinate receive bit-identical values even when their
+    /// local index changes in a later rolling window.
+    pub(super) fn fill_window(
+        &self,
+        out: &mut [f32],
+        channels: usize,
+        frames: usize,
+        window_start_frame: i64,
+    ) {
+        assert_eq!(
+            out.len(),
+            channels
+                .checked_mul(frames)
+                .expect("RVC rnd shape overflow"),
+            "RVC rnd output length must match [channels, frames]"
+        );
+        let frames_i64 = i64::try_from(frames).expect("RVC rnd frame count must fit i64");
+        window_start_frame
+            .checked_add(frames_i64)
+            .expect("RVC rnd absolute frame range overflow");
+
+        for channel in 0..channels {
+            let channel_offset = channel * frames;
+            let mut local_frame = 0;
+            while local_frame < frames {
+                let absolute_frame = window_start_frame + local_frame as i64;
+                let (even, odd) = self.normal_pair(channel as u64, absolute_frame.div_euclid(2));
+                if absolute_frame.rem_euclid(2) == 0 {
+                    out[channel_offset + local_frame] = even;
+                    local_frame += 1;
+                    if local_frame < frames {
+                        out[channel_offset + local_frame] = odd;
+                        local_frame += 1;
+                    }
+                } else {
+                    out[channel_offset + local_frame] = odd;
+                    local_frame += 1;
+                }
+            }
         }
     }
 
-    /// Next SplitMix64 output (uniform `u64`).
-    fn next_u64(&mut self) -> u64 {
-        // SplitMix64 (Steele et al.): increment by the golden-ratio constant,
-        // then avalanche. Good statistical quality for a tiny, fast PRNG.
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform `f64` in the half-open interval `[0, 1)` (53-bit mantissa).
-    fn next_unit(&mut self) -> f64 {
-        // Top 53 bits scaled by 2^-53 lands in [0, 1); the low bound is excluded
-        // below so the log in Box-Muller never sees zero.
-        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
-    }
-
-    /// Next `N(0, 1)` sample.
-    fn next_normal(&mut self) -> f32 {
-        if let Some(spare) = self.spare.take() {
-            return spare;
-        }
-        // Box-Muller: u1 in (0, 1] avoids ln(0); u2 spans the full turn.
-        let u1 = 1.0 - self.next_unit();
-        let u2 = self.next_unit();
+    fn normal_pair(&self, channel: u64, absolute_pair: i64) -> (f32, f32) {
+        // Pair adjacent absolute frames so one Box-Muller transform supplies
+        // both values without making the result depend on window boundaries.
+        let counter = self.seed
+            ^ channel.wrapping_mul(0xd2b7_4407_b1ce_6e93)
+            ^ (absolute_pair as u64).wrapping_mul(0xca5a_8263_9512_1157);
+        let u1 = 1.0 - unit_f64(splitmix64(counter ^ 0x8cb9_2baa_3f3d_8dd7));
+        let u2 = unit_f64(splitmix64(counter ^ 0x9e37_79b9_7f4a_7c15));
         let radius = (-2.0 * u1.ln()).sqrt();
         let angle = std::f64::consts::TAU * u2;
-        self.spare = Some((radius * angle.sin()) as f32);
-        (radius * angle.cos()) as f32
+        ((radius * angle.cos()) as f32, (radius * angle.sin()) as f32)
     }
+}
 
-    /// Fill `out` with independent `N(0, 1)` samples.
-    pub(super) fn fill(&mut self, out: &mut [f32]) {
-        for slot in out.iter_mut() {
-            *slot = self.next_normal();
-        }
-    }
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn unit_f64(bits: u64) -> f64 {
+    // The top 53 bits produce [0, 1). `normal_pair` reflects the first uniform
+    // into (0, 1], so Box-Muller never evaluates ln(0).
+    (bits >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn fill_is_deterministic_for_a_seed() {
-        let mut a = GaussianNoise::new(0x1234_5678);
-        let mut b = GaussianNoise::new(0x1234_5678);
-        let mut buf_a = [0.0f32; 256];
-        let mut buf_b = [0.0f32; 256];
-        a.fill(&mut buf_a);
-        b.fill(&mut buf_b);
-        assert_eq!(buf_a, buf_b);
+    fn window(noise: GaussianNoise, channels: usize, frames: usize, start: i64) -> Vec<f32> {
+        let mut out = vec![0.0; channels * frames];
+        noise.fill_window(&mut out, channels, frames, start);
+        out
     }
 
     #[test]
-    fn successive_fills_differ() {
-        let mut gen = GaussianNoise::new(42);
-        let mut first = [0.0f32; 256];
-        let mut second = [0.0f32; 256];
-        gen.fill(&mut first);
-        gen.fill(&mut second);
-        assert_ne!(first, second, "chunks must draw independent noise");
+    fn overlapping_windows_reuse_each_channel_frame_exactly() {
+        let noise = GaussianNoise::new(RVC_RND_SEED);
+        let channels = 4;
+        let frames = 19;
+        let shift = 7;
+        let first = window(noise, channels, frames, -11);
+        let second = window(noise, channels, frames, -11 + shift as i64);
+
+        for channel in 0..channels {
+            let first_base = channel * frames;
+            let second_base = channel * frames;
+            assert_eq!(
+                &first[first_base + shift..first_base + frames],
+                &second[second_base..second_base + frames - shift]
+            );
+        }
+    }
+
+    #[test]
+    fn same_seed_and_timeline_are_stable_across_instances() {
+        let first = window(GaussianNoise::new(1234), 3, 31, 98);
+        let second = window(GaussianNoise::new(1234), 3, 31, 98);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn different_absolute_positions_do_not_repeat() {
+        let noise = GaussianNoise::new(42);
+        assert_ne!(window(noise, 2, 64, 0), window(noise, 2, 64, 64));
+    }
+
+    #[test]
+    fn channel_major_layout_keeps_coordinate_values() {
+        let noise = GaussianNoise::new(9);
+        let full = window(noise, 3, 8, 20);
+        for channel in 0..3 {
+            let one = window(noise, channel + 1, 1, 25);
+            assert_eq!(full[channel * 8 + 5], one[channel]);
+        }
     }
 
     #[test]
     fn distribution_is_roughly_standard_normal() {
-        let mut gen = GaussianNoise::new(7);
-        let n = 100_000;
-        let mut buf = vec![0.0f32; n];
-        gen.fill(&mut buf);
-        let mean = buf.iter().copied().sum::<f32>() / n as f32;
-        let variance = buf.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
+        let values = window(GaussianNoise::new(7), 192, 521, -137);
+        let n = values.len() as f64;
+        let mean = values.iter().map(|&value| f64::from(value)).sum::<f64>() / n;
+        let variance = values
+            .iter()
+            .map(|&value| (f64::from(value) - mean).powi(2))
+            .sum::<f64>()
+            / n;
         assert!(mean.abs() < 0.05, "mean {mean} not near 0");
         assert!(
             (variance - 1.0).abs() < 0.05,
             "variance {variance} not near 1"
         );
-        // All finite: the (0, 1] guard must keep ln() away from -inf.
-        assert!(buf.iter().all(|x| x.is_finite()));
+        assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn caller_owned_scratch_capacity_is_reused() {
+        let noise = GaussianNoise::new(7);
+        let mut scratch = Vec::new();
+        scratch.resize(192 * 100, 0.0);
+        noise.fill_window(&mut scratch, 192, 100, 0);
+        let capacity = scratch.capacity();
+        scratch.resize(192 * 80, 0.0);
+        noise.fill_window(&mut scratch, 192, 80, 20);
+        assert_eq!(scratch.capacity(), capacity);
     }
 }

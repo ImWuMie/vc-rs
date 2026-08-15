@@ -9,11 +9,11 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use vc_app::{
-    AudioHost, DenoiserMode, DeviceSpec, EngineController, EngineState, EngineStatusSnapshot,
-    F0Config, F0PostprocessConfig, LiveParams, ModelLoadState, NoiseGateShaping,
-    OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot, VoiceCalibrationState,
-    DEFAULT_DENOISER_CONTENT_MIX, DEFAULT_DENOISER_RMVPE_MIX, DEFAULT_F0_THRESHOLD,
-    DEFAULT_PROTECT, DEFAULT_PROTECT_TRANSITION_MS, MAX_DENOISER_CONTENT_MIX,
+    AudioHost, DenoiserMode, DeviceSpec, DynamicTuningMode, EngineController, EngineState,
+    EngineStatusSnapshot, F0Config, F0Mode, F0PostprocessConfig, LiveParams, ModelLoadState,
+    NoiseGateShaping, OutputDynamicsConfig, RealtimeConfig, Smoother, TelemetrySnapshot,
+    VoiceCalibrationState, DEFAULT_DENOISER_CONTENT_MIX, DEFAULT_DENOISER_RMVPE_MIX,
+    DEFAULT_F0_THRESHOLD, DEFAULT_PROTECT, DEFAULT_PROTECT_TRANSITION_MS, MAX_DENOISER_CONTENT_MIX,
     MAX_DENOISER_RMVPE_MIX, MAX_PROTECT, MAX_PROTECT_TRANSITION_MS,
 };
 use vc_core::denoise_config::{
@@ -30,6 +30,7 @@ const TELEMETRY_REFRESH: Duration = Duration::from_millis(250);
 const GUI_CROSSFADE_MS: u32 = 85;
 const GUI_SOLA_SEARCH_MS: u32 = 12;
 const GUI_MIN_EXTRA_CONVERT_MS: u32 = 100;
+const GUI_MAX_RVC_FRAMES: usize = 2_048;
 const QUALITY_PRESET_CHUNK_MS: u32 = 450;
 const QUALITY_PRESET_EXTRA_CONVERT_MS: u32 = 2_120;
 const QUALITY_PRESET_PROTECT_TRANSITION_MS: u32 = 20;
@@ -138,6 +139,10 @@ struct GuiSettings {
     model: String,
     embedder: String,
     f0_model: String,
+    #[serde(default = "default_f0_mode")]
+    f0_mode: String,
+    #[serde(default)]
+    fcpe_model: String,
     index_path: String,
     provider: String,
     gpu_priority: String,
@@ -166,8 +171,17 @@ struct GuiSettings {
     smoother: String,
     rvc_output_tail_discard_ms: u32,
     extra_convert_ms: u32,
+    /// `0` keeps the timing-derived frame count. A positive even value asks a
+    /// dynamic ONNX for a dedicated fixed TensorRT profile on Apply.
+    #[serde(default)]
+    rvc_frames: usize,
     f0_threshold: f32,
     f0_continuity: bool,
+    /// Temporal F0 evidence correction: isolated octave errors, short voiced
+    /// islands, and impulsive pitch spikes. Defaults on for new/legacy GUI
+    /// settings; disabling it restores the continuity-only compatibility path.
+    #[serde(default = "default_f0_stabilization")]
+    f0_stabilization: bool,
     silence_threshold: f32,
     pitch_shift: f32,
     speaker_id: i64,
@@ -178,6 +192,8 @@ struct GuiSettings {
     protect_transition_ms: u32,
     denoiser_content_mix: f32,
     denoiser_rmvpe_mix: f32,
+    #[serde(default = "default_dynamic_tuning_mode")]
+    dynamic_tuning_mode: String,
     denoiser: String,
     #[serde(default)]
     gtcrn_model_dir: String,
@@ -191,6 +207,8 @@ struct GuiSettings {
     dfn3_post_filter_beta: f32,
     #[serde(skip_serializing)]
     noise_gate_enabled: bool,
+    #[serde(default)]
+    silence_gate_enabled: bool,
     noise_gate_threshold: f32,
     noise_gate_attack_ms: f32,
     noise_gate_release_ms: f32,
@@ -216,6 +234,8 @@ impl Default for GuiSettings {
             model: String::new(),
             embedder: String::new(),
             f0_model: String::new(),
+            f0_mode: default_f0_mode(),
+            fcpe_model: String::new(),
             index_path: String::new(),
             provider: default_provider_name().to_string(),
             gpu_priority: "high".to_string(),
@@ -236,8 +256,10 @@ impl Default for GuiSettings {
             smoother: "sola".to_string(),
             rvc_output_tail_discard_ms: 10,
             extra_convert_ms: 100,
+            rvc_frames: 0,
             f0_threshold: DEFAULT_F0_THRESHOLD,
             f0_continuity: true,
+            f0_stabilization: true,
             silence_threshold: 0.0001,
             pitch_shift: 0.0,
             speaker_id: 0,
@@ -248,6 +270,7 @@ impl Default for GuiSettings {
             protect_transition_ms: DEFAULT_PROTECT_TRANSITION_MS,
             denoiser_content_mix: DEFAULT_DENOISER_CONTENT_MIX,
             denoiser_rmvpe_mix: DEFAULT_DENOISER_RMVPE_MIX,
+            dynamic_tuning_mode: default_dynamic_tuning_mode(),
             denoiser: "off".to_string(),
             gtcrn_model_dir: String::new(),
             deepfilternet3_model: String::new(),
@@ -255,6 +278,7 @@ impl Default for GuiSettings {
             dfn3_attenuation_limit_db: DEFAULT_DFN3_ATTENUATION_LIMIT_DB,
             dfn3_post_filter_beta: DEFAULT_DFN3_POST_FILTER_BETA,
             noise_gate_enabled: false,
+            silence_gate_enabled: false,
             noise_gate_threshold: 0.01,
             noise_gate_attack_ms: 5.0,
             noise_gate_release_ms: 50.0,
@@ -302,6 +326,9 @@ impl GuiSettings {
         } else {
             DEFAULT_DENOISER_RMVPE_MIX
         };
+        if !dynamic_tuning_mode_names().contains(&self.dynamic_tuning_mode.as_str()) {
+            self.dynamic_tuning_mode = default_dynamic_tuning_mode();
+        }
         if !webrtc_suppression_level_names().contains(&self.webrtc_suppression_level.as_str()) {
             self.webrtc_suppression_level = "moderate".to_string();
         }
@@ -320,6 +347,8 @@ impl GuiSettings {
         self.crossfade_ms = GUI_CROSSFADE_MS;
         self.sola_search_ms = GUI_SOLA_SEARCH_MS;
         self.extra_convert_ms = self.extra_convert_ms.max(GUI_MIN_EXTRA_CONVERT_MS);
+        self.rvc_frames = self.rvc_frames.min(GUI_MAX_RVC_FRAMES);
+        self.rvc_frames -= self.rvc_frames % 2;
         // 0.3 was the vc-rs default before the RMVPE audit. Migrate that exact
         // value so existing GUI installs receive the corrected upstream/MXGF
         // threshold while preserving any other value the user deliberately set.
@@ -328,6 +357,9 @@ impl GuiSettings {
         }
         if !provider_names().contains(&self.provider.as_str()) {
             self.provider = default_provider_name().to_string();
+        }
+        if !f0_mode_names().contains(&self.f0_mode.as_str()) {
+            self.f0_mode = default_f0_mode();
         }
         if !gpu_priority_names().contains(&self.gpu_priority.as_str()) {
             self.gpu_priority = "high".to_string();
@@ -346,6 +378,7 @@ impl GuiSettings {
         LiveParams {
             pitch_shift: self.pitch_shift,
             speaker_id: self.speaker_id,
+            f0_threshold: self.f0_threshold,
             input_gain: self.input_gain,
             output_gain: self.output_gain,
             monitor_gain: self.monitor_gain,
@@ -353,6 +386,10 @@ impl GuiSettings {
             // denoiser between off and noise-gate takes effect without a reload;
             // rnnoise still needs a reload (it rebuilds a stateful denoiser).
             noise_gate_enabled: self.denoiser == "noise-gate",
+            // This source-activity output mute is intentionally separate from
+            // the exclusive input-gate denoiser, so it can run with WebRTC,
+            // GTCRN, and DeepFilterNet3 without replacing their state.
+            silence_gate_enabled: self.silence_gate_enabled || self.denoiser == "noise-gate",
             noise_gate_threshold: self.noise_gate_threshold,
             denoiser_content_mix: self.denoiser_content_mix,
             denoiser_rmvpe_mix: self.denoiser_rmvpe_mix,
@@ -360,6 +397,10 @@ impl GuiSettings {
             protect: self.protect,
             protect_transition_ms: self.protect_transition_ms,
         }
+    }
+
+    fn dynamic_tuning_mode(&self) -> DynamicTuningMode {
+        parse_dynamic_tuning_mode(&self.dynamic_tuning_mode).unwrap_or_default()
     }
 
     fn realtime(&self) -> Result<RealtimeConfig, String> {
@@ -373,6 +414,8 @@ impl GuiSettings {
             embedder: path_option(&self.embedder),
             embedder_output: None,
             f0_model: path_option(&self.f0_model),
+            f0_mode: parse_f0_mode(&self.f0_mode)?,
+            fcpe_model: path_option(&self.fcpe_model),
             feature_index: path_option(&self.index_path),
             provider: parse_provider(&self.provider)?,
             gpu_priority: parse_gpu_priority(&self.gpu_priority)?,
@@ -396,10 +439,14 @@ impl GuiSettings {
             },
             rvc_output_tail_discard_ms: self.rvc_output_tail_discard_ms,
             extra_convert_ms: self.extra_convert_ms,
+            rvc_frames: (self.rvc_frames != 0).then_some(self.rvc_frames),
             f0: F0Config {
                 f0_threshold: self.f0_threshold,
                 silence_threshold: self.silence_threshold,
-                postprocess: F0PostprocessConfig::continuity(self.f0_continuity),
+                postprocess: F0PostprocessConfig::continuity_with_stabilization(
+                    self.f0_continuity,
+                    self.f0_stabilization,
+                ),
             },
             denoiser_mode: parse_denoiser(&self.denoiser)?,
             gtcrn_model_dir: if self.gtcrn_model_dir.is_empty() {
@@ -491,6 +538,7 @@ fn apply_high_quality_preset(settings: &mut GuiSettings) {
     settings.extra_convert_ms = QUALITY_PRESET_EXTRA_CONVERT_MS;
     settings.f0_threshold = DEFAULT_F0_THRESHOLD;
     settings.f0_continuity = true;
+    settings.f0_stabilization = true;
     // This is a vc-rs extension rather than an MXGF setting. It remains live
     // after restart, but keeping it with the preset makes the quality profile
     // reproducible across GUI launches.
@@ -513,6 +561,7 @@ fn apply_voice_calibration_to_settings(
     );
     settings.f0_threshold = recommendation.f0_threshold;
     settings.f0_continuity = true;
+    settings.f0_stabilization = true;
     settings.input_gain = recommendation.input_gain;
     settings.noise_gate_threshold = recommendation.gate_threshold;
     settings.denoiser_content_mix = recommendation.denoiser_content_mix;
@@ -520,9 +569,10 @@ fn apply_voice_calibration_to_settings(
     settings.index_rate = recommendation.index_rate;
     settings.protect = recommendation.protect;
     settings.protect_transition_ms = recommendation.protect_transition_ms;
-    if settings.denoiser == "off" && recommendation.prefer_noise_gate {
-        settings.denoiser = "noise-gate".to_string();
-    }
+    // Unlike the legacy input-gate denoiser, the source-activity suppressor can
+    // coexist with WebRTC/GTCRN/DFN3. Keep the user's selected speech denoiser
+    // in place and only mute RVC's generated idle noise after sustained silence.
+    settings.silence_gate_enabled = recommendation.prefer_silence_suppressor;
     if settings.denoiser == "noise-gate" {
         // A slightly longer release lets short low-energy consonants keep their
         // preceding voiced envelope instead of abruptly closing.
@@ -559,6 +609,7 @@ impl VcGui {
         let (mut settings, ui_error) = load_settings();
         settings.normalize_gui_managed_settings();
         let controller = EngineController::new(settings.live());
+        controller.set_dynamic_tuning_mode(settings.dynamic_tuning_mode());
         let _ = controller.refresh_devices(settings.input_host(), settings.output_host());
         Self {
             controller,
@@ -579,6 +630,8 @@ impl VcGui {
     fn changed(&mut self) {
         self.dirty_since = Some(Instant::now());
         self.controller.set_live_params(self.settings.live());
+        self.controller
+            .set_dynamic_tuning_mode(self.settings.dynamic_tuning_mode());
     }
 
     /// Activate a pool model once it has finished loading. The pool is lazy —
@@ -624,7 +677,7 @@ impl VcGui {
     fn browse_into(&mut self, kind: ModelKind) {
         let dialog = match kind {
             ModelKind::Index => rfd::FileDialog::new().add_filter("RVC feature index", &["index"]),
-            ModelKind::Rvc | ModelKind::Embedder | ModelKind::F0 => {
+            ModelKind::Rvc | ModelKind::Embedder | ModelKind::F0 | ModelKind::Fcpe => {
                 rfd::FileDialog::new().add_filter("ONNX model", &["onnx"])
             }
         };
@@ -634,6 +687,7 @@ impl VcGui {
                 ModelKind::Rvc => self.settings.model = value,
                 ModelKind::Embedder => self.settings.embedder = value,
                 ModelKind::F0 => self.settings.f0_model = value,
+                ModelKind::Fcpe => self.settings.fcpe_model = value,
                 ModelKind::Index => self.settings.index_path = value,
             }
             self.changed();
@@ -642,6 +696,8 @@ impl VcGui {
 
     fn apply_or_start(&mut self) {
         self.controller.set_live_params(self.settings.live());
+        self.controller
+            .set_dynamic_tuning_mode(self.settings.dynamic_tuning_mode());
         let chunk_ms = self.settings.chunk_ms;
         match self.settings.realtime().and_then(|config| {
             self.controller
@@ -782,7 +838,7 @@ impl eframe::App for VcGui {
             }
         });
         if status.state == EngineState::Running && !status.passthrough_live_switchable {
-            ui.label("Live passthrough switching requires all three models; Apply / Start after selecting them.");
+            ui.label("Live passthrough switching requires the complete model set for the selected F0 mode; Apply / Start after selecting it.");
         }
         ui.separator();
 
@@ -801,11 +857,39 @@ impl eframe::App for VcGui {
             if browse_clicked {
                 self.browse_into(ModelKind::Embedder);
             }
-            let (path_changed, browse_clicked) =
-                model_path_control(ui, "F0 model", &mut self.settings.f0_model);
-            changed |= path_changed;
-            if browse_clicked {
-                self.browse_into(ModelKind::F0);
+            if self.settings.f0_mode != "fcpe" {
+                let (path_changed, browse_clicked) =
+                    model_path_control(ui, "RMVPE model", &mut self.settings.f0_model);
+                changed |= path_changed;
+                if browse_clicked {
+                    self.browse_into(ModelKind::F0);
+                }
+            }
+            egui::ComboBox::from_label("F0 mode")
+                .selected_text(f0_mode_label(&self.settings.f0_mode))
+                .show_ui(ui, |ui| {
+                    for mode in f0_mode_names() {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.settings.f0_mode,
+                                (*mode).to_string(),
+                                f0_mode_label(mode),
+                            )
+                            .changed();
+                    }
+                });
+            if self.settings.f0_mode != "rmvpe" {
+                let (path_changed, browse_clicked) =
+                    model_path_control(ui, "FCPE model", &mut self.settings.fcpe_model);
+                changed |= path_changed;
+                if browse_clicked {
+                    self.browse_into(ModelKind::Fcpe);
+                }
+                ui.small(if self.settings.f0_mode == "hybrid" {
+                    "Hybrid runs RMVPE + FCPE on the shared 10 ms grid; Apply rebuilds fixed GPU engines."
+                } else {
+                    "FCPE-only loads no RMVPE model; Apply rebuilds the fixed GPU engine."
+                });
             }
             let (path_changed, browse_clicked) =
                 model_path_control(ui, "Feature index", &mut self.settings.index_path);
@@ -1064,6 +1148,16 @@ impl eframe::App for VcGui {
                 .changed();
             changed |= ui
                 .add(
+                    egui::Slider::new(&mut self.settings.rvc_frames, 0..=GUI_MAX_RVC_FRAMES)
+                        .step_by(2.0)
+                        .text("RVC frames T (0 = auto)"),
+                )
+                .on_hover_text(
+                    "Dynamic ONNX only. 0 derives T from chunk/context; a positive even value uses more left context and rebuilds a dedicated fixed profile when Apply is clicked. Static ONNX accepts only its exported T.",
+                )
+                .changed();
+            changed |= ui
+                .add(
                     egui::Slider::new(&mut self.settings.f0_threshold, 0.001..=0.5)
                         .logarithmic(true)
                         .text("F0 threshold"),
@@ -1071,6 +1165,12 @@ impl eframe::App for VcGui {
                 .changed();
             changed |= ui
                 .checkbox(&mut self.settings.f0_continuity, "F0 continuity")
+                .changed();
+            changed |= ui
+                .checkbox(&mut self.settings.f0_stabilization, "F0 stabilization")
+                .on_hover_text(
+                    "Correct isolated octave jumps and short F0 spikes without smoothing real note changes.",
+                )
                 .changed();
             changed |= ui
                 .add(
@@ -1127,6 +1227,40 @@ impl eframe::App for VcGui {
                     profile.signal_to_noise_db,
                     profile.peak.clamp(0.0, 1.0) * 100.0,
                     profile.f0_voiced_ratio * 100.0,
+                ));
+            }
+
+            ui.separator();
+            ui.heading("Dynamic tuning");
+            let dynamic_tuning = self.controller.dynamic_tuning_snapshot();
+            let dynamic_before = self.settings.dynamic_tuning_mode.clone();
+            egui::ComboBox::from_label("Language profile")
+                .selected_text(dynamic_tuning_mode_label(&self.settings.dynamic_tuning_mode))
+                .show_ui(ui, |ui| {
+                    for mode in dynamic_tuning_mode_names() {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.settings.dynamic_tuning_mode,
+                                (*mode).to_string(),
+                                dynamic_tuning_mode_label(mode),
+                            )
+                            .changed();
+                    }
+                });
+            if self.settings.dynamic_tuning_mode != dynamic_before {
+                self.controller
+                    .set_dynamic_tuning_mode(self.settings.dynamic_tuning_mode());
+            }
+            if self.settings.dynamic_tuning_mode == "auto" {
+                ui.small("Auto uses conservative acoustic cues, not ASR language recognition.");
+            }
+            if self.settings.dynamic_tuning_mode != "off" {
+                ui.label(format!(
+                    "Active: {} | confidence {:.0}% | SNR {:.0} dB | noise floor {:.5}",
+                    dynamic_tuning.profile.label(),
+                    dynamic_tuning.confidence.clamp(0.0, 1.0) * 100.0,
+                    dynamic_tuning.estimated_snr_db,
+                    dynamic_tuning.noise_floor_rms,
                 ));
             }
 
@@ -1230,14 +1364,26 @@ impl eframe::App for VcGui {
                     }
                 }
             }
-            if self.settings.denoiser == "noise-gate" {
+            if self.settings.denoiser != "noise-gate" {
+                changed |= ui
+                    .checkbox(&mut self.settings.silence_gate_enabled, "Silence suppressor")
+                    .changed();
+            }
+            if self.settings.denoiser == "noise-gate" || self.settings.silence_gate_enabled {
+                let threshold_label = if self.settings.denoiser == "noise-gate" {
+                    "Gate threshold"
+                } else {
+                    "Silence threshold"
+                };
                 changed |= ui
                     .add(
                         egui::Slider::new(&mut self.settings.noise_gate_threshold, 0.0001..=0.5)
                             .logarithmic(true)
-                            .text("Gate threshold"),
+                            .text(threshold_label),
                     )
                     .changed();
+            }
+            if self.settings.denoiser == "noise-gate" {
                 changed |= ui
                     .add(
                         egui::Slider::new(&mut self.settings.noise_gate_attack_ms, 0.0..=200.0)
@@ -1484,6 +1630,7 @@ enum ModelKind {
     Rvc,
     Embedder,
     F0,
+    Fcpe,
     Index,
 }
 
@@ -1665,6 +1812,65 @@ fn denoiser_names() -> &'static [&'static str] {
         "gtcrn",
         "deep-filter-net3",
     ]
+}
+
+fn default_dynamic_tuning_mode() -> String {
+    "off".to_string()
+}
+
+fn default_f0_stabilization() -> bool {
+    true
+}
+
+fn default_f0_mode() -> String {
+    "rmvpe".to_string()
+}
+
+fn parse_f0_mode(value: &str) -> Result<F0Mode, String> {
+    match value {
+        "rmvpe" => Ok(F0Mode::Rmvpe),
+        "fcpe" => Ok(F0Mode::Fcpe),
+        "hybrid" => Ok(F0Mode::Hybrid),
+        _ => Err(format!("Unsupported F0 mode: {value}")),
+    }
+}
+
+fn f0_mode_names() -> &'static [&'static str] {
+    &["rmvpe", "fcpe", "hybrid"]
+}
+
+fn f0_mode_label(mode: &str) -> &'static str {
+    match mode {
+        "fcpe" => "FCPE",
+        "hybrid" => "Hybrid (RMVPE + FCPE)",
+        _ => "RMVPE",
+    }
+}
+
+fn parse_dynamic_tuning_mode(value: &str) -> Result<DynamicTuningMode, String> {
+    match value {
+        "off" => Ok(DynamicTuningMode::Off),
+        "auto" => Ok(DynamicTuningMode::Auto),
+        "chinese" => Ok(DynamicTuningMode::Chinese),
+        "english" => Ok(DynamicTuningMode::English),
+        "japanese" => Ok(DynamicTuningMode::Japanese),
+        _ => Err(format!("Unsupported dynamic tuning mode: {value}")),
+    }
+}
+
+fn dynamic_tuning_mode_names() -> &'static [&'static str] {
+    &["off", "auto", "chinese", "english", "japanese"]
+}
+
+fn dynamic_tuning_mode_label(mode: &str) -> &'static str {
+    match mode {
+        "off" => "Off",
+        "auto" => "Auto (acoustic)",
+        "chinese" => "Chinese",
+        "english" => "English",
+        "japanese" => "Japanese",
+        _ => "Off",
+    }
 }
 
 fn parse_webrtc_suppression_level(value: &str) -> Result<WebRtcSuppressionLevel, String> {
@@ -1949,6 +2155,42 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_tuning_mode_defaults_round_trips_and_normalizes() {
+        let defaults: GuiSettings = toml::from_str("").unwrap();
+        assert_eq!(defaults.dynamic_tuning_mode, "off");
+        assert_eq!(defaults.dynamic_tuning_mode(), DynamicTuningMode::Off);
+
+        let mut saved: GuiSettings = toml::from_str("dynamic_tuning_mode = \"japanese\"").unwrap();
+        saved.normalize_gui_managed_settings();
+        assert_eq!(saved.dynamic_tuning_mode(), DynamicTuningMode::Japanese);
+
+        let mut invalid = GuiSettings {
+            dynamic_tuning_mode: "unsupported".to_string(),
+            ..GuiSettings::default()
+        };
+        invalid.normalize_gui_managed_settings();
+        assert_eq!(invalid.dynamic_tuning_mode, "off");
+    }
+
+    #[test]
+    fn fcpe_f0_mode_parses_round_trips_and_normalizes() {
+        assert_eq!(parse_f0_mode("fcpe").unwrap(), F0Mode::Fcpe);
+        assert_eq!(f0_mode_label("fcpe"), "FCPE");
+        assert!(f0_mode_names().contains(&"fcpe"));
+
+        let mut saved: GuiSettings = toml::from_str("f0_mode = \"fcpe\"").unwrap();
+        saved.normalize_gui_managed_settings();
+        assert_eq!(saved.realtime().unwrap().f0_mode, F0Mode::Fcpe);
+
+        let mut invalid = GuiSettings {
+            f0_mode: "unsupported".to_string(),
+            ..GuiSettings::default()
+        };
+        invalid.normalize_gui_managed_settings();
+        assert_eq!(invalid.f0_mode, "rmvpe");
+    }
+
+    #[test]
     fn gui_gpu_priority_parses_and_normalizes() {
         assert_eq!(
             parse_gpu_priority("normal").unwrap(),
@@ -1967,6 +2209,7 @@ mod tests {
         let settings = GuiSettings::default();
         assert_eq!(settings.f0_threshold, DEFAULT_F0_THRESHOLD);
         assert!(settings.f0_continuity);
+        assert!(settings.f0_stabilization);
         let config = GuiSettings {
             passthrough: true,
             ..settings
@@ -1975,6 +2218,7 @@ mod tests {
         .unwrap();
         assert!(config.f0.postprocess.enabled);
         assert!(config.f0.postprocess.interpolate_internal_unvoiced_gaps);
+        assert!(config.f0.postprocess.fix_octave_jumps);
     }
 
     #[test]
@@ -1986,6 +2230,25 @@ mod tests {
         let mut custom: GuiSettings = toml::from_str("f0_threshold = 0.2").unwrap();
         custom.normalize_gui_managed_settings();
         assert_eq!(custom.f0_threshold, 0.2);
+    }
+
+    #[test]
+    fn gui_normalizes_and_maps_custom_rvc_frames() {
+        let mut settings = GuiSettings {
+            rvc_frames: 2_049,
+            passthrough: true,
+            ..GuiSettings::default()
+        };
+        settings.normalize_gui_managed_settings();
+        assert_eq!(settings.rvc_frames, GUI_MAX_RVC_FRAMES);
+        assert_eq!(
+            settings.realtime().unwrap().rvc_frames,
+            Some(GUI_MAX_RVC_FRAMES)
+        );
+
+        settings.rvc_frames = 201;
+        settings.normalize_gui_managed_settings();
+        assert_eq!(settings.rvc_frames, 200);
     }
 
     #[test]
@@ -2009,7 +2272,8 @@ mod tests {
         assert_eq!(settings.chunk_ms, 600);
         assert_eq!(settings.extra_convert_ms, 2_500);
         assert_eq!(settings.protect_transition_ms, 40);
-        assert_eq!(settings.denoiser, "noise-gate");
+        assert_eq!(settings.denoiser, "off");
+        assert!(settings.silence_gate_enabled);
         assert_eq!(settings.index_rate, 0.45);
         assert_eq!(settings.protect, 0.22);
         assert_eq!(settings.denoiser_rmvpe_mix, 1.0);
@@ -2033,6 +2297,20 @@ mod tests {
         apply_voice_calibration_to_settings(&mut settings, profile, TelemetrySnapshot::default());
 
         assert_eq!(settings.index_rate, 0.0);
+    }
+
+    #[test]
+    fn silence_suppressor_coexists_with_a_stateful_input_denoiser() {
+        let settings = GuiSettings {
+            denoiser: "webrtc".to_string(),
+            silence_gate_enabled: true,
+            ..GuiSettings::default()
+        };
+
+        let live = settings.live();
+
+        assert!(!live.noise_gate_enabled);
+        assert!(live.silence_gate_enabled);
     }
 
     #[test]

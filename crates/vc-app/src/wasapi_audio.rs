@@ -145,21 +145,47 @@ fn open_direction(
     )
 }
 
-pub fn build_input_stream<F>(config: WasapiStreamConfig, on_samples: F) -> Result<WasapiStream>
+pub fn build_input_stream<F>(
+    config: WasapiStreamConfig,
+    session_running: &Arc<AtomicBool>,
+    on_samples: F,
+) -> Result<WasapiStream>
 where
     F: FnMut(&[f32]) + Send + 'static,
 {
+    let session_running = Arc::clone(session_running);
     spawn_stream("input", move |running, started, init_tx, start_tx| {
-        run_input_stream(config, running, started, init_tx, start_tx, on_samples)
+        run_input_stream(
+            config,
+            running,
+            started,
+            init_tx,
+            start_tx,
+            session_running,
+            on_samples,
+        )
     })
 }
 
-pub fn build_output_stream<F>(config: WasapiStreamConfig, fill: F) -> Result<WasapiStream>
+pub fn build_output_stream<F>(
+    config: WasapiStreamConfig,
+    session_running: &Arc<AtomicBool>,
+    fill: F,
+) -> Result<WasapiStream>
 where
     F: FnMut(&mut [f32]) + Send + 'static,
 {
+    let session_running = Arc::clone(session_running);
     spawn_stream("output", move |running, started, init_tx, start_tx| {
-        run_output_stream(config, running, started, init_tx, start_tx, fill)
+        run_output_stream(
+            config,
+            running,
+            started,
+            init_tx,
+            start_tx,
+            session_running,
+            fill,
+        )
     })
 }
 
@@ -225,6 +251,7 @@ fn run_input_stream<F>(
     started: Arc<AtomicBool>,
     init_tx: SyncSender<Result<()>>,
     start_tx: SyncSender<Result<()>>,
+    session_running: Arc<AtomicBool>,
     mut on_samples: F,
 ) -> Result<()>
 where
@@ -238,6 +265,7 @@ where
             stream
         }
         Err(err) => {
+            session_running.store(false, Ordering::Release);
             let _ = init_tx.send(Err(anyhow!("{err:#}")));
             return Err(err);
         }
@@ -254,6 +282,7 @@ where
             config.device_name
         )
     }) {
+        session_running.store(false, Ordering::Release);
         let message = format!("{err:#}");
         let _ = start_tx.send(Err(anyhow!(message.clone())));
         return Err(anyhow!(message));
@@ -289,6 +318,12 @@ where
         }
         Ok(())
     })();
+    if result.is_err() {
+        // The stream thread owns the detailed error.  Publish only a lock-free
+        // stop signal; the controller thread turns it into the session error so
+        // no formatting/logging happens on the audio/event callback path.
+        session_running.store(false, Ordering::Release);
+    }
     stop_stream(&stream.audio_client, "input");
     result
 }
@@ -299,6 +334,7 @@ fn run_output_stream<F>(
     started: Arc<AtomicBool>,
     init_tx: SyncSender<Result<()>>,
     start_tx: SyncSender<Result<()>>,
+    session_running: Arc<AtomicBool>,
     mut fill: F,
 ) -> Result<()>
 where
@@ -312,6 +348,7 @@ where
             stream
         }
         Err(err) => {
+            session_running.store(false, Ordering::Release);
             let _ = init_tx.send(Err(anyhow!("{err:#}")));
             return Err(err);
         }
@@ -328,6 +365,7 @@ where
             config.device_name
         )
     }) {
+        session_running.store(false, Ordering::Release);
         let message = format!("{err:#}");
         let _ = start_tx.send(Err(anyhow!(message.clone())));
         return Err(anyhow!(message));
@@ -353,6 +391,9 @@ where
         }
         Ok(())
     })();
+    if result.is_err() {
+        session_running.store(false, Ordering::Release);
+    }
     stop_stream(&stream.audio_client, "output");
     result
 }

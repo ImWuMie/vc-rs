@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use tracing::{debug, info};
@@ -8,6 +8,7 @@ use crate::dsp;
 use crate::Provider;
 
 use super::api::{ModelOutput, VoiceModel};
+use super::f0_hybrid::HybridF0Fusion;
 use super::f0_postprocess::{F0PostprocessConfig, F0Postprocessor};
 use super::feature::FeatureTensor;
 use super::feature_index::FeatureIndex;
@@ -19,12 +20,15 @@ use super::pitch::{
     align_pitchf_to_features_into, center_crop_pitchf_to_features_into, coarse_pitch_into,
     pitchf_tail_for_output_into, voiced_ratio,
 };
-use super::sessions::{HubertEmbedderSession, RmvpePitchSession, RvcModelSession};
+use super::sessions::{
+    FcpePitchSession, HubertEmbedderSession, RmvpePitchSession, RvcModelSession,
+};
 use super::shape::{
     extra_convert_samples_from_ms, keep_tail_in_place, ms_to_samples,
-    onnx_silence_front_feature_frames, rmvpe_model_input_samples_for_context_16k,
-    tensor_rt_model_input_samples_16k, RVC_SAMPLE_RATE,
+    onnx_silence_front_feature_frames, resolve_rvc_context_samples_16k,
+    rmvpe_model_input_samples_for_context_16k, tensor_rt_model_input_samples_16k, RVC_SAMPLE_RATE,
 };
+use super::speech_activity::{OutputSilenceEnvelope, SpeechActivityDetector};
 use super::stream::{RvcStreamState, SampleDelay, StreamInputTiming};
 
 /// RMVPE confidence threshold used by upstream realtime RVC and MXGF. The old
@@ -46,25 +50,68 @@ pub const DEFAULT_PROTECT_TRANSITION_MS: u32 = 0;
 /// Cap the optional protect-boundary ramp so live automation has a bounded
 /// worker cost and cannot spread consonant protection across an entire chunk.
 pub const MAX_PROTECT_TRANSITION_MS: u32 = 100;
+/// Keep live pitch automation within a finite, musically useful range. The
+/// frontends expose +/-24 semitones, while the wider +/-48 range preserves
+/// compatibility with existing CLI configurations without allowing `powf` in
+/// F0 processing to overflow on arbitrary host input.
+pub const MIN_PITCH_SHIFT_SEMITONES: f32 = -48.0;
+pub const MAX_PITCH_SHIFT_SEMITONES: f32 = 48.0;
+/// Live gain values are applied to normalized audio and then hard-clipped. A
+/// 64x ceiling corresponds to roughly +36 dB (the VST parameter limit) and
+/// prevents malformed automation from producing non-finite intermediate data.
+pub const MAX_LIVE_GAIN: f32 = 64.0;
+/// Audio RMS and gate thresholds operate on normalized samples, so values
+/// above one have no meaningful interpretation.
+pub const MAX_NOISE_GATE_THRESHOLD: f32 = 1.0;
 const RVC_FEATURE_FRAME_MS: u32 = 10;
-/// Default share of the fully denoised signal mixed into ContentVec when a
-/// denoiser is active. RMVPE has its own independent mix control.
+/// Default base share of the denoised signal mixed into ContentVec when a
+/// denoiser is active. The worker can reduce it briefly for speech transients;
+/// RMVPE has its own smaller independent adaptation.
 pub const DEFAULT_DENOISER_CONTENT_MIX: f32 = 0.25;
-/// Keep the residual blend bounded: 0 is raw ContentVec input, 1 is the old
-/// single-path fully denoised behavior.
+/// Keep the residual blend bounded: 0 is exact raw ContentVec input, while 1 is
+/// the maximum cleaned share before speech-transient protection is applied.
 pub const MAX_DENOISER_CONTENT_MIX: f32 = 1.0;
-/// Default share of the denoised branch sent to RMVPE. Keep this at full
-/// denoise for compatibility with the pre-control pipeline.
+/// Default base share of the denoised branch sent to RMVPE. Keep the base at
+/// full denoise for compatibility; low-ZCR voiced onsets may retain a small raw
+/// share so the denoiser cannot erase their first pitch periods.
 pub const DEFAULT_DENOISER_RMVPE_MIX: f32 = 1.0;
 pub const MAX_DENOISER_RMVPE_MIX: f32 = 1.0;
+
+/// F0 backend selection. Sessions and fixed GPU resources are selected and
+/// built only while loading the pipeline; switching modes requires a reload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum F0Mode {
+    #[default]
+    Rmvpe,
+    Fcpe,
+    Hybrid,
+}
+
+impl F0Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rmvpe => "rmvpe",
+            Self::Fcpe => "fcpe",
+            Self::Hybrid => "hybrid",
+        }
+    }
+
+    pub const fn uses_rmvpe(self) -> bool {
+        matches!(self, Self::Rmvpe | Self::Hybrid)
+    }
+
+    pub const fn uses_fcpe(self) -> bool {
+        matches!(self, Self::Fcpe | Self::Hybrid)
+    }
+}
 use super::tensorrt::{
-    derive_rvc_feature_len, provider_uses_fixed_shape, tensor_rt_model_cache_key, ModelRole,
-    TensorRtRunMode, TensorRtSessionProfile, TensorRtSessionPurpose, CUDA_GRAPH_ENV,
+    derive_rvc_feature_len, provider_uses_fixed_shape, tensor_rt_model_cache_key,
+    validate_rvc_static_profile_frames, ModelRole, TensorRtRunMode, TensorRtSessionProfile,
+    TensorRtSessionPurpose, CUDA_GRAPH_ENV,
 };
 #[cfg(feature = "ort")]
 use super::tensorrt::{tensor_rt_warmup_feature_len, TensorRtSharedWaveform};
-
-const SKIP_SILENT_CHUNKS: bool = false;
 
 /// Device-rate input denoising stage, applied after `input_gain` to the cleaned
 /// branch. ContentVec and RMVPE each keep a separately delayed raw branch and
@@ -172,7 +219,7 @@ fn build_input_denoiser(config: &RvcPipelineConfig<'_>) -> InputDenoiser {
     if config.noise_gate_enabled {
         InputDenoiser::Gate(dsp::NoiseGate::new(
             config.sample_rate as f32,
-            config.noise_gate_threshold,
+            normalized_noise_gate_threshold(config.noise_gate_threshold),
             config.noise_gate_shaping.attack_ms,
             config.noise_gate_shaping.release_ms,
             config.noise_gate_shaping.floor,
@@ -184,7 +231,13 @@ fn build_input_denoiser(config: &RvcPipelineConfig<'_>) -> InputDenoiser {
 
 pub struct RvcPipeline {
     embedder: HubertEmbedderSession,
-    pitch: RmvpePitchSession,
+    f0_mode: F0Mode,
+    /// Pitch sessions are optional individually but their presence is fixed by
+    /// `f0_mode` at load time. Never create or swap them from `process`: fixed
+    /// profiles, bindings, and CUDA Graphs belong outside the realtime seam.
+    pitch: Option<RmvpePitchSession>,
+    fcpe: Option<FcpePitchSession>,
+    hybrid_fusion: HybridF0Fusion,
     rvc: RvcModelSession,
     #[cfg(feature = "ort")]
     shared_waveform: Option<TensorRtSharedWaveform>,
@@ -208,6 +261,19 @@ pub struct RvcPipeline {
     // disabled); the remaining fields let `set_noise_gate` rebuild the gate
     // when it is toggled back on without a full pipeline reload.
     input_denoiser: InputDenoiser,
+    // This output-side silence suppressor intentionally does not alter model
+    // input or inference scheduling. RVC can emit a target-voice noise floor
+    // for a quiet source, and stateful input denoisers cannot be replaced by the
+    // legacy input gate at runtime. Keep this as an independent live flag.
+    silence_gate_enabled: bool,
+    // Adaptive source-activity state for the output-only silence suppressor.
+    // It stays alongside the model stream state on the conversion worker and
+    // never feeds a callback or changes inference scheduling.
+    speech_activity: SpeechActivityDetector,
+    // Model output needs a cross-chunk ramp after the activity decision flips.
+    // Keep it on this shared worker path so frontend output rings never receive
+    // a click-causing hard zero and every host gets identical behavior.
+    output_silence_envelope: OutputSilenceEnvelope,
     // Device-rate counterpart to the stream state's GTCRN delay. It aligns raw
     // speech with model-denoiser output before both branches are resampled.
     content_raw_delay: SampleDelay,
@@ -225,6 +291,11 @@ pub struct RvcPipeline {
     // rate use this so non-48 kHz models (e.g. 32 kHz) are not mis-sized.
     rvc_sample_rate: u32,
     extra_convert_samples: usize,
+    /// Load-time selected generator length, checked against the actual
+    /// ContentVec output before every custom-T inference. This is a guardrail
+    /// for nonstandard embedders; fixed TensorRT backends additionally validate
+    /// it while constructing their profile and CUDA graph.
+    requested_rvc_frames: Option<usize>,
     rmvpe_input_samples_16k: usize,
     output_gain: f32,
     volume_envelope: bool,
@@ -233,6 +304,10 @@ pub struct RvcPipeline {
     target_output_rms: f32,
     max_output_gain: f32,
     stream_state: RvcStreamState,
+    // Absolute generator-frame timeline for exported `rnd` inputs. The end
+    // coordinate advances only by newly appended 10 ms frames; replayed rolling
+    // context therefore receives the same latent value on every inference.
+    rnd_timeline: RvcNoiseTimeline,
     // Reused per-chunk buffer for the gain-scaled / denoised input, so `process`
     // does not allocate a fresh Vec every chunk when input_gain != 1.0 or a
     // denoiser is active. Empty when the zero-copy (gain==1.0, denoiser-off) path
@@ -251,6 +326,10 @@ pub struct RvcPipeline {
     original_feature_tensor: FeatureTensor,
     input_reference_scratch: Vec<f32>,
     rms_mix_scratch: dsp::RmsMixScratch,
+    // Natural RMVPE F0 after the optional worker-side waveform periodicity
+    // check. This feeds the rolling raw-F0 timeline before any continuity or
+    // pitch shift, so retrieval, Protect, VAD, and synthesis agree on voicing.
+    pitchf_validated_scratch: Vec<f32>,
     pitchf_untrimmed_scratch: Vec<f32>,
     pitchf_scratch: Vec<f32>,
     pitch_scratch: Vec<i64>,
@@ -340,7 +419,9 @@ pub struct F0Config {
 /// FAISS file is load-time work. `index_rate` and `protect` are live values so
 /// front ends can A/B them without reloading models. Both are clamped in the
 /// worker-side `apply_live` path, so hostile automation cannot turn a malformed
-/// float into invalid feature data.
+/// float into invalid feature data. `index_rate` is the base retrieval share;
+/// the shared worker may reduce it per frame when distance, voicing, or a sharp
+/// ContentVec boundary indicates that source features are more reliable.
 #[derive(Clone, Debug)]
 pub struct FeatureRetrievalConfig<'a> {
     pub index_path: Option<&'a Path>,
@@ -367,7 +448,7 @@ impl Default for F0Config {
         Self {
             f0_threshold: DEFAULT_F0_THRESHOLD,
             silence_threshold: 0.0001,
-            postprocess: F0PostprocessConfig::continuity(true),
+            postprocess: F0PostprocessConfig::continuity_with_stabilization(true, true),
         }
     }
 }
@@ -377,15 +458,19 @@ impl Default for F0Config {
 /// [`RvcPipeline::apply_live`], which is the single live-update entry point
 /// shared by every front-end (the standalone worker and the VST3 host callback).
 ///
-/// `noise_gate_enabled`/`noise_gate_threshold` live here, but the gate's
-/// attack/release/floor and the denoiser *variant* selection (off / gate /
-/// rnnoise) are static load-time config: switching to/from rnnoise rebuilds a
-/// stateful denoiser and so requires a reload, and `apply_live` cannot replace
-/// an active rnnoise stage (see `set_noise_gate`).
+/// `noise_gate_enabled`/`noise_gate_threshold` control the legacy input gate,
+/// whose attack/release/floor and denoiser *variant* selection (off / gate /
+/// rnnoise) are static load-time config. `silence_gate_enabled` is separate: it
+/// retains the input denoiser and mutes generated output after sustained source
+/// silence, so it is safe to use with stateful denoisers (see `set_noise_gate`).
 #[derive(Clone, Copy, Debug)]
 pub struct LiveParams {
     pub pitch_shift: f32,
     pub speaker_id: i64,
+    /// RMVPE voiced/unvoiced confidence threshold. This is live so the dynamic
+    /// tuner can react to speech/noise conditions without rebuilding inference
+    /// sessions or interrupting the rolling F0 timeline.
+    pub f0_threshold: f32,
     pub input_gain: f32,
     pub output_gain: f32,
     // Monitor output gain, applied by the vc-app realtime worker when routing
@@ -395,16 +480,21 @@ pub struct LiveParams {
     // worker alongside the other live knobs).
     pub monitor_gain: f32,
     pub noise_gate_enabled: bool,
+    /// Source-activity output mute that can coexist with any input denoiser.
+    /// It uses the F0/silence threshold from [`F0Config`] as its source
+    /// reference; the input Noise Gate threshold is intentionally independent.
+    pub silence_gate_enabled: bool,
     pub noise_gate_threshold: f32,
-    /// Share of the denoised signal mixed into ContentVec when a denoiser is
-    /// active. `0.25` keeps a raw residual for fricatives; `1.0` is legacy
-    /// single-path behavior.
+    /// Base share of the denoised signal mixed into ContentVec. `0.25` keeps a
+    /// raw residual; worker-side transient protection can reduce a nonzero base
+    /// briefly, while zero remains exact raw input.
     pub denoiser_content_mix: f32,
-    /// Share of the denoised signal sent to RMVPE. `0.0` uses the aligned raw
-    /// branch, `1.0` preserves the historical fully denoised RMVPE input.
+    /// Base share of the denoised signal sent to RMVPE. `0.0` is exact aligned
+    /// raw input; low-ZCR voiced onsets can slightly reduce a nonzero base.
     pub denoiser_rmvpe_mix: f32,
-    /// RVC index blend amount. Meaningful only if an index was selected while
-    /// the pipeline was loaded; zero gives an exact no-retrieval fast path.
+    /// Base RVC index blend amount. Meaningful only if an index was selected
+    /// while the pipeline was loaded; the worker adapts this value per frame,
+    /// and zero gives an exact no-retrieval fast path.
     pub index_rate: f32,
     /// Amount of indexed ContentVec retained on unvoiced (F0 <= 0) frames.
     /// Standard RVC accepts `0.0..=0.5`; `0.5` disables protection.
@@ -420,10 +510,12 @@ impl Default for LiveParams {
         Self {
             pitch_shift: 0.0,
             speaker_id: 0,
+            f0_threshold: DEFAULT_F0_THRESHOLD,
             input_gain: 1.0,
             output_gain: 1.0,
             monitor_gain: 1.0,
             noise_gate_enabled: false,
+            silence_gate_enabled: false,
             noise_gate_threshold: 0.01,
             denoiser_content_mix: DEFAULT_DENOISER_CONTENT_MIX,
             denoiser_rmvpe_mix: DEFAULT_DENOISER_RMVPE_MIX,
@@ -434,11 +526,44 @@ impl Default for LiveParams {
     }
 }
 
+impl LiveParams {
+    /// Return a finite, bounded snapshot suitable for the lock-free worker
+    /// channel. Frontends historically passed this plain struct directly, so
+    /// sanitizing at the shared boundary protects both realtime and VST3 paths
+    /// without changing the public fields or requiring a fallible API.
+    pub fn sanitized(self) -> Self {
+        Self {
+            pitch_shift: normalized_pitch_shift(self.pitch_shift),
+            speaker_id: self.speaker_id,
+            f0_threshold: if self.f0_threshold.is_finite() {
+                self.f0_threshold.clamp(0.001, 0.5)
+            } else {
+                DEFAULT_F0_THRESHOLD
+            },
+            input_gain: normalized_live_gain(self.input_gain),
+            output_gain: normalized_live_gain(self.output_gain),
+            monitor_gain: normalized_live_gain(self.monitor_gain),
+            noise_gate_enabled: self.noise_gate_enabled,
+            silence_gate_enabled: self.silence_gate_enabled,
+            noise_gate_threshold: normalized_noise_gate_threshold(self.noise_gate_threshold),
+            index_rate: normalized_unit_value(self.index_rate),
+            protect: normalized_protect(self.protect),
+            protect_transition_ms: normalized_protect_transition_ms(self.protect_transition_ms),
+            denoiser_content_mix: normalized_denoiser_content_mix(self.denoiser_content_mix),
+            denoiser_rmvpe_mix: normalized_denoiser_rmvpe_mix(self.denoiser_rmvpe_mix),
+        }
+    }
+}
+
 pub struct RvcPipelineConfig<'a> {
     pub model: &'a Path,
     pub embedder: &'a Path,
     pub embedder_output: Option<&'a str>,
-    pub f0_model: &'a Path,
+    /// RMVPE ONNX path. Required for `Rmvpe` and `Hybrid`, unused for `Fcpe`.
+    pub f0_model: Option<&'a Path>,
+    pub f0_mode: F0Mode,
+    /// FCPE ONNX path. Required for `Fcpe` and `Hybrid`, unused for `Rmvpe`.
+    pub fcpe_model: Option<&'a Path>,
     pub provider: Provider,
     pub gpu_priority: super::GpuPriority,
     pub gpu_device_id: u32,
@@ -450,6 +575,9 @@ pub struct RvcPipelineConfig<'a> {
     pub retrieval: FeatureRetrievalConfig<'a>,
     pub input_gain: f32,
     pub noise_gate_enabled: bool,
+    /// Keep converted output quiet after sustained source silence without
+    /// replacing a configured stateful input denoiser.
+    pub silence_gate_enabled: bool,
     pub noise_gate_threshold: f32,
     pub denoiser_content_mix: f32,
     pub denoiser_rmvpe_mix: f32,
@@ -457,6 +585,10 @@ pub struct RvcPipelineConfig<'a> {
     pub output_extra_ms: u32,
     pub volume_excluded_ms: u32,
     pub extra_convert_ms: u32,
+    /// Optional fixed RVC generator frame count. This is resolved while loading
+    /// into one ContentVec window, TensorRT profile, engine, and CUDA graph;
+    /// it is intentionally not a live parameter.
+    pub rvc_frames: Option<usize>,
     pub output_gain: f32,
     pub output_dynamics: OutputDynamicsConfig,
     /// Optional load-time progress callback. It is invoked only while building
@@ -468,6 +600,7 @@ pub struct RvcPipelineConfig<'a> {
 pub enum LoadModelRole {
     ContentVec,
     Rmvpe,
+    Fcpe,
     Rvc,
     Gtcrn,
 }
@@ -477,6 +610,7 @@ impl LoadModelRole {
         match self {
             Self::ContentVec => "ContentVec",
             Self::Rmvpe => "RMVPE",
+            Self::Fcpe => "FCPE",
             Self::Rvc => "RVC",
             Self::Gtcrn => "GTCRN",
         }
@@ -500,6 +634,53 @@ fn report_progress(config: &RvcPipelineConfig<'_>, progress: LoadProgress) {
     if let Some(report) = config.progress {
         report(progress);
     }
+}
+
+/// Validate the profile selected at load time against both the ONNX contract
+/// and an optional user-selected T. This must stay on the loading path: the
+/// realtime worker is allowed to reuse the resulting fixed buffers only.
+fn validate_rvc_profile_frames(
+    static_onnx_frames: Option<usize>,
+    requested_frames: Option<usize>,
+    actual_frames: usize,
+) -> Result<()> {
+    validate_rvc_static_profile_frames(static_onnx_frames, actual_frames)?;
+    if let Some(requested_frames) = requested_frames {
+        if requested_frames != actual_frames {
+            bail!(
+                "RVC custom T={requested_frames}, but the selected ContentVec profile produces T={actual_frames}; use auto or a T compatible with this embedder"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_f0_models<'a>(
+    mode: F0Mode,
+    rmvpe_model: Option<&'a Path>,
+    fcpe_model: Option<&'a Path>,
+) -> Result<(Option<&'a Path>, Option<&'a Path>)> {
+    let rmvpe_model = if mode.uses_rmvpe() {
+        Some(rmvpe_model.ok_or_else(|| {
+            anyhow::anyhow!(
+                "F0 mode '{}' requires an RMVPE ONNX model path (f0_model)",
+                mode.label()
+            )
+        })?)
+    } else {
+        None
+    };
+    let fcpe_model = if mode.uses_fcpe() {
+        Some(fcpe_model.ok_or_else(|| {
+            anyhow::anyhow!(
+                "F0 mode '{}' requires an FCPE ONNX model path (fcpe_model)",
+                mode.label()
+            )
+        })?)
+    } else {
+        None
+    };
+    Ok((rmvpe_model, fcpe_model))
 }
 
 fn report_native_load_progress(
@@ -533,6 +714,64 @@ fn normalized_unit_value(value: f32) -> f32 {
     }
 }
 
+fn normalized_pitch_shift(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(MIN_PITCH_SHIFT_SEMITONES, MAX_PITCH_SHIFT_SEMITONES)
+    } else {
+        0.0
+    }
+}
+
+fn normalized_live_gain(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, MAX_LIVE_GAIN)
+    } else {
+        1.0
+    }
+}
+
+fn normalized_noise_gate_threshold(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, MAX_NOISE_GATE_THRESHOLD)
+    } else {
+        0.01
+    }
+}
+
+/// Tracks the right edge of the generator window rather than assuming a fixed
+/// chunk/window size. This also handles a larger or smaller offline tail window:
+/// its start moves by both the appended-frame count and the window-size delta.
+#[derive(Default)]
+struct RvcNoiseTimeline {
+    window_end_frame: Option<i64>,
+}
+
+impl RvcNoiseTimeline {
+    fn reset(&mut self) {
+        self.window_end_frame = None;
+    }
+
+    fn next_window_start(&mut self, frame_len: usize, new_feature_frames: usize) -> Result<i64> {
+        let frame_len = i64::try_from(frame_len).context("RVC frame length does not fit i64")?;
+        let new_feature_frames = i64::try_from(new_feature_frames)
+            .context("new RVC feature-frame count does not fit i64")?;
+        let window_end_frame = match self.window_end_frame {
+            Some(previous_end) => previous_end
+                .checked_add(new_feature_frames)
+                .context("RVC rnd timeline overflow")?,
+            // Anchor the first (possibly left-padded) window at zero. Later
+            // windows still share coordinates because only new frames advance
+            // this right edge.
+            None => frame_len,
+        };
+        let window_start_frame = window_end_frame
+            .checked_sub(frame_len)
+            .context("RVC rnd timeline underflow")?;
+        self.window_end_frame = Some(window_end_frame);
+        Ok(window_start_frame)
+    }
+}
+
 fn normalized_protect(value: f32) -> f32 {
     if value.is_finite() {
         value.clamp(0.0, MAX_PROTECT)
@@ -558,6 +797,19 @@ fn normalized_denoiser_rmvpe_mix(value: f32) -> f32 {
         value.clamp(0.0, MAX_DENOISER_RMVPE_MIX)
     } else {
         DEFAULT_DENOISER_RMVPE_MIX
+    }
+}
+
+fn output_silence_threshold(configured_threshold: f32) -> f32 {
+    // The output activity gate has its own F0/silence reference.  Do not reuse
+    // the input Noise Gate threshold here: input denoisers commonly use values
+    // around 0.01, while a quiet but valid microphone phrase can be far below
+    // that level.  Coupling the two made enabling input denoising swallow the
+    // first syllable after an idle period.
+    if configured_threshold.is_finite() {
+        configured_threshold.max(0.0)
+    } else {
+        0.0
     }
 }
 
@@ -727,6 +979,8 @@ impl RvcPipeline {
 
     pub fn load(config: RvcPipelineConfig<'_>) -> Result<Self> {
         report_progress(&config, LoadProgress::ValidatingConfig);
+        let (rmvpe_model, fcpe_model) =
+            resolve_f0_models(config.f0_mode, config.f0_model, config.fcpe_model)?;
         if provider_needs_fixed_shape_profile(config.provider) {
             return Self::load_fixed_shape(config);
         }
@@ -759,13 +1013,20 @@ impl RvcPipeline {
         // conversion at load time and leave the per-chunk processing path in samples.
         let extra_convert_samples =
             extra_convert_samples_from_ms(config.extra_convert_ms, rvc_sample_rate);
-        let input_samples_16k = tensor_rt_model_input_samples_16k(
+        let automatic_input_samples_16k = tensor_rt_model_input_samples_16k(
             config.chunk_samples,
             config.sample_rate,
             config.output_extra_ms,
             extra_convert_samples,
             rvc_sample_rate,
         );
+        let input_samples_16k = resolve_rvc_context_samples_16k(
+            automatic_input_samples_16k,
+            config.rvc_frames,
+            rvc_info.static_feature_frames,
+            extra_convert_samples,
+            rvc_sample_rate,
+        )?;
         let rmvpe_input_samples_16k = rmvpe_model_input_samples_for_context_16k(
             config.chunk_samples,
             config.sample_rate,
@@ -802,42 +1063,75 @@ impl RvcPipeline {
             TensorRtRunMode::PinnedCpu,
             TensorRtSessionPurpose::Main,
         )?;
-        report_progress(
-            &config,
-            LoadProgress::LoadingModel {
-                role: LoadModelRole::Rmvpe,
-            },
-        );
-        let pitch = RmvpePitchSession::load(
-            config.f0_model,
-            config.provider,
-            None,
-            TensorRtRunMode::PinnedCpu,
-            TensorRtSessionPurpose::Main,
-        )?;
+        let pitch = if let Some(rmvpe_model) = rmvpe_model {
+            report_progress(
+                &config,
+                LoadProgress::LoadingModel {
+                    role: LoadModelRole::Rmvpe,
+                },
+            );
+            Some(RmvpePitchSession::load(
+                rmvpe_model,
+                config.provider,
+                None,
+                TensorRtRunMode::PinnedCpu,
+                TensorRtSessionPurpose::Main,
+            )?)
+        } else {
+            None
+        };
+        let fcpe = if let Some(fcpe_model) = fcpe_model {
+            report_progress(
+                &config,
+                LoadProgress::LoadingModel {
+                    role: LoadModelRole::Fcpe,
+                },
+            );
+            Some(FcpePitchSession::load(
+                fcpe_model,
+                config.provider,
+                None,
+                TensorRtRunMode::PinnedCpu,
+                TensorRtSessionPurpose::Main,
+            )?)
+        } else {
+            None
+        };
+        let mut stream_state = RvcStreamState::new(rvc_sample_rate);
+        stream_state.set_contentvec_context_samples_16k(input_samples_16k);
         Ok(Self {
             embedder,
+            f0_mode: config.f0_mode,
             pitch,
+            fcpe,
+            hybrid_fusion: HybridF0Fusion::default(),
             rvc,
             #[cfg(feature = "ort")]
             shared_waveform: None,
             speaker_count,
             speaker_id,
-            pitch_shift: config.pitch_shift,
+            pitch_shift: normalized_pitch_shift(config.pitch_shift),
             feature_index,
             index_rate: normalized_unit_value(config.retrieval.index_rate),
             protect: normalized_protect(config.retrieval.protect),
             protect_transition_ms: normalized_protect_transition_ms(
                 config.retrieval.protect_transition_ms,
             ),
-            f0_threshold: config.f0.f0_threshold,
+            f0_threshold: if config.f0.f0_threshold.is_finite() {
+                config.f0.f0_threshold.clamp(0.001, 0.5)
+            } else {
+                DEFAULT_F0_THRESHOLD
+            },
             silence_threshold: config.f0.silence_threshold,
-            input_gain: config.input_gain,
+            input_gain: normalized_live_gain(config.input_gain),
             input_denoiser: build_input_denoiser(&config),
+            silence_gate_enabled: config.silence_gate_enabled,
+            speech_activity: SpeechActivityDetector::default(),
+            output_silence_envelope: OutputSilenceEnvelope::default(),
             content_raw_delay: SampleDelay::default(),
             denoiser_content_mix: normalized_denoiser_content_mix(config.denoiser_content_mix),
             denoiser_rmvpe_mix: normalized_denoiser_rmvpe_mix(config.denoiser_rmvpe_mix),
-            noise_gate_threshold: config.noise_gate_threshold,
+            noise_gate_threshold: normalized_noise_gate_threshold(config.noise_gate_threshold),
             noise_gate_attack_ms: config.noise_gate_shaping.attack_ms,
             noise_gate_release_ms: config.noise_gate_shaping.release_ms,
             noise_gate_floor: config.noise_gate_shaping.floor,
@@ -846,20 +1140,23 @@ impl RvcPipeline {
             volume_excluded_ms: config.volume_excluded_ms,
             rvc_sample_rate,
             extra_convert_samples,
+            requested_rvc_frames: config.rvc_frames,
             rmvpe_input_samples_16k,
-            output_gain: config.output_gain,
+            output_gain: normalized_live_gain(config.output_gain),
             volume_envelope: config.output_dynamics.volume_envelope,
             rms_mix_rate: config.output_dynamics.rms_mix_rate,
             auto_output_gain: config.output_dynamics.auto_output_gain,
             target_output_rms: config.output_dynamics.target_output_rms,
             max_output_gain: config.output_dynamics.max_output_gain,
-            stream_state: RvcStreamState::new(rvc_sample_rate),
+            stream_state,
+            rnd_timeline: RvcNoiseTimeline::default(),
             input_scratch: Vec::new(),
             denoiser_scratch: Vec::new(),
             feature_tensor: FeatureTensor::default(),
             original_feature_tensor: FeatureTensor::default(),
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
+            pitchf_validated_scratch: Vec::new(),
             pitchf_untrimmed_scratch: Vec::new(),
             pitchf_scratch: Vec::new(),
             pitch_scratch: Vec::new(),
@@ -870,6 +1167,8 @@ impl RvcPipeline {
 
     fn load_fixed_shape(config: RvcPipelineConfig<'_>) -> Result<Self> {
         report_progress(&config, LoadProgress::PreparingProvider);
+        let (rmvpe_model, fcpe_model) =
+            resolve_f0_models(config.f0_mode, config.f0_model, config.fcpe_model)?;
         // Windows ML catalog providers may also use fixed-shape profiles, but
         // their adapter selection is owned by Windows ML. Only explicit CUDA
         // backends consume the user-selected CUDA device ID.
@@ -920,28 +1219,40 @@ impl RvcPipeline {
         let rvc_sample_rate = rvc_info.rvc_sample_rate.unwrap_or(RVC_SAMPLE_RATE);
         let extra_convert_samples =
             extra_convert_samples_from_ms(config.extra_convert_ms, rvc_sample_rate);
-        let input_samples_16k = tensor_rt_model_input_samples_16k(
+        let automatic_input_samples_16k = tensor_rt_model_input_samples_16k(
             config.chunk_samples,
             config.sample_rate,
             config.output_extra_ms,
             extra_convert_samples,
             rvc_sample_rate,
         );
+        let input_samples_16k = resolve_rvc_context_samples_16k(
+            automatic_input_samples_16k,
+            config.rvc_frames,
+            rvc_info.static_feature_frames,
+            extra_convert_samples,
+            rvc_sample_rate,
+        )?;
         let rmvpe_input_samples_16k = rmvpe_model_input_samples_for_context_16k(
             config.chunk_samples,
             config.sample_rate,
             input_samples_16k,
         );
-        let (contentvec_model_cache_key, rmvpe_model_cache_key, rvc_model_cache_key) =
-            if provider_needs_fixed_shape_profile(config.provider) {
-                (
-                    Some(tensor_rt_model_cache_key(config.embedder)?),
-                    Some(tensor_rt_model_cache_key(config.f0_model)?),
-                    Some(tensor_rt_model_cache_key(config.model)?),
-                )
-            } else {
-                (None, None, None)
-            };
+        let (
+            contentvec_model_cache_key,
+            rmvpe_model_cache_key,
+            fcpe_model_cache_key,
+            rvc_model_cache_key,
+        ) = if provider_needs_fixed_shape_profile(config.provider) {
+            (
+                Some(tensor_rt_model_cache_key(config.embedder)?),
+                rmvpe_model.map(tensor_rt_model_cache_key).transpose()?,
+                fcpe_model.map(tensor_rt_model_cache_key).transpose()?,
+                Some(tensor_rt_model_cache_key(config.model)?),
+            )
+        } else {
+            (None, None, None, None)
+        };
         // Fixed-shape GPU profiles must use the model's exported input name.
         // Keep this CPU-only probe at load time; the realtime path relies on
         // the resulting profile for CUDA/TensorRT validation and IoBinding.
@@ -958,20 +1269,34 @@ impl RvcPipeline {
         .with_gpu_priority(config.gpu_priority)
         .with_gpu_device_id(gpu_device_id)
         .with_optional_model_cache_key(contentvec_model_cache_key);
-        let rmvpe_profile = TensorRtSessionProfile::single_input(
-            ModelRole::Rmvpe,
-            "waveform",
-            rmvpe_input_samples_16k,
-        )
-        .with_gpu_priority(config.gpu_priority)
-        .with_gpu_device_id(gpu_device_id)
-        .with_optional_model_cache_key(rmvpe_model_cache_key);
+        let rmvpe_profile = rmvpe_model.map(|_| {
+            TensorRtSessionProfile::single_input(
+                ModelRole::Rmvpe,
+                "waveform",
+                rmvpe_input_samples_16k,
+            )
+            .with_gpu_priority(config.gpu_priority)
+            .with_gpu_device_id(gpu_device_id)
+            .with_optional_model_cache_key(rmvpe_model_cache_key)
+        });
+        let fcpe_profile = fcpe_model.map(|_| {
+            TensorRtSessionProfile::new(
+                ModelRole::Fcpe,
+                vec![super::tensorrt::TensorRtInputShape {
+                    name: "audio".to_string(),
+                    dims: vec![1, rmvpe_input_samples_16k, 1],
+                }],
+            )
+            .with_gpu_priority(config.gpu_priority)
+            .with_gpu_device_id(gpu_device_id)
+            .with_optional_model_cache_key(fcpe_model_cache_key)
+        });
         #[cfg(feature = "ort")]
         let shared_waveform_shape = [1usize, input_samples_16k];
         #[cfg(feature = "ort")]
         let mut shared_waveform: Option<TensorRtSharedWaveform> = None;
 
-        let (embedder, pitch, rvc) = if tensor_rt_run_mode.cuda_graph() {
+        let (embedder, pitch, fcpe, rvc) = if tensor_rt_run_mode.cuda_graph() {
             #[cfg(not(feature = "ort"))]
             {
                 unreachable!("cuda_graph run mode requires the `ort` feature")
@@ -1001,6 +1326,11 @@ impl RvcPipeline {
                 )?;
                 drop(embedder_probe);
                 let feature_len = warmup.rvc_feature_len;
+                validate_rvc_profile_frames(
+                    rvc_info.static_feature_frames,
+                    config.rvc_frames,
+                    feature_len,
+                )?;
                 let rvc_profile = TensorRtSessionProfile::rvc(
                     feature_len,
                     expected_feat_channels_usize,
@@ -1010,31 +1340,68 @@ impl RvcPipeline {
                 .with_gpu_device_id(gpu_device_id)
                 .with_optional_model_cache_key(rvc_model_cache_key.clone());
                 info!(
-                "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} rvc={}",
-                config.provider.label(),
-                config.sample_rate,
-                config.chunk_samples,
-                contentvec_profile.profile_shapes,
-                rmvpe_profile.profile_shapes,
-                rvc_profile.profile_shapes
-            );
-
-                report_progress(
-                    &config,
-                    LoadProgress::LoadingModel {
-                        role: LoadModelRole::Rmvpe,
-                    },
+                    "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} fcpe={} rvc={}",
+                    config.provider.label(),
+                    config.sample_rate,
+                    config.chunk_samples,
+                    contentvec_profile.profile_shapes,
+                    rmvpe_profile
+                        .as_ref()
+                        .map(|profile| profile.profile_shapes.as_str())
+                        .unwrap_or("disabled"),
+                    fcpe_profile
+                        .as_ref()
+                        .map(|profile| profile.profile_shapes.as_str())
+                        .unwrap_or("disabled"),
+                    rvc_profile.profile_shapes
                 );
-                let mut pitch_probe = RmvpePitchSession::load(
-                    config.f0_model,
-                    config.provider,
-                    Some(rmvpe_profile.clone()),
-                    TensorRtRunMode::PinnedCpu,
-                    TensorRtSessionPurpose::Probe,
-                )?;
-                let rmvpe_output_shape = pitch_probe
-                    .warmup_output_shape(rmvpe_input_samples_16k, config.f0.f0_threshold)?;
-                drop(pitch_probe);
+
+                let rmvpe_output_shape = if let (Some(rmvpe_model), Some(rmvpe_profile)) =
+                    (rmvpe_model, rmvpe_profile.as_ref())
+                {
+                    report_progress(
+                        &config,
+                        LoadProgress::LoadingModel {
+                            role: LoadModelRole::Rmvpe,
+                        },
+                    );
+                    let mut pitch_probe = RmvpePitchSession::load(
+                        rmvpe_model,
+                        config.provider,
+                        Some(rmvpe_profile.clone()),
+                        TensorRtRunMode::PinnedCpu,
+                        TensorRtSessionPurpose::Probe,
+                    )?;
+                    let shape = pitch_probe
+                        .warmup_output_shape(rmvpe_input_samples_16k, config.f0.f0_threshold)?;
+                    drop(pitch_probe);
+                    Some(shape)
+                } else {
+                    None
+                };
+
+                let fcpe_output_shape = if let (Some(fcpe_model), Some(fcpe_profile)) =
+                    (fcpe_model, fcpe_profile.as_ref())
+                {
+                    report_progress(
+                        &config,
+                        LoadProgress::LoadingModel {
+                            role: LoadModelRole::Fcpe,
+                        },
+                    );
+                    let mut fcpe_probe = FcpePitchSession::load(
+                        fcpe_model,
+                        config.provider,
+                        Some(fcpe_profile.clone()),
+                        TensorRtRunMode::PinnedCpu,
+                        TensorRtSessionPurpose::Probe,
+                    )?;
+                    let shape = fcpe_probe.warmup_output_shape(rmvpe_input_samples_16k)?;
+                    drop(fcpe_probe);
+                    Some(shape)
+                } else {
+                    None
+                };
 
                 report_progress(
                     &config,
@@ -1081,14 +1448,37 @@ impl RvcPipeline {
                     shared_waveform.as_ref(),
                 )?;
 
-                let mut pitch = RmvpePitchSession::load(
-                    config.f0_model,
-                    config.provider,
-                    Some(rmvpe_profile),
-                    tensor_rt_run_mode,
-                    TensorRtSessionPurpose::Final,
-                )?;
-                pitch.enable_tensorrt_binding(&rmvpe_output_shape, config.f0.f0_threshold, None)?;
+                let pitch = if let (Some(rmvpe_model), Some(rmvpe_profile), Some(output_shape)) =
+                    (rmvpe_model, rmvpe_profile, rmvpe_output_shape.as_deref())
+                {
+                    let mut pitch = RmvpePitchSession::load(
+                        rmvpe_model,
+                        config.provider,
+                        Some(rmvpe_profile),
+                        tensor_rt_run_mode,
+                        TensorRtSessionPurpose::Final,
+                    )?;
+                    pitch.enable_tensorrt_binding(output_shape, config.f0.f0_threshold, None)?;
+                    Some(pitch)
+                } else {
+                    None
+                };
+
+                let fcpe = if let (Some(fcpe_model), Some(fcpe_profile), Some(output_shape)) =
+                    (fcpe_model, fcpe_profile, fcpe_output_shape.as_deref())
+                {
+                    let mut fcpe = FcpePitchSession::load(
+                        fcpe_model,
+                        config.provider,
+                        Some(fcpe_profile),
+                        tensor_rt_run_mode,
+                        TensorRtSessionPurpose::Final,
+                    )?;
+                    fcpe.enable_tensorrt_binding(output_shape)?;
+                    Some(fcpe)
+                } else {
+                    None
+                };
 
                 let mut rvc = RvcModelSession::load(
                     config.model,
@@ -1100,7 +1490,7 @@ impl RvcPipeline {
                     rvc_info.io_names.clone(),
                 )?;
                 rvc.enable_tensorrt_binding(&rvc_output_shape, speaker_id)?;
-                (embedder, pitch, rvc)
+                (embedder, pitch, fcpe, rvc)
             }
         } else if config.provider.is_tensorrt() {
             // Native TensorRT engines self-report their fixed output shapes after
@@ -1126,6 +1516,11 @@ impl RvcPipeline {
             };
             let feature_len =
                 derive_rvc_feature_len(contentvec_frames, extra_convert_samples, rvc_sample_rate)?;
+            validate_rvc_profile_frames(
+                rvc_info.static_feature_frames,
+                config.rvc_frames,
+                feature_len,
+            )?;
             let rvc_profile = TensorRtSessionProfile::rvc(
                 feature_len,
                 expected_feat_channels_usize,
@@ -1135,7 +1530,7 @@ impl RvcPipeline {
             .with_gpu_device_id(gpu_device_id)
             .with_optional_model_cache_key(rvc_model_cache_key.clone());
             info!(
-                "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} rvc={}",
+                "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} fcpe={} rvc={}",
                 config.provider.label(),
                 config.sample_rate,
                 config.chunk_samples,
@@ -1144,7 +1539,14 @@ impl RvcPipeline {
                     .as_ref()
                     .map(|profile| profile.profile_shapes.as_str())
                     .unwrap_or("none"),
-                rmvpe_profile.profile_shapes,
+                rmvpe_profile
+                    .as_ref()
+                    .map(|profile| profile.profile_shapes.as_str())
+                    .unwrap_or("disabled"),
+                fcpe_profile
+                    .as_ref()
+                    .map(|profile| profile.profile_shapes.as_str())
+                    .unwrap_or("disabled"),
                 rvc_profile.profile_shapes
             );
             report_native_load_progress(&config, &rvc_profile, LoadModelRole::Rvc);
@@ -1162,17 +1564,38 @@ impl RvcPipeline {
             // ORT IoBinding, so the returned shape is intentionally discarded.
             rvc.warmup_output_shape(feature_len, rvc_info.expected_feat_channels, speaker_id)?;
 
-            report_native_load_progress(&config, &rmvpe_profile, LoadModelRole::Rmvpe);
-            let mut pitch = RmvpePitchSession::load(
-                config.f0_model,
-                config.provider,
-                Some(rmvpe_profile),
-                tensor_rt_run_mode,
-                TensorRtSessionPurpose::Final,
-            )?;
-            pitch.warmup_output_shape(rmvpe_input_samples_16k, config.f0.f0_threshold)?;
+            let pitch =
+                if let (Some(rmvpe_model), Some(rmvpe_profile)) = (rmvpe_model, rmvpe_profile) {
+                    report_native_load_progress(&config, &rmvpe_profile, LoadModelRole::Rmvpe);
+                    let mut pitch = RmvpePitchSession::load(
+                        rmvpe_model,
+                        config.provider,
+                        Some(rmvpe_profile),
+                        tensor_rt_run_mode,
+                        TensorRtSessionPurpose::Final,
+                    )?;
+                    pitch.warmup_output_shape(rmvpe_input_samples_16k, config.f0.f0_threshold)?;
+                    Some(pitch)
+                } else {
+                    None
+                };
 
-            (embedder, pitch, rvc)
+            let fcpe = if let (Some(fcpe_model), Some(fcpe_profile)) = (fcpe_model, fcpe_profile) {
+                report_native_load_progress(&config, &fcpe_profile, LoadModelRole::Fcpe);
+                let mut fcpe = FcpePitchSession::load(
+                    fcpe_model,
+                    config.provider,
+                    Some(fcpe_profile),
+                    tensor_rt_run_mode,
+                    TensorRtSessionPurpose::Final,
+                )?;
+                fcpe.warmup_output_shape(rmvpe_input_samples_16k)?;
+                Some(fcpe)
+            } else {
+                None
+            };
+
+            (embedder, pitch, fcpe, rvc)
         } else {
             #[cfg(not(feature = "ort"))]
             {
@@ -1205,6 +1628,11 @@ impl RvcPipeline {
                     rvc_sample_rate,
                 )?;
                 let feature_len = warmup.rvc_feature_len;
+                validate_rvc_profile_frames(
+                    rvc_info.static_feature_frames,
+                    config.rvc_frames,
+                    feature_len,
+                )?;
                 shared_waveform = if tensor_rt_run_mode.device_io() {
                     Some(TensorRtSharedWaveform::new(
                         &embedder.session,
@@ -1227,35 +1655,75 @@ impl RvcPipeline {
                 .with_gpu_device_id(gpu_device_id)
                 .with_optional_model_cache_key(rvc_model_cache_key.clone());
                 info!(
-                "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} rvc={}",
-                config.provider.label(),
-                config.sample_rate,
-                config.chunk_samples,
-                embedder
-                    .tensor_rt_profile
-                    .as_ref()
-                    .map(|profile| profile.profile_shapes.as_str())
-                    .unwrap_or("none"),
-                rmvpe_profile.profile_shapes,
-                rvc_profile.profile_shapes
-            );
-
-                report_progress(
-                    &config,
-                    LoadProgress::LoadingModel {
-                        role: LoadModelRole::Rmvpe,
-                    },
+                    "fixed runtime profiles backend={} sample_rate={} chunk_samples={} contentvec={} rmvpe={} fcpe={} rvc={}",
+                    config.provider.label(),
+                    config.sample_rate,
+                    config.chunk_samples,
+                    embedder
+                        .tensor_rt_profile
+                        .as_ref()
+                        .map(|profile| profile.profile_shapes.as_str())
+                        .unwrap_or("none"),
+                    rmvpe_profile
+                        .as_ref()
+                        .map(|profile| profile.profile_shapes.as_str())
+                        .unwrap_or("disabled"),
+                    fcpe_profile
+                        .as_ref()
+                        .map(|profile| profile.profile_shapes.as_str())
+                        .unwrap_or("disabled"),
+                    rvc_profile.profile_shapes
                 );
-                let mut pitch = RmvpePitchSession::load(
-                    config.f0_model,
-                    config.provider,
-                    Some(rmvpe_profile),
-                    tensor_rt_run_mode,
-                    TensorRtSessionPurpose::Final,
-                )?;
-                let rmvpe_output_shape =
-                    pitch.warmup_output_shape(rmvpe_input_samples_16k, config.f0.f0_threshold)?;
-                pitch.enable_tensorrt_binding(&rmvpe_output_shape, config.f0.f0_threshold, None)?;
+
+                let pitch = if let (Some(rmvpe_model), Some(rmvpe_profile)) =
+                    (rmvpe_model, rmvpe_profile)
+                {
+                    report_progress(
+                        &config,
+                        LoadProgress::LoadingModel {
+                            role: LoadModelRole::Rmvpe,
+                        },
+                    );
+                    let mut pitch = RmvpePitchSession::load(
+                        rmvpe_model,
+                        config.provider,
+                        Some(rmvpe_profile),
+                        tensor_rt_run_mode,
+                        TensorRtSessionPurpose::Final,
+                    )?;
+                    let rmvpe_output_shape = pitch
+                        .warmup_output_shape(rmvpe_input_samples_16k, config.f0.f0_threshold)?;
+                    pitch.enable_tensorrt_binding(
+                        &rmvpe_output_shape,
+                        config.f0.f0_threshold,
+                        None,
+                    )?;
+                    Some(pitch)
+                } else {
+                    None
+                };
+
+                let fcpe =
+                    if let (Some(fcpe_model), Some(fcpe_profile)) = (fcpe_model, fcpe_profile) {
+                        report_progress(
+                            &config,
+                            LoadProgress::LoadingModel {
+                                role: LoadModelRole::Fcpe,
+                            },
+                        );
+                        let mut fcpe = FcpePitchSession::load(
+                            fcpe_model,
+                            config.provider,
+                            Some(fcpe_profile),
+                            tensor_rt_run_mode,
+                            TensorRtSessionPurpose::Final,
+                        )?;
+                        let output_shape = fcpe.warmup_output_shape(rmvpe_input_samples_16k)?;
+                        fcpe.enable_tensorrt_binding(&output_shape)?;
+                        Some(fcpe)
+                    } else {
+                        None
+                    };
 
                 report_progress(
                     &config,
@@ -1278,33 +1746,45 @@ impl RvcPipeline {
                     speaker_id,
                 )?;
                 rvc.enable_tensorrt_binding(&rvc_output_shape, speaker_id)?;
-                (embedder, pitch, rvc)
+                (embedder, pitch, fcpe, rvc)
             }
         };
 
+        let mut stream_state = RvcStreamState::new(rvc_sample_rate);
+        stream_state.set_contentvec_context_samples_16k(input_samples_16k);
         Ok(Self {
             embedder,
+            f0_mode: config.f0_mode,
             pitch,
+            fcpe,
+            hybrid_fusion: HybridF0Fusion::default(),
             rvc,
             #[cfg(feature = "ort")]
             shared_waveform,
             speaker_count,
             speaker_id,
-            pitch_shift: config.pitch_shift,
+            pitch_shift: normalized_pitch_shift(config.pitch_shift),
             feature_index,
             index_rate: normalized_unit_value(config.retrieval.index_rate),
             protect: normalized_protect(config.retrieval.protect),
             protect_transition_ms: normalized_protect_transition_ms(
                 config.retrieval.protect_transition_ms,
             ),
-            f0_threshold: config.f0.f0_threshold,
+            f0_threshold: if config.f0.f0_threshold.is_finite() {
+                config.f0.f0_threshold.clamp(0.001, 0.5)
+            } else {
+                DEFAULT_F0_THRESHOLD
+            },
             silence_threshold: config.f0.silence_threshold,
-            input_gain: config.input_gain,
+            input_gain: normalized_live_gain(config.input_gain),
             input_denoiser: build_input_denoiser(&config),
+            silence_gate_enabled: config.silence_gate_enabled,
+            speech_activity: SpeechActivityDetector::default(),
+            output_silence_envelope: OutputSilenceEnvelope::default(),
             content_raw_delay: SampleDelay::default(),
             denoiser_content_mix: normalized_denoiser_content_mix(config.denoiser_content_mix),
             denoiser_rmvpe_mix: normalized_denoiser_rmvpe_mix(config.denoiser_rmvpe_mix),
-            noise_gate_threshold: config.noise_gate_threshold,
+            noise_gate_threshold: normalized_noise_gate_threshold(config.noise_gate_threshold),
             noise_gate_attack_ms: config.noise_gate_shaping.attack_ms,
             noise_gate_release_ms: config.noise_gate_shaping.release_ms,
             noise_gate_floor: config.noise_gate_shaping.floor,
@@ -1313,20 +1793,23 @@ impl RvcPipeline {
             volume_excluded_ms: config.volume_excluded_ms,
             rvc_sample_rate,
             extra_convert_samples,
+            requested_rvc_frames: config.rvc_frames,
             rmvpe_input_samples_16k,
-            output_gain: config.output_gain,
+            output_gain: normalized_live_gain(config.output_gain),
             volume_envelope: config.output_dynamics.volume_envelope,
             rms_mix_rate: config.output_dynamics.rms_mix_rate,
             auto_output_gain: config.output_dynamics.auto_output_gain,
             target_output_rms: config.output_dynamics.target_output_rms,
             max_output_gain: config.output_dynamics.max_output_gain,
-            stream_state: RvcStreamState::new(rvc_sample_rate),
+            stream_state,
+            rnd_timeline: RvcNoiseTimeline::default(),
             input_scratch: Vec::new(),
             denoiser_scratch: Vec::new(),
             feature_tensor: FeatureTensor::default(),
             original_feature_tensor: FeatureTensor::default(),
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
+            pitchf_validated_scratch: Vec::new(),
             pitchf_untrimmed_scratch: Vec::new(),
             pitchf_scratch: Vec::new(),
             pitch_scratch: Vec::new(),
@@ -1339,7 +1822,7 @@ impl RvcPipeline {
     /// `RvcPipelineConfig` fields and let a host (e.g. the VST3 plugin) drive
     /// them from automation between chunks without reloading the pipeline.
     pub fn set_pitch_shift(&mut self, pitch_shift: f32) {
-        self.pitch_shift = pitch_shift;
+        self.pitch_shift = normalized_pitch_shift(pitch_shift);
     }
 
     pub fn set_speaker_id(&mut self, speaker_id: i64) {
@@ -1349,12 +1832,23 @@ impl RvcPipeline {
         self.speaker_id = normalize_speaker_id(speaker_id, self.speaker_count);
     }
 
+    pub fn set_f0_threshold(&mut self, f0_threshold: f32) {
+        // A bad live value must not poison RMVPE's threshold for later chunks.
+        // Keep the accepted range aligned with the frontend controls while
+        // allowing a dynamically selected lower confidence cutoff for tones.
+        self.f0_threshold = if f0_threshold.is_finite() {
+            f0_threshold.clamp(0.001, 0.5)
+        } else {
+            DEFAULT_F0_THRESHOLD
+        };
+    }
+
     pub fn speaker_count(&self) -> Option<usize> {
         self.speaker_count
     }
 
     pub fn set_input_gain(&mut self, input_gain: f32) {
-        self.input_gain = input_gain;
+        self.input_gain = normalized_live_gain(input_gain);
     }
 
     pub fn set_index_rate(&mut self, index_rate: f32) {
@@ -1386,7 +1880,7 @@ impl RvcPipeline {
     /// its `ChunkConverter` smoother history. Threshold-only automation keeps
     /// both the gate envelope and the conversion timeline intact.
     pub fn set_noise_gate(&mut self, enabled: bool, threshold: f32) -> bool {
-        self.noise_gate_threshold = threshold;
+        self.noise_gate_threshold = normalized_noise_gate_threshold(threshold);
         // Standalone live-parameter updates must not replace a configured
         // stateful denoiser. Feature-gated arms avoid referencing a backend in a
         // smaller distribution build while keeping the guard at one call site.
@@ -1426,6 +1920,23 @@ impl RvcPipeline {
                 true
             }
         }
+    }
+
+    /// Live-toggle source-activity output muting without modifying the input
+    /// denoiser or its delay. It is intentionally independent from the legacy
+    /// input gate so WebRTC, GTCRN, RNNoise, and DeepFilterNet3 can still keep
+    /// their noise estimators warm during quiet periods.
+    pub fn set_silence_gate(&mut self, enabled: bool) {
+        if self.silence_gate_enabled != enabled {
+            // Do not carry a learned room floor or a pending hangover across an
+            // explicit user toggle. The first enabled chunk is deliberately
+            // protected by the detector's startup grace, preventing a toggle in
+            // the middle of a quiet syllable from creating an abrupt mute.
+            self.speech_activity.reset();
+            self.output_silence_envelope.reset();
+            self.stream_state.prev_silence = false;
+        }
+        self.silence_gate_enabled = enabled;
     }
 
     /// Hot-swap the inexpensive input denoiser variants live. GTCRN and
@@ -1523,24 +2034,30 @@ impl RvcPipeline {
     }
 
     pub fn set_output_gain(&mut self, output_gain: f32) {
-        self.output_gain = output_gain;
+        self.output_gain = normalized_live_gain(output_gain);
     }
 
     /// Apply a full [`LiveParams`] snapshot. The single per-chunk live-update
     /// path: the standalone worker and the VST3 host callback both build a
     /// `LiveParams` and call this, so the live knobs stay wired identically
-    /// across front-ends. `set_noise_gate` keeps the rnnoise guard, so passing
-    /// `noise_gate_enabled: false` never tears down an active rnnoise stage.
+    /// across front-ends. `set_noise_gate` keeps the rnnoise guard, while the
+    /// separate silence gate never touches a configured input-denoiser stage.
     /// Returns true when live automation changed the input-denoiser timeline.
     /// Front-ends must then reset the owning `ChunkConverter` so SOLA/PSOLA does
     /// not join post-switch output against a pre-switch tail.
     pub fn apply_live(&mut self, live: &LiveParams) -> bool {
+        // Normalize once at the shared pipeline boundary. This protects direct
+        // VST3/embedding callers as well as vc-app's atomic mirror, and keeps
+        // every downstream calculation finite without a fallible realtime API.
+        let live = live.sanitized();
         self.set_pitch_shift(live.pitch_shift);
         self.set_speaker_id(live.speaker_id);
+        self.set_f0_threshold(live.f0_threshold);
         self.set_input_gain(live.input_gain);
         self.set_output_gain(live.output_gain);
         let denoiser_changed =
             self.set_noise_gate(live.noise_gate_enabled, live.noise_gate_threshold);
+        self.set_silence_gate(live.silence_gate_enabled);
         self.set_denoiser_content_mix(live.denoiser_content_mix);
         self.set_denoiser_rmvpe_mix(live.denoiser_rmvpe_mix);
         self.set_index_rate(live.index_rate);
@@ -1554,9 +2071,19 @@ impl RvcPipeline {
     /// engine. Callers changing a denoiser must reset the outer chunk smoother
     /// too; that history belongs to `ChunkConverter`, not this pipeline.
     fn clear_conversion_history(&mut self) {
+        // Audio/F0 history is disposable, but a fixed ContentVec context is
+        // load-time shape state shared with TensorRT's profile. Carry it over
+        // when replacing the stream state or a denoiser toggle can make the
+        // next fixed-profile inference use a different T.
+        let contentvec_context_samples_16k = self.stream_state.contentvec_context_samples_16k();
         #[cfg(feature = "gtcrn")]
         let gtcrn = self.stream_state.gtcrn.take();
         self.stream_state = RvcStreamState::new(self.rvc_sample_rate);
+        if let Some(samples) = contentvec_context_samples_16k {
+            self.stream_state
+                .set_contentvec_context_samples_16k(samples);
+        }
+        self.rnd_timeline.reset();
         #[cfg(feature = "gtcrn")]
         self.stream_state.set_gtcrn(gtcrn);
         self.input_scratch.clear();
@@ -1565,10 +2092,13 @@ impl RvcPipeline {
         self.original_feature_tensor = FeatureTensor::default();
         self.input_reference_scratch.clear();
         self.rms_mix_scratch = dsp::RmsMixScratch::default();
+        self.pitchf_validated_scratch.clear();
         self.pitchf_untrimmed_scratch.clear();
         self.pitchf_scratch.clear();
         self.pitch_scratch.clear();
         self.pitchf_postprocessed_scratch.clear();
+        self.speech_activity.reset();
+        self.output_silence_envelope.reset();
     }
 
     /// Discards rolling audio/F0 context while retaining loaded inference
@@ -1701,13 +2231,22 @@ impl VoiceModel for RvcPipeline {
         self.input_scratch = input_scratch;
         self.denoiser_scratch = denoiser_scratch;
 
+        if stream_input.stream_restarted {
+            // `generate_input` owns resampler/path resets. Keep the adaptive
+            // detector on exactly the same timeline so a previous device or
+            // denoiser branch cannot donate a stale noise floor to the new one.
+            self.speech_activity.reset();
+            self.output_silence_envelope.reset();
+            self.rnd_timeline.reset();
+        }
+
         // input_rms/silence follow the configured RMVPE branch. With denoising
         // off this is the same single-resampled signal as ContentVec; with
-        // denoising on each branch can retain a different raw share.
+        // denoising on each branch can retain a different raw share. The final
+        // activity decision waits for raw RMVPE F0 below, so interpolation in F0
+        // post-processing cannot manufacture speech evidence during silence.
         let input_rms = stream_input.input_rms;
-        let is_silent = self.silence_threshold > 0.0 && input_rms < self.silence_threshold;
-        let output_silent = is_silent && self.stream_state.prev_silence;
-        self.stream_state.prev_silence = is_silent;
+        let source_silence_threshold = output_silence_threshold(self.silence_threshold);
 
         // Features
         let embedder_start = Instant::now();
@@ -1755,17 +2294,129 @@ impl VoiceModel for RvcPipeline {
         if protect_active {
             self.original_feature_tensor.copy_from(&self.feature_tensor);
         }
+        let embedder_time = embedder_start.elapsed();
+        // Pitch
+        let pitch_start = Instant::now();
+        // Extract natural F0. RMVPE receives zero pitch shift so every backend
+        // enters the same downstream continuity/shift path. The selected
+        // sessions and fixed buffers were established at load time; this match
+        // must remain inference-only on the worker path.
+        let audio_16k_len = self.stream_state.pitch_16k_buffer.len();
+        let rmvpe_input_samples_16k = self.rmvpe_input_samples_16k.min(audio_16k_len);
+        let rmvpe_window_start_samples = audio_16k_len - rmvpe_input_samples_16k;
+        let rmvpe_audio_16k = &self.stream_state.pitch_16k_buffer[rmvpe_window_start_samples..];
+        let pitchf_raw = match self.f0_mode {
+            F0Mode::Rmvpe => self
+                .pitch
+                .as_mut()
+                .context("RMVPE mode loaded without an RMVPE session")?
+                .extract(rmvpe_audio_16k, 0.0, self.f0_threshold)?,
+            F0Mode::Fcpe => self
+                .fcpe
+                .as_mut()
+                .context("FCPE mode loaded without an FCPE session")?
+                .extract(rmvpe_audio_16k)?,
+            F0Mode::Hybrid => {
+                let rmvpe_pitch = self
+                    .pitch
+                    .as_mut()
+                    .context("hybrid F0 mode loaded without an RMVPE session")?
+                    .extract(rmvpe_audio_16k, 0.0, self.f0_threshold)?;
+                let fcpe_pitch = self
+                    .fcpe
+                    .as_mut()
+                    .context("hybrid F0 mode loaded without an FCPE session")?
+                    .extract(rmvpe_audio_16k)?;
+                self.hybrid_fusion
+                    .fuse(rmvpe_pitch, fcpe_pitch, rmvpe_audio_16k)?
+            }
+        };
+        let rmvpe_audio_16k_len = rmvpe_audio_16k.len();
+        let pitchf_raw_len = pitchf_raw.len();
+        self.f0_postprocess.validate_raw_pitchf_into(
+            pitchf_raw,
+            rmvpe_audio_16k,
+            &mut self.pitchf_validated_scratch,
+        );
+        self.stream_state.update_pitchf_from_estimator_window(
+            &self.pitchf_validated_scratch,
+            rmvpe_window_start_samples,
+        );
+        let raw_voiced_ratio = voiced_ratio(
+            self.stream_state
+                .newest_raw_pitchf(stream_input.new_feature_frames),
+        );
+        let adaptive_source_active = if self.silence_gate_enabled {
+            // Feed exactly the fresh RMVPE branch tail. Reusing the rolling
+            // window would let a previous phrase hold the silence gate open;
+            // running only while enabled keeps the optional neural VAD out of
+            // the normal conversion CPU budget.
+            let speech_audio = self
+                .stream_state
+                .newest_pitch_audio(stream_input.speech_features.samples);
+            self.speech_activity.observe(
+                stream_input.speech_features,
+                speech_audio,
+                raw_voiced_ratio,
+                source_silence_threshold,
+            )
+        } else {
+            false
+        };
+        // The detector is only authoritative while the output-only suppressor
+        // is enabled. Preserve the old static bookkeeping otherwise so a future
+        // live toggle has a defined two-chunk confirmation boundary.
+        let is_silent = if self.silence_gate_enabled {
+            !adaptive_source_active
+        } else {
+            source_silence_threshold > 0.0 && input_rms < source_silence_threshold
+        };
+        let output_silent = self.silence_gate_enabled
+            && is_silent
+            && self.stream_state.prev_silence
+            // Never discard a whole conversion increment solely because the
+            // aggregate detector missed a short onset.  The guard is scalar
+            // and worker-owned; it adds no callback allocation or inference
+            // branch and lets the next chunk close the gate once the signal is
+            // unambiguously ambient.
+            && self.speech_activity.safe_to_mute(stream_input.speech_features);
+        self.stream_state.prev_silence = is_silent;
+        let pitch_frames = self.stream_state.pitchf_buffer.len();
+        let pitch_time = pitch_start.elapsed();
+        // RMVPE's center-padded STFT and ContentVec's convolutional frontend do
+        // not expose the same frame count for the same waveform. First center
+        // crop to the untrimmed ContentVec grid so a 183->180 case uses
+        // pitchf[1..181], then apply the existing tail crop for silence_front.
+        center_crop_pitchf_to_features_into(
+            &self.stream_state.pitchf_buffer,
+            feature_len_before_trim,
+            &mut self.pitchf_untrimmed_scratch,
+        );
+
+        // Retrieval needs natural F0 and untrimmed ContentVec neighbors on the
+        // same timeline. Running it here keeps voiced/unvoiced and boundary
+        // decisions independent of the later pitch shift/post-processing.
         if let Some(feature_index) = self.feature_index.as_mut() {
-            feature_index.blend_frames_in_place(
+            feature_index.blend_frames_adaptive_in_place(
                 &mut self.feature_tensor.data,
                 raw_feature_len,
                 raw_feature_dimensions,
                 self.index_rate,
+                &self.pitchf_untrimmed_scratch,
             )?;
         }
 
         let silence_front_frames =
             onnx_silence_front_feature_frames(self.extra_convert_samples, self.rvc_sample_rate);
+        // If the requested front context is larger than this window, the
+        // preparation helper intentionally keeps the whole tensor; in that
+        // case there is no offset to apply when looking up adaptive scales.
+        let effective_silence_front_frames =
+            if silence_front_frames > 0 && silence_front_frames < feature_len_before_trim {
+                silence_front_frames
+            } else {
+                0
+            };
         prepare_rvc_feature_frames(
             &mut self.feature_tensor,
             silence_front_frames,
@@ -1778,7 +2429,6 @@ impl VoiceModel for RvcPipeline {
                 feature_len_before_trim,
             )?;
         }
-        let embedder_time = embedder_start.elapsed();
         let feature_len = self
             .feature_tensor
             .shape
@@ -1786,34 +2436,13 @@ impl VoiceModel for RvcPipeline {
             .copied()
             .and_then(|len| usize::try_from(len).ok())
             .context("trimmed embedder frame length does not fit in usize")?;
-        // Pitch
-        let pitch_start = Instant::now();
-        // Extract raw (natural) F0: pass 0.0 so RMVPE does not pre-apply pitch
-        // shift. pitch_shift is applied once in f0_postprocess after smoothing,
-        // so clamp/octave/median act on natural F0. pitchf_buffer therefore
-        // accumulates raw F0 (see the guardrail above the post-process call).
-        let audio_16k_len = self.stream_state.pitch_16k_buffer.len();
-        let rmvpe_input_samples_16k = self.rmvpe_input_samples_16k.min(audio_16k_len);
-        let rmvpe_window_start_samples = audio_16k_len - rmvpe_input_samples_16k;
-        let rmvpe_audio_16k = &self.stream_state.pitch_16k_buffer[rmvpe_window_start_samples..];
-        let pitchf_raw = self
-            .pitch
-            .extract(rmvpe_audio_16k, 0.0, self.f0_threshold)?;
-        let rmvpe_audio_16k_len = rmvpe_audio_16k.len();
-        let pitchf_raw_len = pitchf_raw.len();
-        self.stream_state
-            .update_pitchf_from_rmvpe_window(pitchf_raw, rmvpe_window_start_samples);
-        let pitch_frames = self.stream_state.pitchf_buffer.len();
-        let pitch_time = pitch_start.elapsed();
-        // RMVPE's center-padded STFT and ContentVec's convolutional frontend do
-        // not expose the same frame count for the same waveform. First center
-        // crop to the untrimmed ContentVec grid so a 183->180 case uses
-        // pitchf[1..181], then apply the existing tail crop for silence_front.
-        center_crop_pitchf_to_features_into(
-            &self.stream_state.pitchf_buffer,
-            feature_len_before_trim,
-            &mut self.pitchf_untrimmed_scratch,
-        );
+        if let Some(requested_frames) = self.requested_rvc_frames {
+            if feature_len != requested_frames {
+                bail!(
+                    "RVC custom T={requested_frames}, but the selected ContentVec window produced T={feature_len}; use auto or a T compatible with this embedder"
+                )
+            }
+        }
         align_pitchf_to_features_into(
             &self.pitchf_untrimmed_scratch,
             feature_len,
@@ -1823,11 +2452,17 @@ impl VoiceModel for RvcPipeline {
             // Use natural (unshifted, unpostprocessed) F0. Pitch correction may
             // fill short gaps for synthesis, but it must not classify an
             // originally unvoiced consonant as voiced for feature retrieval.
-            self.feature_tensor.protect_unvoiced_frames(
+            let adaptive_scales = self
+                .feature_index
+                .as_ref()
+                .map(|feature_index| feature_index.adaptive_protect_scales());
+            self.feature_tensor.protect_unvoiced_frames_with_adaptive(
                 &self.original_feature_tensor,
                 &self.pitchf_scratch,
                 self.protect,
                 protect_transition_frames(self.protect_transition_ms),
+                adaptive_scales,
+                effective_silence_front_frames,
             )?;
         }
         // Guardrail: pitchf_buffer / pitchf_scratch hold raw (un-transposed) F0
@@ -1857,36 +2492,13 @@ impl VoiceModel for RvcPipeline {
         coarse_pitch_into(pitchf, &mut self.pitch_scratch);
         let pitch = self.pitch_scratch.as_slice();
 
-        if SKIP_SILENT_CHUNKS && output_silent {
-            // If previous chunk was also silent, keep returning silence without running the model to reduce CPU usage and avoid latency spikes from the embedder when silence ends.
-            out_audio.clear();
-            out_audio.resize(stream_input.out_size, 0.0);
-            out_pitchf.clear();
-            return Ok(ModelOutput {
-                sample_rate: self.rvc_sample_rate,
-                inference_time: total_start.elapsed(),
-                embedder_time: Duration::ZERO,
-                pitch_time: Duration::ZERO,
-                rvc_time: Duration::ZERO,
-                input_rms,
-                voiced_ratio: 0.0,
-                raw_output_samples: stream_input.out_size,
-                output_rms: 0.0,
-                applied_output_gain: 1.0,
-                feature_frames: 0,
-                pitch_frames: 0,
-                silent: true,
-                convert_size: stream_input.convert_size,
-                out_size: stream_input.out_size,
-                model_input_samples: self.stream_state.audio_buffer.len(),
-                volume: stream_input.volume,
-            });
-        }
-
         // RVC. The converted samples are written straight into the caller-owned
         // `out_audio` buffer (reused across chunks) and all post-processing runs
         // in place on it; the output pitchf goes into `out_pitchf`.
         let rvc_start = Instant::now();
+        let rnd_window_start_frame = self
+            .rnd_timeline
+            .next_window_start(feature_len, stream_input.new_feature_frames)?;
         self.rvc.infer(
             &self.feature_tensor.data,
             &self.feature_tensor.shape,
@@ -1894,6 +2506,7 @@ impl VoiceModel for RvcPipeline {
             pitch,
             pitchf,
             self.speaker_id,
+            rnd_window_start_frame,
             out_audio,
         )?;
         let rvc_time = rvc_start.elapsed();
@@ -1943,12 +2556,30 @@ impl VoiceModel for RvcPipeline {
             );
         }
         let output_rms_before_gain = dsp::rms(out_audio);
+        // Do not skip the model on silence: RVC's rolling ContentVec/F0 context
+        // must continue advancing, especially with large extra-convert windows.
+        // Once two source-silent chunks establish a stable boundary, mute only
+        // the generated audio so model noise cannot leak into an idle mic.
+        let mute_silent_output = self.silence_gate_enabled && output_silent;
         let applied_output_gain = self.applied_output_gain(output_rms_before_gain);
-        let output_rms = if (applied_output_gain - 1.0).abs() > f32::EPSILON {
+        let output_rms_after_gain = if (applied_output_gain - 1.0).abs() > f32::EPSILON {
             dsp::apply_gain_and_rms(out_audio, applied_output_gain)
         } else {
             output_rms_before_gain
         };
+        let output_rms = if self.silence_gate_enabled {
+            self.output_silence_envelope.apply_and_rms(
+                out_audio,
+                !mute_silent_output,
+                self.rvc_sample_rate,
+            )
+        } else {
+            output_rms_after_gain
+        };
+        // `silent` controls queue policy in realtime frontends. A fade-out must
+        // remain queueable until every sample has reached zero; otherwise a
+        // nearly-full output ring can cut the envelope abruptly and click.
+        let fully_silent = mute_silent_output && self.output_silence_envelope.is_silent();
 
         Ok(ModelOutput {
             sample_rate: self.rvc_sample_rate,
@@ -1963,7 +2594,7 @@ impl VoiceModel for RvcPipeline {
             applied_output_gain,
             feature_frames: feature_len,
             pitch_frames,
-            silent: output_silent,
+            silent: fully_silent,
             convert_size: stream_input.convert_size,
             out_size: stream_input.out_size,
             model_input_samples: self.stream_state.audio_buffer.len(),
@@ -2019,6 +2650,7 @@ impl RvcPipeline {
 impl std::fmt::Debug for RvcPipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RvcPipeline")
+            .field("f0_mode", &self.f0_mode)
             .field("speaker_count", &self.speaker_count)
             .field("speaker_id", &self.speaker_id)
             .field("pitch_shift", &self.pitch_shift)
@@ -2042,6 +2674,36 @@ impl std::fmt::Debug for RvcPipeline {
 #[cfg(test)]
 mod progress_tests {
     use super::*;
+
+    #[test]
+    fn f0_modes_resolve_only_the_sessions_they_use() {
+        let rmvpe = Path::new("rmvpe.onnx");
+        let fcpe = Path::new("fcpe.onnx");
+
+        assert_eq!(
+            resolve_f0_models(F0Mode::Rmvpe, Some(rmvpe), Some(fcpe)).unwrap(),
+            (Some(rmvpe), None)
+        );
+        assert_eq!(
+            resolve_f0_models(F0Mode::Fcpe, Some(rmvpe), Some(fcpe)).unwrap(),
+            (None, Some(fcpe))
+        );
+        assert_eq!(
+            resolve_f0_models(F0Mode::Hybrid, Some(rmvpe), Some(fcpe)).unwrap(),
+            (Some(rmvpe), Some(fcpe))
+        );
+    }
+
+    #[test]
+    fn f0_modes_reject_missing_required_models() {
+        let rmvpe = Path::new("rmvpe.onnx");
+        let fcpe = Path::new("fcpe.onnx");
+
+        assert!(resolve_f0_models(F0Mode::Rmvpe, None, Some(fcpe)).is_err());
+        assert!(resolve_f0_models(F0Mode::Fcpe, Some(rmvpe), None).is_err());
+        assert!(resolve_f0_models(F0Mode::Hybrid, Some(rmvpe), None).is_err());
+        assert!(resolve_f0_models(F0Mode::Hybrid, None, Some(fcpe)).is_err());
+    }
 
     #[test]
     fn native_engine_build_progress_is_only_reported_for_cache_miss() {
@@ -2074,7 +2736,7 @@ mod progress_tests {
     }
 
     #[test]
-    fn rmvpe_denoiser_mix_defaults_to_full_cleaned_branch() {
+    fn rmvpe_denoiser_mix_defaults_to_full_cleaned_base() {
         assert_eq!(
             LiveParams::default().denoiser_rmvpe_mix,
             DEFAULT_DENOISER_RMVPE_MIX
@@ -2085,5 +2747,74 @@ mod progress_tests {
             normalized_denoiser_rmvpe_mix(f32::NAN),
             DEFAULT_DENOISER_RMVPE_MIX
         );
+    }
+
+    #[test]
+    fn live_params_sanitize_non_finite_and_out_of_range_values() {
+        let params = LiveParams {
+            pitch_shift: f32::INFINITY,
+            f0_threshold: f32::NAN,
+            input_gain: -1.0,
+            output_gain: 1000.0,
+            monitor_gain: f32::NEG_INFINITY,
+            noise_gate_threshold: 2.0,
+            index_rate: f32::NAN,
+            protect: f32::INFINITY,
+            denoiser_content_mix: -1.0,
+            denoiser_rmvpe_mix: 2.0,
+            ..LiveParams::default()
+        }
+        .sanitized();
+
+        assert_eq!(params.pitch_shift, 0.0);
+        assert_eq!(params.f0_threshold, DEFAULT_F0_THRESHOLD);
+        assert_eq!(params.input_gain, 0.0);
+        assert_eq!(params.output_gain, MAX_LIVE_GAIN);
+        assert_eq!(params.monitor_gain, 1.0);
+        assert_eq!(params.noise_gate_threshold, MAX_NOISE_GATE_THRESHOLD);
+        assert_eq!(params.index_rate, 0.0);
+        assert_eq!(params.protect, DEFAULT_PROTECT);
+        assert_eq!(params.denoiser_content_mix, 0.0);
+        assert_eq!(params.denoiser_rmvpe_mix, MAX_DENOISER_RMVPE_MIX);
+    }
+
+    #[test]
+    fn pitch_and_gain_normalizers_keep_finite_values_bounded() {
+        assert_eq!(normalized_pitch_shift(-100.0), MIN_PITCH_SHIFT_SEMITONES);
+        assert_eq!(normalized_pitch_shift(100.0), MAX_PITCH_SHIFT_SEMITONES);
+        assert_eq!(normalized_live_gain(-1.0), 0.0);
+        assert_eq!(normalized_live_gain(100.0), MAX_LIVE_GAIN);
+        assert_eq!(normalized_noise_gate_threshold(-1.0), 0.0);
+        assert_eq!(
+            normalized_noise_gate_threshold(2.0),
+            MAX_NOISE_GATE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn silence_suppressor_threshold_is_independent_from_input_gate() {
+        assert_eq!(output_silence_threshold(0.0001), 0.0001);
+        assert_eq!(output_silence_threshold(0.03), 0.03);
+        assert_eq!(output_silence_threshold(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn rnd_timeline_tracks_overlap_and_variable_window_sizes() {
+        let mut timeline = RvcNoiseTimeline::default();
+        assert_eq!(timeline.next_window_start(100, 20).unwrap(), 0);
+        assert_eq!(timeline.next_window_start(100, 20).unwrap(), 20);
+        // Shrinking the rolling window moves its left edge forward by the new
+        // frames plus the removed prefix; growing it can move the edge back.
+        assert_eq!(timeline.next_window_start(80, 20).unwrap(), 60);
+        assert_eq!(timeline.next_window_start(110, 20).unwrap(), 50);
+    }
+
+    #[test]
+    fn rnd_timeline_reset_repeats_the_first_window() {
+        let mut timeline = RvcNoiseTimeline::default();
+        assert_eq!(timeline.next_window_start(96, 16).unwrap(), 0);
+        assert_eq!(timeline.next_window_start(96, 16).unwrap(), 16);
+        timeline.reset();
+        assert_eq!(timeline.next_window_start(96, 16).unwrap(), 0);
     }
 }

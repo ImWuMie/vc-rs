@@ -49,8 +49,10 @@ Packages must not contain:
 - Machine-specific absolute paths, developer user names, or local directory
   layouts.
 - Secrets, credentials, tokens, private configuration, or environment dumps.
-- Local models or weights, TensorRT engine caches, audio recordings, logs,
-  temporary files, or other developer-machine state.
+- Local RVC/voice-conversion models or weights, TensorRT engine caches, audio
+  recordings, logs, temporary files, or other developer-machine state. The
+  generic MIT-licensed Silero VAD weights are the intentional exception: they
+  are compiled into `silero-vad-pure` and covered by the package license notice.
 - Debug artifacts such as `.pdb` files, unless a separate debug-symbol package
   is intentionally produced.
 - Runtime DLLs belonging to a different backend variant.
@@ -58,6 +60,12 @@ Packages must not contain:
 Reference ContentVec and RMVPE models are downloaded only at the user's request
 by `download-models.ps1`; they are third-party files and must not be added to a
 release archive.
+
+The optional FCPE hybrid estimator follows the same rule. Its ONNX weights are
+external user-selected assets (the reference export is documented in
+`docs/cli.md`) and must not be copied into a package, engine cache, test
+artifact, or installer. Only the runtime contract and license reference belong
+in the repository.
 
 ## Backend Isolation
 
@@ -156,8 +164,10 @@ manual judgement/runtime checks.
 Before publishing each final ZIP:
 
 1. Build it with the appropriate `package.ps1` or `scripts/package-all.ps1`
-   command without relying on an unverified `-SkipBuild` artifact. (`release.ps1
-   -Build`.)
+   command. (`release.ps1 -Build`.) `-SkipBuild` is accepted only when the prior
+   build's identity stamp exactly matches the requested package kind, backend,
+   full feature set, ASIO/DeepFilterNet3/runtime-only options, and the current
+   SHA-256 of every reused executable or plugin/helper binary.
 2. Extract the ZIP into a fresh directory and inspect the actual archived
    contents, not only the staging directory.
 3. Confirm required binaries, runtime DLLs, install instructions, and license
@@ -215,8 +225,6 @@ Review these known limitations before release:
   build-machine paths and the current user name, and matches prohibited files by
   name. It does not scan vendor DLLs for arbitrary secrets, so do not stage
   unexpected files into a package staging directory.
-- `-SkipBuild` does not prove that the reused binary matches the requested
-  backend variant.
 - `package-store-msix.ps1` requires the Windows App Development CLI
   (`winget install Microsoft.WinAppCli`) and creates an unsigned MSIX unless
   `-PfxPath` is provided. The default MSIX identity is for local packaging only;

@@ -1,3 +1,5 @@
+use anyhow::{bail, Context, Result};
+
 // ContentVec emits frames on a 20 ms stride at 16 kHz. RVC's 10 ms grid is
 // created later by repeating feature frames, so keep this alignment scoped to
 // the shared ContentVec/RMVPE waveform context and not pitch/output sizing.
@@ -7,6 +9,10 @@ pub(super) const CONTENTVEC_CONTEXT_ALIGN_SAMPLES: usize = 320;
 pub(super) const RMVPE_FRAME_SAMPLES_16K: usize = 160;
 pub(super) const RMVPE_BUCKET_FRAMES: usize = 32;
 pub(super) const RMVPE_GUARD_FRAMES: usize = 5;
+/// Upper bound for a manually selected dynamic RVC window. It prevents a typo
+/// from requesting an impractically large fixed TensorRT engine or rolling
+/// audio buffer. Dynamic ONNX models do not encode a numeric `frames` maximum.
+pub(super) const MAX_CUSTOM_RVC_FRAMES: usize = 2_048;
 
 pub(super) fn ms_to_samples(sample_rate: u32, ms: u32) -> usize {
     ((sample_rate as u64 * ms as u64) / 1000) as usize
@@ -125,6 +131,133 @@ pub(super) fn tensor_rt_model_input_samples_16k(
         extra_convert_samples,
         rvc_sample_rate,
     )
+}
+
+/// Returns the RVC generator frame count produced by the standard ContentVec
+/// frontend for a fixed 16 kHz waveform window. ContentVec's convolutional
+/// frontend has a 320-sample hop and emits one fewer frame than the number of
+/// complete hops. Keep this paired with `rvc_context_samples_16k_for_frames`:
+/// fixed TensorRT profiles and the rolling stream window must agree exactly.
+pub(super) fn rvc_frames_for_context_samples_16k(
+    context_samples_16k: usize,
+    extra_convert_samples: usize,
+    rvc_sample_rate: u32,
+) -> Result<usize> {
+    if !context_samples_16k.is_multiple_of(CONTENTVEC_CONTEXT_ALIGN_SAMPLES) {
+        bail!(
+            "ContentVec context {context_samples_16k} is not aligned to its {}-sample hop",
+            CONTENTVEC_CONTEXT_ALIGN_SAMPLES
+        );
+    }
+    let contentvec_frames = context_samples_16k
+        .checked_div(CONTENTVEC_CONTEXT_ALIGN_SAMPLES)
+        .and_then(|frames| frames.checked_sub(1))
+        .context("ContentVec context is too short to emit a frame")?;
+    let repeated_frames = contentvec_frames
+        .checked_mul(2)
+        .context("RVC frame count overflow")?;
+    let silence_front_frames =
+        onnx_silence_front_feature_frames(extra_convert_samples, rvc_sample_rate);
+    let frames = if silence_front_frames > 0 && silence_front_frames < repeated_frames {
+        repeated_frames - silence_front_frames
+    } else {
+        repeated_frames
+    };
+    if frames == 0 {
+        bail!("derived zero RVC frames from ContentVec context")
+    }
+    Ok(frames)
+}
+
+/// Inverts the ContentVec/RVC time-grid mapping for a fixed generator profile.
+/// A requested `T` changes only load-time context/history: the audio chunk size
+/// and its output cadence remain unchanged. The realtime path must never turn a
+/// custom T into a per-callback shape change or engine rebuild.
+pub(super) fn rvc_context_samples_16k_for_frames(
+    frames: usize,
+    extra_convert_samples: usize,
+    rvc_sample_rate: u32,
+) -> Result<usize> {
+    if frames == 0 {
+        bail!("RVC frames must be greater than zero; use 0/auto to derive it from timing")
+    }
+    if frames > MAX_CUSTOM_RVC_FRAMES {
+        bail!(
+            "RVC frames {frames} exceed the supported custom limit {MAX_CUSTOM_RVC_FRAMES}; use 0/auto or a smaller value"
+        )
+    }
+    let silence_front_frames =
+        onnx_silence_front_feature_frames(extra_convert_samples, rvc_sample_rate);
+    let repeated_frames = frames
+        .checked_add(silence_front_frames)
+        .context("RVC frame count overflow")?;
+    if !repeated_frames.is_multiple_of(2) {
+        bail!(
+            "RVC frames {frames} cannot be represented by this ContentVec model; choose an even frame count"
+        )
+    }
+    let contentvec_frames = repeated_frames / 2;
+    let context_samples_16k = contentvec_frames
+        .checked_add(1)
+        .and_then(|frames| frames.checked_mul(CONTENTVEC_CONTEXT_ALIGN_SAMPLES))
+        .context("ContentVec context size overflow")?;
+    let actual = rvc_frames_for_context_samples_16k(
+        context_samples_16k,
+        extra_convert_samples,
+        rvc_sample_rate,
+    )?;
+    if actual != frames {
+        bail!(
+            "RVC frame mapping produced {actual} frames for requested {frames}; choose a compatible frame count"
+        )
+    }
+    Ok(context_samples_16k)
+}
+
+/// Resolves a requested fixed RVC frame count against the model contract and
+/// current audio timing. A dynamic ONNX's symbolic `frames` axis has no numeric
+/// range, so its lower bound is the current automatically derived context; a
+/// static ONNX has one exact valid value.
+pub(super) fn resolve_rvc_context_samples_16k(
+    automatic_context_samples_16k: usize,
+    requested_frames: Option<usize>,
+    static_model_frames: Option<usize>,
+    extra_convert_samples: usize,
+    rvc_sample_rate: u32,
+) -> Result<usize> {
+    let automatic_frames = rvc_frames_for_context_samples_16k(
+        automatic_context_samples_16k,
+        extra_convert_samples,
+        rvc_sample_rate,
+    )?;
+    let Some(requested_frames) = requested_frames else {
+        // A static ONNX has exactly one legal generator frame count.  Do this
+        // check before loading any backend session so CPU/DirectML fail at
+        // startup just like TensorRT; the realtime worker must never discover
+        // a profile mismatch on its first callback.  Dynamic models have no
+        // numeric contract here and keep the automatically derived context.
+        if let Some(static_model_frames) = static_model_frames {
+            if static_model_frames != automatic_frames {
+                bail!(
+                    "RVC ONNX has static T={static_model_frames}, but the current runtime requires T={automatic_frames}; re-export with `export-pth --frames {automatic_frames}` or use a matching runtime configuration"
+                );
+            }
+        }
+        return Ok(automatic_context_samples_16k);
+    };
+    if let Some(static_model_frames) = static_model_frames {
+        if requested_frames != static_model_frames {
+            bail!(
+                "RVC ONNX supports only T={static_model_frames}, but --rvc-frames requested T={requested_frames}; use T={static_model_frames} or load a dynamic ONNX"
+            )
+        }
+    }
+    if requested_frames < automatic_frames {
+        bail!(
+            "RVC T={requested_frames} is smaller than the current timing requires (minimum T={automatic_frames}); reduce chunk/context timing or use auto/a larger even T"
+        )
+    }
+    rvc_context_samples_16k_for_frames(requested_frames, extra_convert_samples, rvc_sample_rate)
 }
 
 pub(super) fn rmvpe_model_input_samples_16k(chunk_samples: usize, sample_rate: u32) -> usize {

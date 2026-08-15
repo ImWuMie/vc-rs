@@ -1,6 +1,7 @@
 mod api;
 mod cache;
 mod chunk_converter;
+mod f0_hybrid;
 mod f0_postprocess;
 mod feature;
 mod feature_index;
@@ -13,6 +14,7 @@ mod pitch;
 mod process_priority;
 mod sessions;
 mod shape;
+mod speech_activity;
 mod stream;
 mod tensorrt;
 
@@ -39,13 +41,14 @@ pub use chunk_converter::{ChunkConverter, ChunkOutputConfig, ChunkStats};
 // Re-exported so the standalone front-ends can name the config when building
 // `RvcPipelineConfig`; the processor itself stays private to the engine.
 pub use f0_postprocess::F0PostprocessConfig;
-pub use inspect::{inspect_model, validate_rvc_model};
+pub use inspect::{inspect_model, validate_exported_rvc_model, validate_rvc_model};
 pub use pipeline::{
-    F0Config, FeatureRetrievalConfig, InputDenoiserMode, LiveParams, LoadModelRole, LoadProgress,
-    NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
+    F0Config, F0Mode, FeatureRetrievalConfig, InputDenoiserMode, LiveParams, LoadModelRole,
+    LoadProgress, NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
     DEFAULT_DENOISER_CONTENT_MIX, DEFAULT_DENOISER_RMVPE_MIX, DEFAULT_F0_THRESHOLD,
     DEFAULT_PROTECT, DEFAULT_PROTECT_TRANSITION_MS, MAX_DENOISER_CONTENT_MIX,
-    MAX_DENOISER_RMVPE_MIX, MAX_PROTECT, MAX_PROTECT_TRANSITION_MS,
+    MAX_DENOISER_RMVPE_MIX, MAX_LIVE_GAIN, MAX_NOISE_GATE_THRESHOLD, MAX_PITCH_SHIFT_SEMITONES,
+    MAX_PROTECT, MAX_PROTECT_TRANSITION_MS, MIN_PITCH_SHIFT_SEMITONES,
 };
 pub use process_priority::{set_process_gpu_priority, set_process_power_throttling};
 pub use shape::EMBEDDER_SAMPLE_RATE;

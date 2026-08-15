@@ -6,7 +6,7 @@ use vc_core::denoise_config::{
     MAX_DFN3_ATTENUATION_LIMIT_DB, MAX_DFN3_POST_FILTER_BETA,
 };
 use vc_core::model_rvc::{
-    DEFAULT_DENOISER_CONTENT_MIX, DEFAULT_DENOISER_RMVPE_MIX, DEFAULT_F0_THRESHOLD,
+    F0Mode, DEFAULT_DENOISER_CONTENT_MIX, DEFAULT_DENOISER_RMVPE_MIX, DEFAULT_F0_THRESHOLD,
     DEFAULT_PROTECT, DEFAULT_PROTECT_TRANSITION_MS, MAX_DENOISER_CONTENT_MIX,
     MAX_DENOISER_RMVPE_MIX, MAX_PROTECT, MAX_PROTECT_TRANSITION_MS,
 };
@@ -130,6 +130,9 @@ pub enum Denoiser {
     NoiseGate,
     Rnnoise,
     Gtcrn,
+    // Keep the spelling used by earlier vc-rs documentation as a CLI alias.
+    // Clap renders the canonical kebab-case `web-rtc` form in --help.
+    #[value(alias = "webrtc")]
     WebRtc,
     DeepFilterNet3,
 }
@@ -143,6 +146,30 @@ impl From<Denoiser> for vc_app::DenoiserMode {
             Denoiser::Gtcrn => Self::Gtcrn,
             Denoiser::WebRtc => Self::WebRtc,
             Denoiser::DeepFilterNet3 => Self::DeepFilterNet3,
+        }
+    }
+}
+
+/// Realtime-only language-aware tuning selection. `Auto` is intentionally an
+/// acoustic profile heuristic rather than a text-level language recognizer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum DynamicTuning {
+    #[default]
+    Off,
+    Auto,
+    Chinese,
+    English,
+    Japanese,
+}
+
+impl From<DynamicTuning> for vc_app::DynamicTuningMode {
+    fn from(value: DynamicTuning) -> Self {
+        match value {
+            DynamicTuning::Off => Self::Off,
+            DynamicTuning::Auto => Self::Auto,
+            DynamicTuning::Chinese => Self::Chinese,
+            DynamicTuning::English => Self::English,
+            DynamicTuning::Japanese => Self::Japanese,
         }
     }
 }
@@ -225,6 +252,20 @@ pub struct RunArgs {
     #[arg(long)]
     pub f0_model: Option<PathBuf>,
     #[arg(
+        long,
+        value_enum,
+        default_value = "rmvpe",
+        help = "F0 estimator: rmvpe, fcpe, or hybrid (RMVPE + FCPE reliability fusion)"
+    )]
+    pub f0_mode: F0Mode,
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_if_eq_any([("f0_mode", "fcpe"), ("f0_mode", "hybrid")]),
+        help = "FCPE ONNX model (required for --f0-mode fcpe or hybrid)"
+    )]
+    pub fcpe_model: Option<PathBuf>,
+    #[arg(
         long = "index-path",
         alias = "index",
         value_name = "PATH",
@@ -292,6 +333,12 @@ pub struct RunArgs {
         help = "Additional RVC conversion context in milliseconds"
     )]
     pub extra_convert_ms: u32,
+    #[arg(
+        long,
+        value_name = "T",
+        help = "Fixed RVC generator frames for a dynamic ONNX; omit for timing-derived auto T"
+    )]
+    pub rvc_frames: Option<usize>,
     #[arg(long, default_value_t = 0.0001)]
     pub silence_threshold: f32,
     #[arg(long, value_enum, default_value_t = default_provider())]
@@ -308,7 +355,7 @@ pub struct RunArgs {
         long,
         default_value_t = 0.0,
         value_parser = parse_unit_f32,
-        help = "RVC feature-index blend rate (0.0 disables retrieval)"
+        help = "Base RVC feature-index blend rate (adaptive per feature frame; 0.0 disables retrieval)"
     )]
     pub index_rate: f32,
     #[arg(
@@ -329,11 +376,25 @@ pub struct RunArgs {
     pub f0_threshold: f32,
     #[arg(
         long,
+        value_enum,
+        default_value_t = DynamicTuning::Off,
+        help = "Realtime language-aware tuning: off, auto (conservative acoustic heuristic), chinese, english, or japanese"
+    )]
+    pub dynamic_tuning: DynamicTuning,
+    #[arg(
+        long,
         default_value_t = true,
         action = clap::ArgAction::Set,
-        help = "Interpolate internal RMVPE pitch dropouts (true/false)"
+        help = "Interpolate short internal F0 dropouts (true/false)"
     )]
     pub f0_continuity: bool,
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        help = "Stabilize raw F0 with temporal octave/island checks (true/false)"
+    )]
+    pub f0_stabilization: bool,
     #[arg(long, default_value_t = DEFAULT_INPUT_GAIN)]
     pub input_gain: f32,
     #[arg(long, default_value_t = DEFAULT_OUTPUT_GAIN)]
@@ -341,7 +402,7 @@ pub struct RunArgs {
     #[arg(
         long,
         value_enum,
-        help = "Input denoiser: off, noise-gate, rnnoise, gtcrn, webrtc, or deep-filter-net3"
+        help = "Input denoiser: off, noise-gate, rnnoise, gtcrn, web-rtc, or deep-filter-net3"
     )]
     pub denoiser: Option<Denoiser>,
     #[arg(
@@ -354,7 +415,7 @@ pub struct RunArgs {
         long,
         value_enum,
         default_value_t = WebRtcSuppressionLevel::Moderate,
-        help = "WebRTC suppression level (used with --denoiser webrtc)"
+        help = "WebRTC suppression level (used with --denoiser web-rtc)"
     )]
     pub webrtc_level: WebRtcSuppressionLevel,
     #[arg(
@@ -377,6 +438,12 @@ pub struct RunArgs {
         help = "DeepFilterNet3 post-filter beta (0..=0.1)"
     )]
     pub dfn3_post_filter_beta: f32,
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        help = "Mute converted output after sustained source silence without replacing the selected input denoiser"
+    )]
+    pub silence_suppressor: bool,
     #[arg(long = "noise-gate", conflicts_with = "denoiser", action = clap::ArgAction::SetTrue, help = "Deprecated alias for --denoiser noise-gate")]
     pub noise_gate: bool,
     #[arg(
@@ -433,8 +500,26 @@ pub struct WavArgs {
     pub embedder: PathBuf,
     #[arg(long)]
     pub embedder_output: Option<String>,
-    #[arg(long)]
-    pub f0_model: PathBuf,
+    #[arg(
+        long,
+        required_if_eq_any([("f0_mode", "rmvpe"), ("f0_mode", "hybrid")]),
+        help = "RMVPE ONNX model (required for --f0-mode rmvpe or hybrid)"
+    )]
+    pub f0_model: Option<PathBuf>,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "rmvpe",
+        help = "F0 estimator: rmvpe, fcpe, or hybrid (RMVPE + FCPE reliability fusion)"
+    )]
+    pub f0_mode: F0Mode,
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_if_eq_any([("f0_mode", "fcpe"), ("f0_mode", "hybrid")]),
+        help = "FCPE ONNX model (required for --f0-mode fcpe or hybrid)"
+    )]
+    pub fcpe_model: Option<PathBuf>,
     #[arg(
         long = "index-path",
         alias = "index",
@@ -459,6 +544,12 @@ pub struct WavArgs {
     pub sola_search_ms: u32,
     #[arg(long, default_value_t = DEFAULT_RVC_OUTPUT_TAIL_DISCARD_MS)]
     pub rvc_output_tail_discard_ms: u32,
+    #[arg(
+        long,
+        value_name = "T",
+        help = "Fixed RVC generator frames for a dynamic ONNX; omit for timing-derived auto T"
+    )]
+    pub rvc_frames: Option<usize>,
     #[arg(long, value_enum, default_value_t = default_provider())]
     pub provider: Provider,
     #[arg(long, value_enum, default_value_t = GpuPriority::High)]
@@ -473,7 +564,7 @@ pub struct WavArgs {
         long,
         default_value_t = 0.0,
         value_parser = parse_unit_f32,
-        help = "RVC feature-index blend rate (0.0 disables retrieval)"
+        help = "Base RVC feature-index blend rate (adaptive per feature frame; 0.0 disables retrieval)"
     )]
     pub index_rate: f32,
     #[arg(
@@ -496,9 +587,16 @@ pub struct WavArgs {
         long,
         default_value_t = true,
         action = clap::ArgAction::Set,
-        help = "Interpolate internal RMVPE pitch dropouts (true/false)"
+        help = "Interpolate short internal F0 dropouts (true/false)"
     )]
     pub f0_continuity: bool,
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        help = "Stabilize raw F0 with temporal octave/island checks (true/false)"
+    )]
+    pub f0_stabilization: bool,
     #[arg(long, default_value_t = DEFAULT_INPUT_GAIN)]
     pub input_gain: f32,
     #[arg(long, default_value_t = DEFAULT_OUTPUT_GAIN)]
@@ -506,7 +604,7 @@ pub struct WavArgs {
     #[arg(
         long,
         value_enum,
-        help = "Input denoiser: off, noise-gate, rnnoise, gtcrn, webrtc, or deep-filter-net3"
+        help = "Input denoiser: off, noise-gate, rnnoise, gtcrn, web-rtc, or deep-filter-net3"
     )]
     pub denoiser: Option<Denoiser>,
     #[arg(
@@ -519,7 +617,7 @@ pub struct WavArgs {
         long,
         value_enum,
         default_value_t = WebRtcSuppressionLevel::Moderate,
-        help = "WebRTC suppression level (used with --denoiser webrtc)"
+        help = "WebRTC suppression level (used with --denoiser web-rtc)"
     )]
     pub webrtc_level: WebRtcSuppressionLevel,
     #[arg(
@@ -615,6 +713,9 @@ pub struct ExportPthArgs {
     /// Python executable from that RVC installation.
     #[arg(long, value_name = "PYTHON")]
     pub python: PathBuf,
+    /// Export a TensorRT-oriented ONNX with every time axis fixed to this frame count.
+    #[arg(long, value_name = "N", value_parser = parse_positive_usize)]
+    pub frames: Option<usize>,
     /// Required acknowledgement: importing a local RVC installation executes its Python model definitions.
     #[arg(long)]
     pub trust_rvc_root: bool,
@@ -676,6 +777,17 @@ fn parse_unit_f32(value: &str) -> Result<f32, String> {
         Ok(value)
     } else {
         Err("value must be a finite number in 0.0..=1.0".to_string())
+    }
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("expected a positive integer, got '{value}'"))?;
+    if parsed == 0 {
+        Err("value must be greater than zero".to_string())
+    } else {
+        Ok(parsed)
     }
 }
 
@@ -960,7 +1072,11 @@ mod tests {
         assert_eq!(args.wasapi_buffer_ms, DEFAULT_WASAPI_BUFFER_MS);
         assert_eq!(args.rms_mix_rate, 0.0);
         assert_eq!(args.f0_threshold, DEFAULT_F0_THRESHOLD);
+        assert_eq!(args.f0_mode, F0Mode::Rmvpe);
+        assert!(args.fcpe_model.is_none());
+        assert_eq!(args.dynamic_tuning, DynamicTuning::Off);
         assert!(args.f0_continuity);
+        assert!(args.f0_stabilization);
         assert_eq!(args.index_rate, 0.0);
         assert_eq!(args.protect, DEFAULT_PROTECT);
         assert_eq!(args.protect_transition_ms, DEFAULT_PROTECT_TRANSITION_MS);
@@ -972,7 +1088,77 @@ mod tests {
             DEFAULT_RVC_OUTPUT_TAIL_DISCARD_MS
         );
         assert_eq!(args.extra_convert_ms, DEFAULT_EXTRA_CONVERT_MS);
+        assert_eq!(args.rvc_frames, None);
         assert!(args.validate_audio_options().is_ok());
+    }
+
+    #[test]
+    fn parses_hybrid_f0_and_requires_fcpe_model() {
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--f0-mode",
+            "hybrid",
+            "--fcpe-model",
+            "fcpe.onnx",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.f0_mode, F0Mode::Hybrid);
+        assert_eq!(args.fcpe_model, Some(PathBuf::from("fcpe.onnx")));
+        assert!(
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--f0-mode", "hybrid",]).is_err()
+        );
+    }
+
+    #[test]
+    fn parses_fcpe_only_without_rmvpe_model() {
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--f0-mode",
+            "fcpe",
+            "--fcpe-model",
+            "fcpe.onnx",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.f0_mode, F0Mode::Fcpe);
+        assert_eq!(args.f0_model, None);
+        assert_eq!(args.fcpe_model, Some(PathBuf::from("fcpe.onnx")));
+
+        let wav = Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-mode",
+            "fcpe",
+            "--fcpe-model",
+            "fcpe.onnx",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+        ])
+        .unwrap();
+        let Command::Wav(args) = wav.command else {
+            panic!("expected wav command");
+        };
+        assert_eq!(args.f0_mode, F0Mode::Fcpe);
+        assert_eq!(args.f0_model, None);
+
+        assert!(
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--f0-mode", "fcpe",]).is_err()
+        );
     }
 
     #[test]
@@ -998,6 +1184,38 @@ mod tests {
             "output.wav",
             "--infer-chunks",
             "2",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn parses_realtime_dynamic_tuning_mode() {
+        let cli =
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--dynamic-tuning", "auto"])
+                .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.dynamic_tuning, DynamicTuning::Auto);
+        assert_eq!(
+            vc_app::DynamicTuningMode::from(args.dynamic_tuning),
+            vc_app::DynamicTuningMode::Auto
+        );
+        assert!(Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-model",
+            "f0.onnx",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+            "--dynamic-tuning",
+            "auto",
         ])
         .is_err());
     }
@@ -1369,6 +1587,19 @@ mod tests {
         };
         assert!(!run.f0_continuity);
 
+        let run_stabilization = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--f0-stabilization",
+            "false",
+        ])
+        .unwrap();
+        let Command::Run(run_stabilization) = run_stabilization.command else {
+            panic!("expected run command");
+        };
+        assert!(!run_stabilization.f0_stabilization);
+
         let wav = Cli::try_parse_from([
             "vc-rs",
             "wav",
@@ -1422,7 +1653,52 @@ mod tests {
         };
         assert_eq!(args.model, PathBuf::from("voice.pth"));
         assert_eq!(args.output, PathBuf::from("voice.onnx"));
+        assert_eq!(args.frames, None);
         assert!(args.trust_rvc_root);
+    }
+
+    #[test]
+    fn parses_fixed_frame_pth_export() {
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "export-pth",
+            "--model",
+            "voice.pth",
+            "--output",
+            "voice-99.onnx",
+            "--rvc-root",
+            "rvc-webui",
+            "--python",
+            "python.exe",
+            "--frames",
+            "99",
+            "--trust-rvc-root",
+        ])
+        .unwrap();
+        let Command::ExportPth(args) = cli.command else {
+            panic!("expected export-pth command");
+        };
+        assert_eq!(args.frames, Some(99));
+    }
+
+    #[test]
+    fn rejects_zero_frame_pth_export() {
+        assert!(Cli::try_parse_from([
+            "vc-rs",
+            "export-pth",
+            "--model",
+            "voice.pth",
+            "--output",
+            "voice.onnx",
+            "--rvc-root",
+            "rvc-webui",
+            "--python",
+            "python.exe",
+            "--frames",
+            "0",
+            "--trust-rvc-root",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1595,6 +1871,38 @@ mod tests {
             "4800"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn parses_custom_rvc_frames_for_realtime_and_wav() {
+        let cli =
+            Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--rvc-frames", "200"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.rvc_frames, Some(200));
+
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "wav",
+            "--model",
+            "model.onnx",
+            "--embedder",
+            "embedder.onnx",
+            "--f0-model",
+            "f0.onnx",
+            "--input",
+            "input.wav",
+            "--output",
+            "output.wav",
+            "--rvc-frames",
+            "62",
+        ])
+        .unwrap();
+        let Command::Wav(args) = cli.command else {
+            panic!("expected wav command");
+        };
+        assert_eq!(args.rvc_frames, Some(62));
     }
 
     #[test]
@@ -2049,6 +2357,21 @@ mod tests {
             panic!("expected run command");
         };
         assert_eq!(args.denoiser_mode(), Denoiser::Rnnoise);
+
+        let cli = Cli::try_parse_from([
+            "vc-rs",
+            "run",
+            "--passthrough",
+            "--denoiser",
+            "webrtc",
+            "--silence-suppressor",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.denoiser_mode(), Denoiser::WebRtc);
+        assert!(args.silence_suppressor);
 
         let cli = Cli::try_parse_from(["vc-rs", "run", "--passthrough", "--noise-gate"]).unwrap();
         let Command::Run(args) = cli.command else {

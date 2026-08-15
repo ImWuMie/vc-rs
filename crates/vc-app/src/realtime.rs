@@ -1,3 +1,4 @@
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
@@ -11,9 +12,13 @@ use anyhow::{anyhow, bail, Result};
 use rtrb::RingBuffer;
 use thread_priority::{set_current_thread_priority, ThreadPriority};
 use vc_core::dsp;
+use vc_core::dynamic_tuning::{
+    DynamicLanguageProfile, DynamicTuner, DynamicTuningMode, DynamicTuningObservation,
+    DynamicTuningSnapshot,
+};
 use vc_core::model_rvc::{
     set_process_gpu_priority, set_process_power_throttling, ChunkConverter, ChunkOutputConfig,
-    ChunkStats, F0Config, FeatureRetrievalConfig, GpuPriority, LiveParams, LoadProgress,
+    ChunkStats, F0Config, F0Mode, FeatureRetrievalConfig, GpuPriority, LiveParams, LoadProgress,
     NoiseGateShaping, OutputDynamicsConfig, RvcPipeline, RvcPipelineConfig,
 };
 use vc_core::sola::SmoothingKind;
@@ -31,6 +36,8 @@ use crate::audio::{self, AudioStream, RealtimeAudio};
 const INPUT_QUEUE_CHUNKS: usize = 4;
 const OUTPUT_QUEUE_CHUNKS: usize = 4;
 const COMMAND_CAPACITY: usize = 8;
+const BASE_MODEL_REQUEST_ID: u64 = 0;
+const FIRST_DYNAMIC_MODEL_REQUEST_ID: NonZeroU64 = NonZeroU64::MIN;
 const CALIBRATION_IDLE: u8 = 0;
 const CALIBRATION_REQUESTED: u8 = 1;
 const CALIBRATION_COLLECTING: u8 = 2;
@@ -107,12 +114,75 @@ pub enum DenoiserMode {
     DeepFilterNet3,
 }
 
+const DENOISER_MODE_BITS: u32 = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AppliedDenoiserSnapshot {
+    generation: u64,
+    mode: DenoiserMode,
+}
+
+/// Lock-free publication of the denoiser mode the worker actually applied.
+/// Generation and mode share one atomic word so a background model loader can
+/// never observe a new mode paired with an old generation (or vice versa).
+struct AppliedDenoiserState {
+    packed: AtomicU64,
+}
+
+impl AppliedDenoiserState {
+    fn new(snapshot: AppliedDenoiserSnapshot) -> Self {
+        Self {
+            packed: AtomicU64::new(pack_applied_denoiser(snapshot)),
+        }
+    }
+
+    fn load(&self) -> AppliedDenoiserSnapshot {
+        unpack_applied_denoiser(self.packed.load(Ordering::Acquire))
+    }
+
+    fn store(&self, snapshot: AppliedDenoiserSnapshot) {
+        self.packed
+            .store(pack_applied_denoiser(snapshot), Ordering::Release);
+    }
+}
+
+fn pack_applied_denoiser(snapshot: AppliedDenoiserSnapshot) -> u64 {
+    let mode = match snapshot.mode {
+        DenoiserMode::Off => 0,
+        DenoiserMode::NoiseGate => 1,
+        DenoiserMode::Rnnoise => 2,
+        DenoiserMode::Gtcrn => 3,
+        DenoiserMode::WebRtc => 4,
+        DenoiserMode::DeepFilterNet3 => 5,
+    };
+    debug_assert!(snapshot.generation <= (u64::MAX >> DENOISER_MODE_BITS));
+    (snapshot.generation << DENOISER_MODE_BITS) | mode
+}
+
+fn unpack_applied_denoiser(packed: u64) -> AppliedDenoiserSnapshot {
+    let mode = match packed & ((1 << DENOISER_MODE_BITS) - 1) {
+        0 => DenoiserMode::Off,
+        1 => DenoiserMode::NoiseGate,
+        2 => DenoiserMode::Rnnoise,
+        3 => DenoiserMode::Gtcrn,
+        4 => DenoiserMode::WebRtc,
+        5 => DenoiserMode::DeepFilterNet3,
+        _ => unreachable!("invalid packed denoiser mode"),
+    };
+    AppliedDenoiserSnapshot {
+        generation: packed >> DENOISER_MODE_BITS,
+        mode,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RealtimeConfig {
     pub model: Option<PathBuf>,
     pub embedder: Option<PathBuf>,
     pub embedder_output: Option<String>,
     pub f0_model: Option<PathBuf>,
+    pub f0_mode: F0Mode,
+    pub fcpe_model: Option<PathBuf>,
     /// Optional target-speaker FAISS `added_IVF*_Flat_*.index`. It is immutable
     /// for a live session because decoding it is model-load work; `index_rate`
     /// and `protect` remain lock-free live parameters in [`LiveParams`].
@@ -141,6 +211,9 @@ pub struct RealtimeConfig {
     pub smoother: Smoother,
     pub rvc_output_tail_discard_ms: u32,
     pub extra_convert_ms: u32,
+    /// Optional fixed generator frame count. Changing this reloads the model
+    /// pipeline because fixed providers need a distinct engine/CUDA graph.
+    pub rvc_frames: Option<usize>,
     pub f0: F0Config,
     pub denoiser_mode: DenoiserMode,
     // GTCRN model directory (holds gtcrn_stream.onnx). Required only when
@@ -170,6 +243,8 @@ impl Default for RealtimeConfig {
             embedder: None,
             embedder_output: None,
             f0_model: None,
+            f0_mode: F0Mode::Rmvpe,
+            fcpe_model: None,
             feature_index: None,
             provider: Provider::Cpu,
             gpu_priority: GpuPriority::default(),
@@ -189,6 +264,7 @@ impl Default for RealtimeConfig {
             smoother: Smoother::Sola,
             rvc_output_tail_discard_ms: 10,
             extra_convert_ms: 100,
+            rvc_frames: None,
             f0: F0Config::default(),
             denoiser_mode: DenoiserMode::Off,
             gtcrn_model_dir: None,
@@ -207,7 +283,10 @@ impl Default for RealtimeConfig {
 
 impl RealtimeConfig {
     fn has_complete_model_set(&self) -> bool {
-        self.model.is_some() && self.embedder.is_some() && self.f0_model.is_some()
+        self.model.is_some()
+            && self.embedder.is_some()
+            && (!self.f0_mode.uses_rmvpe() || self.f0_model.is_some())
+            && (!self.f0_mode.uses_fcpe() || self.fcpe_model.is_some())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -241,10 +320,20 @@ impl RealtimeConfig {
         validate_unit_interval("noise gate floor", self.noise_gate_shaping.floor)?;
         validate_non_negative_f32("target output RMS", self.output_dynamics.target_output_rms)?;
         validate_non_negative_f32("max output gain", self.output_dynamics.max_output_gain)?;
-        if !self.passthrough
-            && (self.model.is_none() || self.embedder.is_none() || self.f0_model.is_none())
-        {
-            bail!("model, embedder, and F0 model are required");
+        if !self.passthrough && (self.model.is_none() || self.embedder.is_none()) {
+            bail!("model and embedder are required");
+        }
+        if !self.passthrough && self.f0_mode.uses_rmvpe() && self.f0_model.is_none() {
+            bail!(
+                "{} F0 mode requires an RMVPE model (f0_model)",
+                self.f0_mode.label()
+            );
+        }
+        if self.f0_mode.uses_fcpe() && self.fcpe_model.is_none() {
+            bail!(
+                "{} F0 mode requires an FCPE model (fcpe_model)",
+                self.f0_mode.label()
+            );
         }
         if self.denoiser_mode == DenoiserMode::Gtcrn && self.gtcrn_model_dir.is_none() {
             bail!("GTCRN denoiser requires a model directory (gtcrn_model_dir)");
@@ -334,7 +423,9 @@ impl RealtimeConfig {
             model,
             embedder: self.embedder.as_ref().expect("validated"),
             embedder_output: self.embedder_output.as_deref(),
-            f0_model: self.f0_model.as_ref().expect("validated"),
+            f0_model: self.f0_model.as_deref(),
+            f0_mode: self.f0_mode,
+            fcpe_model: self.fcpe_model.as_deref(),
             provider: self.provider,
             gpu_priority: self.gpu_priority,
             gpu_device_id: self.gpu_device_id,
@@ -351,6 +442,7 @@ impl RealtimeConfig {
             },
             input_gain: live.input_gain,
             noise_gate_enabled: self.denoiser_mode == DenoiserMode::NoiseGate,
+            silence_gate_enabled: live.silence_gate_enabled,
             noise_gate_threshold: live.noise_gate_threshold,
             denoiser_content_mix: live.denoiser_content_mix,
             denoiser_rmvpe_mix: live.denoiser_rmvpe_mix,
@@ -358,6 +450,7 @@ impl RealtimeConfig {
             output_extra_ms,
             volume_excluded_ms: self.crossfade_ms,
             extra_convert_ms: self.extra_convert_ms,
+            rvc_frames: self.rvc_frames,
             output_gain: live.output_gain,
             output_dynamics: self.output_dynamics,
             progress,
@@ -372,10 +465,12 @@ impl RealtimeConfig {
 struct AtomicLiveParams {
     pitch_shift: AtomicU32,
     speaker_id: AtomicI64,
+    f0_threshold: AtomicU32,
     input_gain: AtomicU32,
     output_gain: AtomicU32,
     monitor_gain: AtomicU32,
     noise_gate_enabled: AtomicBool,
+    silence_gate_enabled: AtomicBool,
     noise_gate_threshold: AtomicU32,
     index_rate: AtomicU32,
     protect: AtomicU32,
@@ -392,9 +487,15 @@ impl AtomicLiveParams {
     }
 
     fn store(&self, value: LiveParams) {
+        // Keep malformed host/GUI automation out of the atomics. The worker
+        // path is intentionally lock-free, so normalization happens before
+        // publishing and does not require a recovery branch in the callback.
+        let value = value.sanitized();
         self.pitch_shift
             .store(value.pitch_shift.to_bits(), Ordering::Relaxed);
         self.speaker_id.store(value.speaker_id, Ordering::Relaxed);
+        self.f0_threshold
+            .store(value.f0_threshold.to_bits(), Ordering::Relaxed);
         self.input_gain
             .store(value.input_gain.to_bits(), Ordering::Relaxed);
         self.output_gain
@@ -403,6 +504,8 @@ impl AtomicLiveParams {
             .store(value.monitor_gain.to_bits(), Ordering::Relaxed);
         self.noise_gate_enabled
             .store(value.noise_gate_enabled, Ordering::Relaxed);
+        self.silence_gate_enabled
+            .store(value.silence_gate_enabled, Ordering::Relaxed);
         self.noise_gate_threshold
             .store(value.noise_gate_threshold.to_bits(), Ordering::Relaxed);
         self.index_rate
@@ -421,10 +524,12 @@ impl AtomicLiveParams {
         LiveParams {
             pitch_shift: f32::from_bits(self.pitch_shift.load(Ordering::Relaxed)),
             speaker_id: self.speaker_id.load(Ordering::Relaxed),
+            f0_threshold: f32::from_bits(self.f0_threshold.load(Ordering::Relaxed)),
             input_gain: f32::from_bits(self.input_gain.load(Ordering::Relaxed)),
             output_gain: f32::from_bits(self.output_gain.load(Ordering::Relaxed)),
             monitor_gain: f32::from_bits(self.monitor_gain.load(Ordering::Relaxed)),
             noise_gate_enabled: self.noise_gate_enabled.load(Ordering::Relaxed),
+            silence_gate_enabled: self.silence_gate_enabled.load(Ordering::Relaxed),
             noise_gate_threshold: f32::from_bits(self.noise_gate_threshold.load(Ordering::Relaxed)),
             index_rate: f32::from_bits(self.index_rate.load(Ordering::Relaxed)),
             protect: f32::from_bits(self.protect.load(Ordering::Relaxed)),
@@ -432,6 +537,11 @@ impl AtomicLiveParams {
             denoiser_content_mix: f32::from_bits(self.denoiser_content_mix.load(Ordering::Relaxed)),
             denoiser_rmvpe_mix: f32::from_bits(self.denoiser_rmvpe_mix.load(Ordering::Relaxed)),
         }
+        .sanitized()
+    }
+
+    fn set_noise_gate_enabled(&self, enabled: bool) {
+        self.noise_gate_enabled.store(enabled, Ordering::Relaxed);
     }
 }
 
@@ -492,6 +602,52 @@ pub struct ModelLoadStatus {
     /// Monotonic load-request id (never reused), so a queued/loading model can
     /// be addressed even after earlier entries are removed from the list.
     pub request_id: u64,
+}
+
+fn model_load_request_is_live(status: &EngineStatusSnapshot, request_id: u64) -> bool {
+    status.model_loads.iter().any(|entry| {
+        entry.request_id == request_id && matches!(&entry.state, ModelLoadState::Loading(_))
+    })
+}
+
+/// Allocate a dynamic-model request id while reserving zero permanently for
+/// the base model status row. Exhaustion is practically unreachable and must
+/// fail rather than wrap to zero or reuse an id that can still be referenced by
+/// a background loader.
+fn take_dynamic_model_request_id(next: &mut NonZeroU64) -> u64 {
+    let request_id = next.get();
+    *next = NonZeroU64::new(
+        request_id
+            .checked_add(1)
+            .expect("dynamic model request ids exhausted"),
+    )
+    .expect("incrementing a nonzero request id cannot produce zero");
+    request_id
+}
+
+/// Remove one non-base model status entry and remap dense pool indices after
+/// its slot. The base row (`request_id == 0`, pool slot 0) is an invariant and
+/// cannot be removed even by an internal/stale command.
+fn remove_dynamic_model_status(
+    status: &mut EngineStatusSnapshot,
+    request_id: u64,
+) -> Option<usize> {
+    if request_id == BASE_MODEL_REQUEST_ID {
+        return None;
+    }
+    let entry_index = status
+        .model_loads
+        .iter()
+        .position(|entry| entry.request_id == request_id)?;
+    let pool_slot = status.model_loads.remove(entry_index).pool_index;
+    if let Some(pool_slot) = pool_slot {
+        for entry in &mut status.model_loads {
+            if entry.pool_index.is_some_and(|slot| slot > pool_slot) {
+                entry.pool_index = entry.pool_index.map(|slot| slot - 1);
+            }
+        }
+    }
+    pool_slot
 }
 
 #[derive(Clone, Debug, Default)]
@@ -699,6 +855,71 @@ impl VoiceCalibrationControl {
     }
 }
 
+/// Cross-thread control plane for the optional language-aware live overlay.
+///
+/// The mode is atomically sampled by the inference worker at chunk boundaries.
+/// Its diagnostic snapshot is deliberately published with `try_lock()` only
+/// from that worker: a slow GUI frame can lose one refresh, but must never add
+/// blocking work to the audio callback or the conversion deadline.
+#[derive(Default)]
+struct DynamicTuningControl {
+    mode: AtomicU8,
+    latest: Mutex<DynamicTuningSnapshot>,
+}
+
+impl DynamicTuningControl {
+    fn set_mode(&self, mode: DynamicTuningMode) {
+        self.mode.store(mode.as_u8(), Ordering::Release);
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = DynamicTuningSnapshot {
+                mode,
+                profile: fixed_dynamic_profile(mode),
+                confidence: if matches!(
+                    mode,
+                    DynamicTuningMode::Chinese
+                        | DynamicTuningMode::English
+                        | DynamicTuningMode::Japanese
+                ) {
+                    1.0
+                } else {
+                    0.0
+                },
+                ..DynamicTuningSnapshot::default()
+            };
+        }
+    }
+
+    fn mode(&self) -> DynamicTuningMode {
+        DynamicTuningMode::from_u8(self.mode.load(Ordering::Acquire))
+    }
+
+    fn reset_snapshot(&self) {
+        self.set_mode(self.mode());
+    }
+
+    fn publish(&self, snapshot: DynamicTuningSnapshot) {
+        if let Ok(mut latest) = self.latest.try_lock() {
+            *latest = snapshot;
+        }
+    }
+
+    fn snapshot(&self) -> DynamicTuningSnapshot {
+        self.latest
+            .lock()
+            .map(|snapshot| *snapshot)
+            .unwrap_or_default()
+    }
+}
+
+fn fixed_dynamic_profile(mode: DynamicTuningMode) -> DynamicLanguageProfile {
+    match mode {
+        DynamicTuningMode::Chinese => DynamicLanguageProfile::Chinese,
+        DynamicTuningMode::English => DynamicLanguageProfile::English,
+        DynamicTuningMode::Japanese => DynamicLanguageProfile::Japanese,
+        DynamicTuningMode::Off | DynamicTuningMode::Auto => DynamicLanguageProfile::Neutral,
+    }
+}
+
 // Boxing the large `Apply` payload is intentionally declined: these commands
 // flow at control-message cadence (model/config changes), not per audio block,
 // so the size disparity costs nothing worth an extra heap allocation + indirection
@@ -721,6 +942,7 @@ enum Command {
         converter: ChunkConverter<RvcPipeline>,
         built_input_rate: u32,
         built_output_rate: u32,
+        built_denoiser_generation: u64,
     },
     AddModelFailed {
         request_id: u64,
@@ -776,8 +998,10 @@ enum WorkerCommand {
         name: String,
         request_id: u64,
         activate: bool,
+        built_denoiser_generation: u64,
     },
-    // Remove a pool slot (dense pool index; the base model stays slot 0).
+    // Remove a pool slot by dense index. Base protection is enforced earlier by
+    // stable request_id=0; a no-base session's first dynamic model can be slot 0.
     RemoveModel {
         slot: usize,
     },
@@ -787,6 +1011,8 @@ enum WorkerCommand {
     SetDenoiser {
         mode: DenoiserMode,
         webrtc_suppression_level: vc_core::denoise_config::WebRtcSuppressionLevel,
+        // Monotonic generation used to reject a stale async model swap.
+        generation: u64,
     },
     // Pre-built GTCRN denoisers (one per model + passthrough), swapped in after
     // an off-thread engine load.
@@ -794,6 +1020,7 @@ enum WorkerCommand {
     SwapGtcrn {
         model_denoisers: Vec<vc_core::denoise::GtcrnDenoiser>,
         passthrough_denoiser: Option<vc_core::denoise::GtcrnDenoiser>,
+        generation: u64,
     },
     // Official DFN3 graph/archive construction is expensive and must never run
     // on the worker's audio deadline. Instances arrive from a loader thread and
@@ -802,6 +1029,7 @@ enum WorkerCommand {
     SwapDeepFilterNet3 {
         model_denoisers: Vec<vc_core::denoise::DeepFilterNet3Denoiser>,
         passthrough_denoiser: Option<vc_core::denoise::DeepFilterNet3Denoiser>,
+        generation: u64,
     },
 }
 
@@ -820,6 +1048,7 @@ pub struct EngineController {
     devices: Arc<Mutex<DeviceList>>,
     telemetry: Arc<Telemetry>,
     voice_calibration: Arc<VoiceCalibrationControl>,
+    dynamic_tuning: Arc<DynamicTuningControl>,
     live: Arc<AtomicLiveParams>,
     passthrough: Arc<AtomicBool>,
     active_model: Arc<AtomicUsize>,
@@ -833,6 +1062,7 @@ impl EngineController {
         let devices = Arc::new(Mutex::new(DeviceList::default()));
         let telemetry = Arc::new(Telemetry::default());
         let voice_calibration = Arc::new(VoiceCalibrationControl::default());
+        let dynamic_tuning = Arc::new(DynamicTuningControl::default());
         let live = Arc::new(AtomicLiveParams::new(initial_live));
         let passthrough = Arc::new(AtomicBool::new(false));
         let active_model = Arc::new(AtomicUsize::new(0));
@@ -842,6 +1072,7 @@ impl EngineController {
             let devices = Arc::clone(&devices);
             let telemetry = Arc::clone(&telemetry);
             let voice_calibration = Arc::clone(&voice_calibration);
+            let dynamic_tuning = Arc::clone(&dynamic_tuning);
             let live = Arc::clone(&live);
             let passthrough = Arc::clone(&passthrough);
             let active_model = Arc::clone(&active_model);
@@ -856,6 +1087,7 @@ impl EngineController {
                         devices,
                         telemetry,
                         voice_calibration,
+                        dynamic_tuning,
                         live,
                         passthrough,
                         active_model,
@@ -869,6 +1101,7 @@ impl EngineController {
             devices,
             telemetry,
             voice_calibration,
+            dynamic_tuning,
             live,
             passthrough,
             active_model,
@@ -913,6 +1146,9 @@ impl EngineController {
     /// the worker slot and drops the status entry; if it was active, the active
     /// slot falls back to the nearest remaining model.
     pub fn remove_model(&self, request_id: u64) -> Result<()> {
+        if request_id == BASE_MODEL_REQUEST_ID {
+            bail!("the base model cannot be removed");
+        }
         self.try_command(Command::RemoveModel { request_id })
     }
 
@@ -921,14 +1157,24 @@ impl EngineController {
     /// keeps the live gate flag coherent so the per-chunk live path does not
     /// fight the requested mode.
     pub fn set_denoiser(&self, mode: DenoiserMode) -> Result<()> {
-        let mut params = self.live.load();
-        params.noise_gate_enabled = mode == DenoiserMode::NoiseGate;
-        self.live.store(params);
         self.try_command(Command::SetDenoiser(mode))
     }
 
     pub fn set_live_params(&self, params: LiveParams) {
         self.live.store(params);
+    }
+
+    /// Choose the optional worker-side language-aware tuning overlay. The
+    /// latest manual [`LiveParams`] remain the baseline and are overlaid only
+    /// at inference-chunk boundaries.
+    pub fn set_dynamic_tuning_mode(&self, mode: DynamicTuningMode) {
+        self.dynamic_tuning.set_mode(mode);
+    }
+
+    /// Latest language-profile heuristic diagnostics. This contains no audio
+    /// samples and can be queried freely by GUI/CLI frontends.
+    pub fn dynamic_tuning_snapshot(&self) -> DynamicTuningSnapshot {
+        self.dynamic_tuning.snapshot()
     }
 
     pub fn set_passthrough(&self, enabled: bool) {
@@ -994,30 +1240,43 @@ fn control_loop(
     devices: Arc<Mutex<DeviceList>>,
     telemetry: Arc<Telemetry>,
     voice_calibration: Arc<VoiceCalibrationControl>,
+    dynamic_tuning: Arc<DynamicTuningControl>,
     live: Arc<AtomicLiveParams>,
     passthrough: Arc<AtomicBool>,
     active_model: Arc<AtomicUsize>,
 ) {
     let mut session: Option<RealtimeSession> = None;
-    // Tracks the live denoiser mode so models added to the pool later load with
-    // the currently-active denoiser rather than the Apply-time config value.
-    let mut current_denoiser = DenoiserMode::Off;
+    // Every asynchronous denoiser load captures the generation at the time it
+    // starts.  The control thread advances this value whenever the session or
+    // selected denoiser changes, so a slow GTCRN/DFN3 loader cannot apply its
+    // result after a newer request (or after a restart).  Keep this check off
+    // the audio worker; it is only used by background/control threads.
+    let denoiser_generation = Arc::new(AtomicU64::new(0));
+    // Background model loads must use the mode the worker actually applied,
+    // not merely the latest request (which may still be loading or may fail).
+    let applied_denoiser = Arc::new(AppliedDenoiserState::new(AppliedDenoiserSnapshot {
+        generation: 0,
+        mode: DenoiserMode::Off,
+    }));
     // Monotonic id for each model-load request, so a `model_loads` entry can be
     // addressed after earlier entries have been removed (per-model delete).
-    let mut next_request_id = 0u64;
+    let mut next_request_id = FIRST_DYNAMIC_MODEL_REQUEST_ID;
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Command::Apply(config)) => {
-                current_denoiser = config.denoiser_mode;
+                denoiser_generation.fetch_add(1, Ordering::AcqRel);
                 restart_session(
                     &mut session,
                     config,
                     &status,
                     &telemetry,
                     &voice_calibration,
+                    &dynamic_tuning,
                     &live,
                     &passthrough,
                     &active_model,
+                    &denoiser_generation,
+                    &applied_denoiser,
                     "Stopping previous session",
                 );
             }
@@ -1027,25 +1286,32 @@ fn control_loop(
                     Some(Ok(UpdateDevicesOutcome::Swapped)) => {
                         if let Some(session) = &session {
                             if let Ok(mut current) = status.lock() {
-                                *current = session.status();
+                                patch_device_status(&mut current, &session.status);
                             }
                         }
                     }
                     Some(Ok(UpdateDevicesOutcome::RestartRequired(config))) => {
-                        current_denoiser = config.denoiser_mode;
+                        denoiser_generation.fetch_add(1, Ordering::AcqRel);
                         restart_session(
                             &mut session,
                             config,
                             &status,
                             &telemetry,
                             &voice_calibration,
+                            &dynamic_tuning,
                             &live,
                             &passthrough,
                             &active_model,
+                            &denoiser_generation,
+                            &applied_denoiser,
                             "Device sample rate changed; restarting",
                         );
                     }
-                    Some(Err(err)) => set_error(&status, &err),
+                    Some(Err(err)) => set_recoverable_error(
+                        &status,
+                        "Device change failed; previous devices remain active",
+                        &err,
+                    ),
                     None => {}
                 }
             }
@@ -1055,7 +1321,7 @@ fn control_loop(
                     &tx,
                     &status,
                     &live,
-                    current_denoiser,
+                    applied_denoiser.load(),
                     path,
                     &mut next_request_id,
                 );
@@ -1066,6 +1332,7 @@ fn control_loop(
                 converter,
                 built_input_rate,
                 built_output_rate,
+                built_denoiser_generation,
             }) => {
                 let Some(s) = session.as_ref() else {
                     update_model_load_status(
@@ -1094,6 +1361,17 @@ fn control_loop(
                     );
                     continue;
                 }
+                if applied_denoiser.load().generation != built_denoiser_generation {
+                    update_model_load_status(
+                        &status,
+                        request_id,
+                        ModelLoadState::Error(
+                            "denoiser changed while model was loading; retry the model load"
+                                .to_string(),
+                        ),
+                    );
+                    continue;
+                }
                 // Activate when this is the first loaded model (a passthrough-only
                 // session grew its first RVC model).
                 let activate = {
@@ -1108,6 +1386,7 @@ fn control_loop(
                         name,
                         request_id,
                         activate,
+                        built_denoiser_generation,
                     })
                     .is_err()
                 {
@@ -1124,27 +1403,19 @@ fn control_loop(
                 update_model_load_status(&status, request_id, ModelLoadState::Error(error));
             }
             Ok(Command::RemoveModel { request_id }) => {
+                // Zero is permanently reserved for the base model. The public
+                // controller rejects it, and this second check protects the
+                // status/worker invariants from a stale or future internal
+                // command that bypasses that API.
+                if request_id == BASE_MODEL_REQUEST_ID {
+                    continue;
+                }
                 let Some(s) = session.as_ref() else { continue };
                 // Pull the entry out of the status list first, fixing up the pool
                 // indices of entries after the removed slot.
                 let pool_slot = {
                     let mut st = status.lock().unwrap_or_else(|e| e.into_inner());
-                    let pi = st
-                        .model_loads
-                        .iter()
-                        .find(|m| m.request_id == request_id)
-                        .and_then(|m| m.pool_index);
-                    st.model_loads.retain(|m| m.request_id != request_id);
-                    if let Some(pi) = pi {
-                        for m in st.model_loads.iter_mut() {
-                            if let Some(x) = m.pool_index {
-                                if x > pi {
-                                    m.pool_index = Some(x - 1);
-                                }
-                            }
-                        }
-                    }
-                    pi
+                    remove_dynamic_model_status(&mut st, request_id)
                 };
                 // A loaded model must be dropped from the worker's pool too.
                 if let Some(pool_slot) = pool_slot {
@@ -1159,11 +1430,19 @@ fn control_loop(
                 }
             }
             Ok(Command::SetDenoiser(mode)) => {
-                current_denoiser = mode;
-                handle_set_denoiser(session.as_ref(), &status, mode);
+                let generation = denoiser_generation.fetch_add(1, Ordering::AcqRel) + 1;
+                handle_set_denoiser(
+                    session.as_ref(),
+                    &status,
+                    mode,
+                    generation,
+                    &denoiser_generation,
+                );
             }
             Ok(Command::Stop) => {
+                denoiser_generation.fetch_add(1, Ordering::AcqRel);
                 voice_calibration.cancel();
+                dynamic_tuning.reset_snapshot();
                 set_status(&status, EngineState::Stopping, "Stopping");
                 drop(session.take());
                 set_status(&status, EngineState::Stopped, "Stopped");
@@ -1174,19 +1453,32 @@ fn control_loop(
                     *current = result;
                 }
             }
-            Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+            Ok(Command::Shutdown) => {
+                denoiser_generation.fetch_add(1, Ordering::AcqRel);
+                break;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                denoiser_generation.fetch_add(1, Ordering::AcqRel);
+                break;
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
-        if session
-            .as_ref()
-            .is_some_and(|s| !s.running.load(Ordering::Relaxed))
-        {
+        let stopped_message = session.as_ref().and_then(|session| {
+            stopped_session_message_and_invalidate(
+                &session.running,
+                &session.endpoint_running,
+                &denoiser_generation,
+            )
+        });
+        if let Some(message) = stopped_message {
             voice_calibration.cancel();
+            dynamic_tuning.reset_snapshot();
             drop(session.take());
-            set_status(&status, EngineState::Error, "Realtime worker stopped");
+            set_status(&status, EngineState::Error, message);
         }
     }
     voice_calibration.cancel();
+    dynamic_tuning.reset_snapshot();
     drop(session);
 }
 
@@ -1199,9 +1491,9 @@ fn handle_add_model(
     tx: &SyncSender<Command>,
     status: &Arc<Mutex<EngineStatusSnapshot>>,
     live: &Arc<AtomicLiveParams>,
-    denoiser_mode: DenoiserMode,
+    applied_denoiser: AppliedDenoiserSnapshot,
     path: PathBuf,
-    next_request_id: &mut u64,
+    next_request_id: &mut NonZeroU64,
 ) {
     let Some(session) = session else {
         set_note(status, "Cannot add a model while stopped");
@@ -1226,9 +1518,8 @@ fn handle_add_model(
         set_note(status, "Model is already loaded or queued");
         return;
     }
-    let ctx = session.model_load_context(path.clone(), &live.load(), denoiser_mode);
-    let request_id = *next_request_id;
-    *next_request_id += 1;
+    let ctx = session.model_load_context(path.clone(), &live.load(), applied_denoiser.mode);
+    let request_id = take_dynamic_model_request_id(next_request_id);
     {
         let mut st = status.lock().unwrap_or_else(|e| e.into_inner());
         st.model_loads.push(ModelLoadStatus {
@@ -1266,6 +1557,7 @@ fn handle_add_model(
                         converter,
                         built_input_rate,
                         built_output_rate,
+                        built_denoiser_generation: applied_denoiser.generation,
                     });
                 }
                 Err(err) => {
@@ -1292,6 +1584,8 @@ fn handle_set_denoiser(
     session: Option<&RealtimeSession>,
     status: &Arc<Mutex<EngineStatusSnapshot>>,
     mode: DenoiserMode,
+    generation: u64,
+    _current_generation: &Arc<AtomicU64>,
 ) {
     let Some(s) = session else {
         return;
@@ -1305,6 +1599,7 @@ fn handle_set_denoiser(
                 .send(WorkerCommand::SetDenoiser {
                     mode,
                     webrtc_suppression_level: s.config.webrtc_suppression_level,
+                    generation,
                 })
                 .is_err()
             {
@@ -1340,21 +1635,33 @@ fn handle_set_denoiser(
                 let wake = Arc::clone(&s.wake);
                 let running_message = s.status().message.clone();
                 let loader_status = Arc::clone(status);
+                let loader_generation = Arc::clone(_current_generation);
                 let spawn = thread::Builder::new()
                     .name("vc-app-gtcrn-loader".to_string())
                     .stack_size(64 * 1024 * 1024)
                     .spawn(move || {
                         let result =
                             load_gtcrn_denoisers(&model_dir, backend, input_rate, model_count);
+                        // A newer mode/restart supersedes this load.  Do not
+                        // publish status or enqueue a swap for stale results;
+                        // dropping the freshly built state is safe because it
+                        // never entered the real-time worker.
+                        if loader_generation.load(Ordering::Acquire) != generation {
+                            return;
+                        }
                         if let Ok(mut st) = loader_status.lock() {
                             st.message = running_message.clone();
                         }
                         match result {
                             Ok((model_denoisers, passthrough_denoiser)) => {
+                                if loader_generation.load(Ordering::Acquire) != generation {
+                                    return;
+                                }
                                 if worker_tx
                                     .send(WorkerCommand::SwapGtcrn {
                                         model_denoisers,
                                         passthrough_denoiser,
+                                        generation,
                                     })
                                     .is_err()
                                 {
@@ -1367,6 +1674,9 @@ fn handle_set_denoiser(
                                 }
                             }
                             Err(err) => {
+                                if loader_generation.load(Ordering::Acquire) != generation {
+                                    return;
+                                }
                                 if let Ok(mut st) = loader_status.lock() {
                                     st.detail = Some(format!("GTCRN load failed: {err:#}"));
                                 }
@@ -1409,6 +1719,7 @@ fn handle_set_denoiser(
                 let wake = Arc::clone(&s.wake);
                 let running_message = s.status().message.clone();
                 let loader_status = Arc::clone(status);
+                let loader_generation = Arc::clone(_current_generation);
                 let spawn = thread::Builder::new()
                     .name("vc-app-dfn3-loader".to_string())
                     .stack_size(64 * 1024 * 1024)
@@ -1420,15 +1731,22 @@ fn handle_set_denoiser(
                             input_rate,
                             model_count,
                         );
+                        if loader_generation.load(Ordering::Acquire) != generation {
+                            return;
+                        }
                         if let Ok(mut st) = loader_status.lock() {
                             st.message = running_message.clone();
                         }
                         match result {
                             Ok((model_denoisers, passthrough_denoiser)) => {
+                                if loader_generation.load(Ordering::Acquire) != generation {
+                                    return;
+                                }
                                 if worker_tx
                                     .send(WorkerCommand::SwapDeepFilterNet3 {
                                         model_denoisers,
                                         passthrough_denoiser,
+                                        generation,
                                     })
                                     .is_err()
                                 {
@@ -1443,6 +1761,9 @@ fn handle_set_denoiser(
                                 }
                             }
                             Err(err) => {
+                                if loader_generation.load(Ordering::Acquire) != generation {
+                                    return;
+                                }
                                 if let Ok(mut st) = loader_status.lock() {
                                     st.detail =
                                         Some(format!("DeepFilterNet3 load failed: {err:#}"));
@@ -1602,7 +1923,9 @@ struct ModelLoadContext {
     model: PathBuf,
     embedder: PathBuf,
     embedder_output: Option<String>,
-    f0_model: PathBuf,
+    f0_model: Option<PathBuf>,
+    f0_mode: F0Mode,
+    fcpe_model: Option<PathBuf>,
     feature_index: Option<PathBuf>,
     provider: Provider,
     gpu_priority: GpuPriority,
@@ -1620,11 +1943,13 @@ struct ModelLoadContext {
     output_gain: f32,
     f0: F0Config,
     noise_gate_enabled: bool,
+    silence_gate_enabled: bool,
     noise_gate_threshold: f32,
     noise_gate_shaping: NoiseGateShaping,
     output_extra_ms: u32,
     volume_excluded_ms: u32,
     extra_convert_ms: u32,
+    rvc_frames: Option<usize>,
     output_dynamics: OutputDynamicsConfig,
     smoother_kind: SmoothingKind,
     output_rate: u32,
@@ -1644,7 +1969,9 @@ impl ModelLoadContext {
             model: &self.model,
             embedder: &self.embedder,
             embedder_output: self.embedder_output.as_deref(),
-            f0_model: &self.f0_model,
+            f0_model: self.f0_model.as_deref(),
+            f0_mode: self.f0_mode,
+            fcpe_model: self.fcpe_model.as_deref(),
             provider: self.provider,
             gpu_priority: self.gpu_priority,
             gpu_device_id: self.gpu_device_id,
@@ -1661,6 +1988,7 @@ impl ModelLoadContext {
             },
             input_gain: self.input_gain,
             noise_gate_enabled: self.noise_gate_enabled,
+            silence_gate_enabled: self.silence_gate_enabled,
             noise_gate_threshold: self.noise_gate_threshold,
             denoiser_content_mix: self.denoiser_content_mix,
             denoiser_rmvpe_mix: self.denoiser_rmvpe_mix,
@@ -1668,6 +1996,7 @@ impl ModelLoadContext {
             output_extra_ms: self.output_extra_ms,
             volume_excluded_ms: self.volume_excluded_ms,
             extra_convert_ms: self.extra_convert_ms,
+            rvc_frames: self.rvc_frames,
             output_gain: self.output_gain,
             output_dynamics: self.output_dynamics,
             progress: Some(progress),
@@ -1778,30 +2107,46 @@ fn restart_session(
     status: &Arc<Mutex<EngineStatusSnapshot>>,
     telemetry: &Arc<Telemetry>,
     voice_calibration: &Arc<VoiceCalibrationControl>,
+    dynamic_tuning: &Arc<DynamicTuningControl>,
     live: &Arc<AtomicLiveParams>,
     passthrough: &Arc<AtomicBool>,
     active_model: &Arc<AtomicUsize>,
+    denoiser_generation: &Arc<AtomicU64>,
+    applied_denoiser: &Arc<AppliedDenoiserState>,
     stopping_message: &str,
 ) {
     // A calibration belongs to one microphone/session timeline. Do not let a
     // worker completing just as a device/model restart occurs publish a profile
     // measured from the old stream into the new configuration.
     voice_calibration.cancel();
+    // A newly spawned worker owns a fresh DynamicTuner. Reset its frontend
+    // diagnostics at the same lifecycle boundary so an old room-noise estimate
+    // is never shown as if it belonged to the new input device/session.
+    dynamic_tuning.reset_snapshot();
     passthrough.store(config.passthrough, Ordering::Relaxed);
     set_status(status, EngineState::Stopping, stopping_message);
     drop(session.take());
     set_status(status, EngineState::Starting, "Validating configuration");
     telemetry.reset();
+    let initial_denoiser_mode = config.denoiser_mode;
     match RealtimeSession::start(
         config,
         Arc::clone(telemetry),
         Arc::clone(voice_calibration),
+        Arc::clone(dynamic_tuning),
         Arc::clone(live),
         Arc::clone(passthrough),
         Arc::clone(active_model),
+        Arc::clone(denoiser_generation),
+        Arc::clone(applied_denoiser),
         status,
     ) {
         Ok(new_session) => {
+            applied_denoiser.store(AppliedDenoiserSnapshot {
+                generation: denoiser_generation.load(Ordering::Acquire),
+                mode: initial_denoiser_mode,
+            });
+            live.set_noise_gate_enabled(initial_denoiser_mode == DenoiserMode::NoiseGate);
             if let Ok(mut current) = status.lock() {
                 *current = new_session.status();
             }
@@ -1845,6 +2190,60 @@ fn set_error(status: &Mutex<EngineStatusSnapshot>, error: &anyhow::Error) {
         status.monitor_sample_rate = 0;
         status.passthrough_live_switchable = false;
     }
+}
+
+/// Copy only endpoint-owned status fields after a same-rate device swap. Model
+/// load entries and the active model are worker-owned and may have changed
+/// since the session's startup snapshot was created, so replacing the complete
+/// shared status here would roll live pool state backwards.
+fn patch_device_status(current: &mut EngineStatusSnapshot, device_status: &EngineStatusSnapshot) {
+    current.message.clone_from(&device_status.message);
+    current.detail.clone_from(&device_status.detail);
+    current.input_device.clone_from(&device_status.input_device);
+    current
+        .output_device
+        .clone_from(&device_status.output_device);
+    current.input_sample_rate = device_status.input_sample_rate;
+    current.output_sample_rate = device_status.output_sample_rate;
+    current
+        .monitor_device
+        .clone_from(&device_status.monitor_device);
+    current.monitor_sample_rate = device_status.monitor_sample_rate;
+}
+
+/// Publish a control-path failure without tearing down a still-healthy running
+/// session. Device reconfiguration is transactional: when the candidate fails,
+/// the old streams, worker, model pool, and device fields remain authoritative.
+fn set_recoverable_error(
+    status: &Mutex<EngineStatusSnapshot>,
+    message: impl Into<String>,
+    error: &anyhow::Error,
+) {
+    if let Ok(mut status) = status.lock() {
+        status.message = message.into();
+        status.detail = Some(format!("{error:#}"));
+    }
+}
+
+/// Detect an unexpected worker/endpoint stop and invalidate asynchronous
+/// denoiser loads before the session is dropped. Otherwise a loader started by
+/// the failed session could race a later restart and install stale state.
+fn stopped_session_message_and_invalidate(
+    worker_running: &AtomicBool,
+    endpoint_running: &AtomicBool,
+    denoiser_generation: &AtomicU64,
+) -> Option<&'static str> {
+    let message = if !worker_running.load(Ordering::Acquire) {
+        Some("Realtime worker stopped")
+    } else if !endpoint_running.load(Ordering::Acquire) {
+        Some("Realtime audio endpoint stopped")
+    } else {
+        None
+    };
+    if message.is_some() {
+        denoiser_generation.fetch_add(1, Ordering::AcqRel);
+    }
+    message
 }
 
 fn load_progress_message(progress: LoadProgress) -> String {
@@ -2229,6 +2628,7 @@ impl PassthroughProcessor {
             output_rms: dsp::rms(prepared),
             model_output_samples: prepared.len(),
             voiced_ratio: 0.0,
+            pitch_variation_semitones: 0.0,
             pitch_frames: 0,
         })
     }
@@ -2239,6 +2639,92 @@ impl PassthroughProcessor {
 // loaded RVC sessions but stop invoking them while passthrough is active; a
 // pool is a switchable session that grew past one RVC model (added live), with
 // the active slot selected by an atomic written from the front-end.
+fn remap_slot_after_removal(
+    requested_before: usize,
+    removed_slot: usize,
+    remaining_models: usize,
+) -> usize {
+    if remaining_models == 0 {
+        return 0;
+    }
+    if requested_before == removed_slot {
+        removed_slot.min(remaining_models - 1)
+    } else if requested_before > removed_slot {
+        requested_before - 1
+    } else {
+        requested_before
+    }
+}
+
+fn remove_aligned_model_slot<T>(models: &mut Vec<T>, names: &mut Vec<String>, slot: usize) -> bool {
+    if slot >= models.len() || models.len() != names.len() {
+        return false;
+    }
+    models.remove(slot);
+    names.remove(slot);
+    true
+}
+
+/// Remap the frontend-requested dense slot only if it still contains the value
+/// observed before deletion. A concurrent `set_active_model` wins the CAS; the
+/// process path's existing bounds clamp handles that newer request against the
+/// shortened pool on its next chunk.
+fn try_remap_requested_slot_after_removal(
+    active_requested: &AtomicUsize,
+    requested_before: usize,
+    removed_slot: usize,
+    remaining_models: usize,
+) -> bool {
+    let remapped = remap_slot_after_removal(requested_before, removed_slot, remaining_models);
+    active_requested
+        .compare_exchange(
+            requested_before,
+            remapped,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+/// Publish the controller-selected first-model activation without overwriting
+/// a newer frontend selection. Adding a non-active model does not change any
+/// existing dense index, so it must not write the atomic at all.
+fn try_publish_active_slot_after_add(
+    active_requested: &AtomicUsize,
+    requested_before: usize,
+    active_after: usize,
+    activate: bool,
+) -> bool {
+    activate
+        && active_requested
+            .compare_exchange(
+                requested_before,
+                active_after,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+}
+
+fn keep_first_reset_error(first_error: &mut Option<anyhow::Error>, result: Result<()>) {
+    if first_error.is_none() {
+        if let Err(err) = result {
+            *first_error = Some(err);
+        }
+    }
+}
+
+fn reset_rvc_converter_history(
+    converter: &mut ChunkConverter<RvcPipeline>,
+    first_error: &mut Option<anyhow::Error>,
+) {
+    let model_reset = converter.model_mut().reset_streaming_state();
+    // The smoother/tail is independent from the model reset result and must
+    // always be cleared before audio from a newly-bound device can arrive.
+    converter.reset_streaming_state();
+    keep_first_reset_error(first_error, model_reset);
+}
+
 #[allow(clippy::large_enum_variant)]
 enum RuntimeModel {
     PassthroughOnly(PassthroughProcessor),
@@ -2312,6 +2798,14 @@ impl RuntimeModel {
                     }
                     return passthrough.process_chunk(audio, live, prepared);
                 }
+                // `remove_model` normally converts an empty pool back to the
+                // PassthroughOnly variant. Keep this guard as a defensive
+                // invariant at the realtime seam: a stale command or future
+                // pool mutation must never turn `len() - 1` into an underflow
+                // or index an empty vector on the worker thread.
+                if models.is_empty() {
+                    return passthrough.process_chunk(audio, live, prepared);
+                }
                 let requested = active_requested
                     .load(Ordering::Relaxed)
                     .min(models.len() - 1);
@@ -2344,6 +2838,7 @@ impl RuntimeModel {
         activate: bool,
         active_requested: Arc<AtomicUsize>,
     ) -> RuntimeModel {
+        let requested_before = active_requested.load(Ordering::Relaxed);
         let (passthrough, mut models, mut names, mut active, passthrough_active) = match self {
             Self::PassthroughOnly(passthrough) => (passthrough, Vec::new(), Vec::new(), 0, false),
             Self::Switchable {
@@ -2373,7 +2868,12 @@ impl RuntimeModel {
         if activate {
             active = slot;
         }
-        active_requested.store(active, Ordering::Relaxed);
+        let _ = try_publish_active_slot_after_add(
+            &active_requested,
+            requested_before,
+            active,
+            activate,
+        );
         RuntimeModel::Pool {
             passthrough,
             models,
@@ -2392,12 +2892,14 @@ impl RuntimeModel {
         }
     }
 
-    /// Drop a pool slot by its dense index (the base model is slot 0 and is not
-    /// removed by the front-end). If the active model is removed, the active
-    /// slot falls back to the nearest remaining model; pool indices after the
-    /// removed slot shift down. The requested-slot atomic is re-stored so the
-    /// worker's next `process_chunk` converges to the new active slot.
+    /// Drop a pool slot by its dense index. Base-model protection belongs to the
+    /// control layer's stable request id: in a passthrough-only session the first
+    /// live-added (and removable) model legitimately occupies dense slot 0. If
+    /// the active/requested model is removed, it falls back to the nearest
+    /// remaining model; later indices shift down. A compare-exchange preserves a
+    /// newer concurrent frontend request instead of overwriting it.
     fn remove_model(mut self, slot: usize) -> RuntimeModel {
+        let mut empty_pool_requested_before = None;
         if let Self::Pool {
             models,
             names,
@@ -2406,15 +2908,40 @@ impl RuntimeModel {
             ..
         } = &mut self
         {
-            if slot < models.len() {
-                models.remove(slot);
-                names.remove(slot);
-                if slot == *active {
-                    *active = slot.min(models.len().saturating_sub(1));
-                } else if slot < *active {
-                    *active -= 1;
+            if models.is_empty() {
+                empty_pool_requested_before = Some(active_requested.load(Ordering::Relaxed));
+            } else {
+                let requested_before = active_requested.load(Ordering::Relaxed);
+                if remove_aligned_model_slot(models, names, slot) {
+                    *active = remap_slot_after_removal(*active, slot, models.len());
+                    let _ = try_remap_requested_slot_after_removal(
+                        active_requested,
+                        requested_before,
+                        slot,
+                        models.len(),
+                    );
                 }
-                active_requested.store(*active, Ordering::Relaxed);
+            }
+        }
+        // A model-free session has a distinct runtime variant. Apart from
+        // avoiding an empty-pool index, this keeps status/passthrough semantics
+        // coherent after deleting the final live-loaded model.
+        if matches!(&self, Self::Pool { models, .. } if models.is_empty()) {
+            if let Self::Pool {
+                passthrough,
+                active_requested,
+                ..
+            } = self
+            {
+                let requested_before = empty_pool_requested_before
+                    .unwrap_or_else(|| active_requested.load(Ordering::Relaxed));
+                let _ = active_requested.compare_exchange(
+                    requested_before,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                return Self::PassthroughOnly(passthrough);
             }
         }
         self
@@ -2436,6 +2963,36 @@ impl RuntimeModel {
                 .get_mut(*active)
                 .and_then(|model| model.model_mut().speaker_count()),
         }
+    }
+
+    /// Reset every stream-derived state after a same-rate device rebind. This
+    /// runs only on the inference worker: callbacks keep queue-only ownership,
+    /// while all loaded (including inactive) models, passthrough denoisers and
+    /// converter smoothers start the new device on a clean timeline.
+    fn reset_for_device_rebind(&mut self, live: &LiveParams) -> Result<()> {
+        let mut first_error = None;
+        match self {
+            Self::PassthroughOnly(passthrough) => {
+                keep_first_reset_error(&mut first_error, passthrough.reset(live));
+            }
+            Self::Switchable {
+                passthrough, rvc, ..
+            } => {
+                keep_first_reset_error(&mut first_error, passthrough.reset(live));
+                reset_rvc_converter_history(rvc, &mut first_error);
+            }
+            Self::Pool {
+                passthrough,
+                models,
+                ..
+            } => {
+                keep_first_reset_error(&mut first_error, passthrough.reset(live));
+                for model in models {
+                    reset_rvc_converter_history(model, &mut first_error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Hot-swap the denoiser variant across the passthrough processor and every
@@ -2490,7 +3047,10 @@ impl RuntimeModel {
         &mut self,
         passthrough_denoiser: Option<vc_core::denoise::GtcrnDenoiser>,
         model_denoisers: Vec<vc_core::denoise::GtcrnDenoiser>,
-    ) {
+    ) -> bool {
+        if !denoiser_set_matches_model_count(model_denoisers.len(), self.model_count()) {
+            return false;
+        }
         match self {
             Self::PassthroughOnly(passthrough) => passthrough.set_gtcrn(passthrough_denoiser),
             Self::Switchable {
@@ -2513,6 +3073,7 @@ impl RuntimeModel {
                 }
             }
         }
+        true
     }
 
     /// Hot-swap pre-built DeepFilterNet3 denoisers (one device-rate stream per
@@ -2523,7 +3084,10 @@ impl RuntimeModel {
         &mut self,
         passthrough_denoiser: Option<vc_core::denoise::DeepFilterNet3Denoiser>,
         model_denoisers: Vec<vc_core::denoise::DeepFilterNet3Denoiser>,
-    ) {
+    ) -> bool {
+        if !denoiser_set_matches_model_count(model_denoisers.len(), self.model_count()) {
+            return false;
+        }
         match self {
             Self::PassthroughOnly(passthrough) => {
                 passthrough.set_deepfilternet3(passthrough_denoiser)
@@ -2548,7 +3112,12 @@ impl RuntimeModel {
                 }
             }
         }
+        true
     }
+}
+
+fn denoiser_set_matches_model_count(supplied: usize, current: usize) -> bool {
+    supplied == current
 }
 
 impl From<DenoiserMode> for vc_core::model_rvc::InputDenoiserMode {
@@ -2622,7 +3191,11 @@ fn accumulate_input_chunk(
 }
 
 struct RealtimeSession {
+    /// Worker/session lifetime. Device endpoint failures are tracked by the
+    /// separately swappable `endpoint_running` flag so a candidate rebind can
+    /// fail without stopping the current worker and streams.
     running: Arc<AtomicBool>,
+    endpoint_running: Arc<AtomicBool>,
     wake: Arc<WorkerWake>,
     worker: Option<JoinHandle<()>>,
     input_stream: Option<AudioStream>,
@@ -2648,13 +3221,21 @@ struct RealtimeSession {
 }
 
 impl RealtimeSession {
+    // These are independently owned lifecycle handles (device telemetry,
+    // calibration, dynamic tuning, live controls, routing, and status). Keep
+    // them explicit at the one session-construction boundary rather than
+    // inventing a short-lived aggregate that obscures ownership on restart.
+    #[allow(clippy::too_many_arguments)]
     fn start(
         config: RealtimeConfig,
         telemetry: Arc<Telemetry>,
         voice_calibration: Arc<VoiceCalibrationControl>,
+        dynamic_tuning: Arc<DynamicTuningControl>,
         live: Arc<AtomicLiveParams>,
         passthrough_live: Arc<AtomicBool>,
         active_model: Arc<AtomicUsize>,
+        denoiser_generation: Arc<AtomicU64>,
+        applied_denoiser: Arc<AppliedDenoiserState>,
         status: &Arc<Mutex<EngineStatusSnapshot>>,
     ) -> Result<Self> {
         // Reset the live active-model slot to the base model on every session.
@@ -2761,6 +3342,7 @@ impl RealtimeSession {
         let output_capacity = output_chunk * OUTPUT_QUEUE_CHUNKS;
         let input_capacity = input_chunk * INPUT_QUEUE_CHUNKS;
         let running = Arc::new(AtomicBool::new(true));
+        let endpoint_running = Arc::new(AtomicBool::new(true));
         let wake = Arc::new(WorkerWake::default());
         // Worker command mailbox (control thread → worker). Unbounded so large
         // payloads (later: whole model converters) never block the sender.
@@ -2774,7 +3356,7 @@ impl RealtimeSession {
             input_capacity,
             output_capacity,
             config.monitor_output_enabled.then_some(monitor_capacity),
-            &running,
+            &endpoint_running,
             &wake,
             &telemetry,
         )?;
@@ -2788,6 +3370,9 @@ impl RealtimeSession {
         let worker_wake = Arc::clone(&wake);
         let worker_telemetry = Arc::clone(&telemetry);
         let worker_voice_calibration = Arc::clone(&voice_calibration);
+        let worker_dynamic_tuning = Arc::clone(&dynamic_tuning);
+        let worker_denoiser_generation = Arc::clone(&denoiser_generation);
+        let worker_applied_denoiser = Arc::clone(&applied_denoiser);
         let worker_debug_input = Arc::clone(&debug_input);
         let worker_debug_output = Arc::clone(&debug_output);
         // The worker owns the model pool, so it is the source of truth for pool
@@ -2818,10 +3403,19 @@ impl RealtimeSession {
                     // callback: calibration is a setup task, not RT I/O.
                     let mut calibration_generation = 0u64;
                     let mut calibration: Option<VoiceCalibrationAccumulator> = None;
+                    // This overlay is owned entirely by the inference worker.
+                    // It samples the user's base controls once per chunk and
+                    // never reaches into an audio callback or an editor lock.
+                    let mut dynamic_tuner = DynamicTuner::default();
                     // Last pool slot reported to the shared status, so a live
                     // model switch is propagated without re-looking-up the name
                     // (and allocating) on every chunk.
                     let mut last_active_slot = 0usize;
+                    // Async denoiser commands carry a generation.  The worker
+                    // is the final authority because loader/control sends can
+                    // race; stale swaps are dropped before touching state.
+                    let mut applied_denoiser_generation =
+                        worker_denoiser_generation.load(Ordering::Acquire);
                     while worker_running.load(Ordering::SeqCst) {
                         match worker_voice_calibration.request() {
                             Some((generation, duration_ms))
@@ -2848,20 +3442,82 @@ impl RealtimeSession {
                                     output_producer: op,
                                     monitor_producer: mp,
                                 } => {
+                                    let live_params = live.load();
+                                    if let Err(err) = model.reset_for_device_rebind(&live_params) {
+                                        // Continuing would concatenate the new
+                                        // microphone with partially-reset model
+                                        // or denoiser history. Stop the worker;
+                                        // the control loop will publish Error.
+                                        tracing::warn!(
+                                            "failed to reset model history for device rebind: {err:#}"
+                                        );
+                                        worker_running.store(false, Ordering::SeqCst);
+                                        break;
+                                    }
+                                    let next_monitor_resampler = if mp.is_some() {
+                                        match dsp::StreamingResampleMono::new(
+                                            output_rate as usize,
+                                            monitor_rate as usize,
+                                        ) {
+                                            Ok(resampler) => Some(resampler),
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    "failed to reset monitor resampler for device rebind: {err:#}"
+                                                );
+                                                worker_running.store(false, Ordering::SeqCst);
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    };
                                     input_consumer = ic;
                                     output_producer = op;
                                     monitor_producer = mp;
-                                    // Discard partial input accumulated from the
-                                    // previous device; its samples do not belong
-                                    // to the new ring's timeline.
+                                    monitor_resampler = next_monitor_resampler;
+                                    // Discard every worker-owned partial buffer
+                                    // and adaptive observation from the previous
+                                    // device. The new rings begin one clean
+                                    // model/denoiser/monitor timeline.
                                     input_acc.clear();
+                                    prepared.clear();
+                                    monitor_prepared.clear();
+                                    calibration_generation = 0;
+                                    calibration = None;
+                                    dynamic_tuner = DynamicTuner::default();
+                                    worker_dynamic_tuning.reset_snapshot();
                                 }
                                 WorkerCommand::AddModel {
                                     converter,
                                     name,
                                     request_id,
                                     activate,
+                                    built_denoiser_generation,
                                 } => {
+                                    // The control thread can remove a loading
+                                    // request before its background builder
+                                    // finishes.  Remove has no pool slot in that
+                                    // window, so the worker must re-check the
+                                    // tombstone here or the completed converter
+                                    // would become a ghost model after deletion.
+                                    let request_is_live = worker_status
+                                        .lock()
+                                        .map(|status| model_load_request_is_live(&status, request_id))
+                                        .unwrap_or(false);
+                                    if !request_is_live {
+                                        continue;
+                                    }
+                                    if built_denoiser_generation != applied_denoiser_generation {
+                                        update_model_load_status(
+                                            &worker_status,
+                                            request_id,
+                                            ModelLoadState::Error(
+                                                "denoiser changed before model activation; retry the model load"
+                                                    .to_string(),
+                                            ),
+                                        );
+                                        continue;
+                                    }
                                     // A passthrough-only session gains live
                                     // passthrough switching once it has a model.
                                     let was_passthrough_only =
@@ -2890,6 +3546,23 @@ impl RealtimeSession {
                                 }
                                 WorkerCommand::RemoveModel { slot } => {
                                     model = model.remove_model(slot);
+                                    if model.model_count() == 0 {
+                                        // The passthrough processor may have been
+                                        // idle while the deleted RVC model was
+                                        // active. Reset its resampler/denoiser
+                                        // timeline before exposing the model-free
+                                        // route, just like a normal RVC ->
+                                        // passthrough transition.
+                                        let live_params = live.load();
+                                        if let RuntimeModel::PassthroughOnly(passthrough) = &mut model
+                                        {
+                                            if let Err(err) = passthrough.reset(&live_params) {
+                                                tracing::warn!(
+                                                    "failed to reset passthrough after final model removal: {err}"
+                                                );
+                                            }
+                                        }
+                                    }
                                     // Removing the active pool slot may fall back to a
                                     // model with a different embedding table (for example
                                     // MXGF 308-speaker -> stock 109-speaker). Publish the
@@ -2899,37 +3572,111 @@ impl RealtimeSession {
                                     if let Ok(mut st) = worker_status.lock() {
                                         st.active_model = model.active_model_name();
                                         st.speaker_count = model.active_speaker_count();
+                                        st.passthrough_live_switchable = model.model_count() > 0;
                                     }
                                 }
                                 WorkerCommand::SetDenoiser {
                                     mode,
                                     webrtc_suppression_level,
+                                    generation,
                                 } => {
-                                    let live_params = live.load();
-                                    if let Err(err) = model.set_denoiser_mode(
-                                        mode,
-                                        input_rate,
-                                        &live_params,
-                                        webrtc_suppression_level,
-                                    ) {
-                                        tracing::warn!("failed to switch denoiser: {err}");
+                                    if generation
+                                        == worker_denoiser_generation.load(Ordering::Acquire)
+                                        && generation >= applied_denoiser_generation
+                                    {
+                                        let live_params = live.load();
+                                        match model.set_denoiser_mode(
+                                            mode,
+                                            input_rate,
+                                            &live_params,
+                                            webrtc_suppression_level,
+                                        ) {
+                                            Ok(()) => {
+                                                applied_denoiser_generation = generation;
+                                                worker_applied_denoiser.store(
+                                                    AppliedDenoiserSnapshot { generation, mode },
+                                                );
+                                                live.set_noise_gate_enabled(
+                                                    mode == DenoiserMode::NoiseGate,
+                                                );
+                                            }
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    "failed to switch denoiser: {err}"
+                                                );
+                                                if let Ok(mut status) = worker_status.lock() {
+                                                    status.detail = Some(format!(
+                                                        "Denoiser switch failed: {err:#}"
+                                                    ));
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 #[cfg(feature = "gtcrn")]
                                 WorkerCommand::SwapGtcrn {
                                     model_denoisers,
                                     passthrough_denoiser,
+                                    generation,
                                 } => {
-                                    model.set_gtcrn(passthrough_denoiser, model_denoisers);
+                                    if generation
+                                        == worker_denoiser_generation.load(Ordering::Acquire)
+                                        && generation >= applied_denoiser_generation
+                                    {
+                                        if model.set_gtcrn(
+                                            passthrough_denoiser,
+                                            model_denoisers,
+                                        ) {
+                                            applied_denoiser_generation = generation;
+                                            worker_applied_denoiser.store(
+                                                AppliedDenoiserSnapshot {
+                                                    generation,
+                                                    mode: DenoiserMode::Gtcrn,
+                                                },
+                                            );
+                                            live.set_noise_gate_enabled(false);
+                                        } else if let Ok(mut status) = worker_status.lock() {
+                                            status.detail = Some(
+                                                "GTCRN swap discarded because the model pool changed during loading; retry denoiser selection"
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
                                 }
                                 #[cfg(feature = "deepfilternet3")]
                                 WorkerCommand::SwapDeepFilterNet3 {
                                     model_denoisers,
                                     passthrough_denoiser,
+                                    generation,
                                 } => {
-                                    model.set_deepfilternet3(passthrough_denoiser, model_denoisers);
+                                    if generation
+                                        == worker_denoiser_generation.load(Ordering::Acquire)
+                                        && generation >= applied_denoiser_generation
+                                    {
+                                        if model.set_deepfilternet3(
+                                            passthrough_denoiser,
+                                            model_denoisers,
+                                        ) {
+                                            applied_denoiser_generation = generation;
+                                            worker_applied_denoiser.store(
+                                                AppliedDenoiserSnapshot {
+                                                    generation,
+                                                    mode: DenoiserMode::DeepFilterNet3,
+                                                },
+                                            );
+                                            live.set_noise_gate_enabled(false);
+                                        } else if let Ok(mut status) = worker_status.lock() {
+                                            status.detail = Some(
+                                                "DeepFilterNet3 swap discarded because the model pool changed during loading; retry denoiser selection"
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
                                 }
                             }
+                        }
+                        if !worker_running.load(Ordering::SeqCst) {
+                            break;
                         }
                         if !accumulate_input_chunk(&mut input_consumer, &mut input_acc, input_chunk)
                         {
@@ -2961,7 +3708,19 @@ impl RealtimeSession {
                                 .mark_collecting(calibration_generation, collector.captured_ms());
                             (observed, collector.is_complete())
                         });
-                        let live_params = live.load();
+                        let dynamic_mode = worker_dynamic_tuning.mode();
+                        // Measure raw device audio before input gain or a
+                        // denoiser. The completed RVC chunk supplies the F0
+                        // metrics below, so this becomes an allocation-free
+                        // full observation after `process_chunk` returns.
+                        let dynamic_observation = dynamic_mode.is_enabled().then(|| {
+                            DynamicTuningObservation::from_audio(
+                                &input_acc[..input_chunk],
+                                0.0,
+                                0.0,
+                            )
+                        });
+                        let live_params = dynamic_tuner.live_params(dynamic_mode, live.load());
                         let stats = model.process_chunk(
                             &input_acc[..input_chunk],
                             input_rate,
@@ -2974,6 +3733,15 @@ impl RealtimeSession {
                             worker_running.store(false, Ordering::SeqCst);
                             break;
                         };
+                        if let Some(mut observation) = dynamic_observation {
+                            observation.voiced_ratio = stats.voiced_ratio;
+                            observation.pitch_variation_semitones = stats.pitch_variation_semitones;
+                            dynamic_tuner.observe(dynamic_mode, observation);
+                        }
+                        // A mode switch to Off still refreshes the UI on the
+                        // next processed chunk. `try_lock` makes diagnostic
+                        // publication lossy rather than stalling inference.
+                        worker_dynamic_tuning.publish(dynamic_tuner.snapshot());
                         if let Some((observed_samples, complete)) = calibration_observation {
                             let profile = if observed_samples > 0 {
                                 calibration.as_mut().and_then(|collector| {
@@ -3033,13 +3801,15 @@ impl RealtimeSession {
                                 samples.extend_from_slice(&prepared);
                             }
                         }
-                        let should_queue = !output_silent
-                            || should_queue_silent_output(
-                                output_capacity - output_producer.slots(),
-                                output_chunk,
-                            );
-                        if should_queue {
-                            let (_, remainder) = output_producer.push_partial_slice(&prepared);
+                        let output_push_len = queued_output_len(
+                            output_silent,
+                            output_capacity - output_producer.slots(),
+                            output_chunk,
+                            prepared.len(),
+                        );
+                        if output_push_len > 0 {
+                            let (_, remainder) =
+                                output_producer.push_partial_slice(&prepared[..output_push_len]);
                             worker_telemetry
                                 .output_dropped_samples
                                 .fetch_add(remainder.len() as u64, Ordering::Relaxed);
@@ -3069,13 +3839,15 @@ impl RealtimeSession {
                                     *sample = (*sample * monitor_gain).clamp(-1.0, 1.0);
                                 }
                             }
-                            if !output_silent
-                                || should_queue_silent_output(
-                                    monitor_capacity - producer.slots(),
-                                    monitor_chunk,
-                                )
-                            {
-                                let (_, remainder) = producer.push_partial_slice(&monitor_prepared);
+                            let monitor_push_len = queued_output_len(
+                                output_silent,
+                                monitor_capacity - producer.slots(),
+                                monitor_chunk,
+                                monitor_prepared.len(),
+                            );
+                            if monitor_push_len > 0 {
+                                let (_, remainder) = producer
+                                    .push_partial_slice(&monitor_prepared[..monitor_push_len]);
                                 worker_telemetry
                                     .monitor_dropped_samples
                                     .fetch_add(remainder.len() as u64, Ordering::Relaxed);
@@ -3085,15 +3857,16 @@ impl RealtimeSession {
                 })?,
         );
 
-        let monitor_play = match &monitor_stream {
-            Some(stream) => stream.play(),
-            None => Ok(()),
-        };
-        if let Err(err) = output_stream
-            .play()
-            .and(monitor_play)
-            .and_then(|_| input_stream.play())
-        {
+        if let Err(err) = activate_candidate_endpoints(
+            &endpoint_running,
+            || output_stream.play(),
+            || match &monitor_stream {
+                Some(stream) => stream.play(),
+                None => Ok(()),
+            },
+            || input_stream.play(),
+            || Ok(()),
+        ) {
             drop(input_stream);
             drop(output_stream);
             drop(monitor_stream);
@@ -3103,6 +3876,7 @@ impl RealtimeSession {
 
         Ok(Self {
             running,
+            endpoint_running,
             wake,
             worker: worker.take(),
             input_stream: Some(input_stream),
@@ -3153,7 +3927,7 @@ impl RealtimeSession {
                             .unwrap_or_default(),
                         state: ModelLoadState::Loaded,
                         pool_index: Some(0),
-                        request_id: 0,
+                        request_id: BASE_MODEL_REQUEST_ID,
                     }]
                 } else {
                     Vec::new()
@@ -3210,56 +3984,69 @@ impl RealtimeSession {
         };
         if new_input_rate != self.input_rate || new_output_rate != self.output_rate || !monitor_ok {
             let mut cfg = self.config.clone();
-            cfg.input_host = dev.input_host;
-            cfg.output_host = dev.output_host;
-            cfg.input_device = dev.input_device;
-            cfg.output_device = dev.output_device;
-            cfg.monitor_output_enabled = dev.monitor_output_enabled;
-            cfg.monitor_output_device = dev.monitor_output_device;
-            cfg.wasapi_input_exclusive = dev.wasapi_input_exclusive;
-            cfg.wasapi_output_exclusive = dev.wasapi_output_exclusive;
-            cfg.wasapi_buffer_ms = dev.wasapi_buffer_ms;
+            apply_device_spec(&mut cfg, &dev);
             return Ok(UpdateDevicesOutcome::RestartRequired(cfg));
         }
-        let endpoints = build_streams(
+        let candidate_running = Arc::new(AtomicBool::new(true));
+        let StreamEndpoints {
+            input_stream,
+            output_stream,
+            monitor_stream,
+            input_consumer,
+            output_producer,
+            monitor_producer,
+        } = build_streams(
             &audio,
             self.input_capacity,
             self.output_capacity,
             dev.monitor_output_enabled.then_some(self.monitor_capacity),
-            &self.running,
+            &candidate_running,
             &self.wake,
             &self.telemetry,
         )?;
-        // Rebind the worker's ring ends before playing. The worker drains this
-        // mailbox at the top of its loop and tolerates a briefly-disconnected
-        // ring in the gap; the explicit wake covers the parked-idle case.
-        self.worker_tx
-            .send(WorkerCommand::RebindRings {
-                input_consumer: endpoints.input_consumer,
-                output_producer: endpoints.output_producer,
-                monitor_producer: endpoints.monitor_producer,
-            })
-            .map_err(|_| anyhow!("worker command channel closed"))?;
+        // Candidate callbacks have a private health flag and bounded rings.
+        // Start every stream before publishing its ring ends to the worker; a
+        // play/send failure then drops only the candidate while the old device
+        // timeline remains fully connected.
+        activate_candidate_endpoints(
+            &candidate_running,
+            || output_stream.play(),
+            || match &monitor_stream {
+                Some(stream) => stream.play(),
+                None => Ok(()),
+            },
+            || input_stream.play(),
+            || {
+                self.worker_tx
+                    .send(WorkerCommand::RebindRings {
+                        input_consumer,
+                        output_producer,
+                        monitor_producer,
+                    })
+                    .map_err(|_| anyhow!("worker command channel closed"))
+            },
+        )?;
         self.wake.wake();
-        let monitor_play = match &endpoints.monitor_stream {
-            Some(stream) => stream.play(),
-            None => Ok(()),
-        };
-        endpoints
-            .output_stream
-            .play()
-            .and(monitor_play)
-            .and_then(|_| endpoints.input_stream.play())?;
-        drop(self.input_stream.take());
-        drop(self.output_stream.take());
-        drop(self.monitor_stream.take());
-        self.input_stream = Some(endpoints.input_stream);
-        self.output_stream = Some(endpoints.output_stream);
-        self.monitor_stream = endpoints.monitor_stream;
+
+        // Sending RebindRings is the commit point: no fallible work follows.
+        // Swap health ownership first so a late callback error from an old
+        // stream cannot stop the new endpoint set, then retire the old handles.
+        let old_endpoint_running = std::mem::replace(&mut self.endpoint_running, candidate_running);
+        old_endpoint_running.store(false, Ordering::SeqCst);
+        let old_input_stream = self.input_stream.replace(input_stream);
+        let old_output_stream = self.output_stream.replace(output_stream);
+        let old_monitor_stream = std::mem::replace(&mut self.monitor_stream, monitor_stream);
+        drop(old_input_stream);
+        drop(old_output_stream);
+        drop(old_monitor_stream);
+        apply_device_spec(&mut self.config, &dev);
         // Update the session status in place; the state stays Running.
         let status = &mut self.status;
+        status.detail = None;
         status.input_device = audio.input_name().to_string();
         status.output_device = audio.output_name().to_string();
+        status.input_sample_rate = new_input_rate;
+        status.output_sample_rate = new_output_rate;
         status.monitor_device = if dev.monitor_output_enabled {
             audio.monitor_name().to_string()
         } else {
@@ -3298,7 +4085,9 @@ impl RealtimeSession {
             model: new_model,
             embedder: self.config.embedder.clone().expect("validated"),
             embedder_output: self.config.embedder_output.clone(),
-            f0_model: self.config.f0_model.clone().expect("validated"),
+            f0_model: self.config.f0_model.clone(),
+            f0_mode: self.config.f0_mode,
+            fcpe_model: self.config.fcpe_model.clone(),
             feature_index: self.config.feature_index.clone(),
             provider: self.config.provider,
             gpu_priority: self.config.gpu_priority,
@@ -3316,11 +4105,13 @@ impl RealtimeSession {
             output_gain: live.output_gain,
             f0: self.config.f0.clone(),
             noise_gate_enabled: denoiser_mode == DenoiserMode::NoiseGate,
+            silence_gate_enabled: live.silence_gate_enabled,
             noise_gate_threshold: live.noise_gate_threshold,
             noise_gate_shaping: self.config.noise_gate_shaping,
             output_extra_ms,
             volume_excluded_ms: self.config.crossfade_ms,
             extra_convert_ms: self.config.extra_convert_ms,
+            rvc_frames: self.config.rvc_frames,
             output_dynamics: self.config.output_dynamics,
             smoother_kind: self.config.smoother.kind(),
             output_rate: self.output_rate,
@@ -3336,6 +4127,7 @@ impl RealtimeSession {
 impl Drop for RealtimeSession {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        self.endpoint_running.store(false, Ordering::SeqCst);
         // Wake a parked worker so it observes the cleared running flag and exits
         // even when the input stream has already stopped delivering wake()s.
         self.wake.wake();
@@ -3358,6 +4150,61 @@ impl Drop for RealtimeSession {
     }
 }
 
+fn apply_device_spec(config: &mut RealtimeConfig, dev: &DeviceSpec) {
+    config.input_host = dev.input_host;
+    config.output_host = dev.output_host;
+    config.input_device.clone_from(&dev.input_device);
+    config.output_device.clone_from(&dev.output_device);
+    config.monitor_output_enabled = dev.monitor_output_enabled;
+    config
+        .monitor_output_device
+        .clone_from(&dev.monitor_output_device);
+    config.wasapi_input_exclusive = dev.wasapi_input_exclusive;
+    config.wasapi_output_exclusive = dev.wasapi_output_exclusive;
+    config.wasapi_buffer_ms = dev.wasapi_buffer_ms;
+}
+
+/// Start a candidate endpoint set in dependency order and publish its worker
+/// rings only after every stream is healthy. The caller owns the old endpoint
+/// flag, so clearing only `candidate_running` makes all pre-commit failures
+/// rollback without disturbing the active session.
+fn activate_candidate_endpoints<PlayOutput, PlayMonitor, PlayInput, Rebind>(
+    candidate_running: &AtomicBool,
+    play_output: PlayOutput,
+    play_monitor: PlayMonitor,
+    play_input: PlayInput,
+    rebind: Rebind,
+) -> Result<()>
+where
+    PlayOutput: FnOnce() -> Result<()>,
+    PlayMonitor: FnOnce() -> Result<()>,
+    PlayInput: FnOnce() -> Result<()>,
+    Rebind: FnOnce() -> Result<()>,
+{
+    let ensure_running = || {
+        if candidate_running.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            bail!("candidate audio endpoint stopped during startup")
+        }
+    };
+    let result = (|| {
+        play_output()?;
+        ensure_running()?;
+        play_monitor()?;
+        ensure_running()?;
+        play_input()?;
+        ensure_running()?;
+        // A successful rebind is the commit point. Do not add a fallible step
+        // after it: the worker may consume the new ring ends immediately.
+        rebind()
+    })();
+    if result.is_err() {
+        candidate_running.store(false, Ordering::SeqCst);
+    }
+    result
+}
+
 /// Short display name for a model path (the file name; falls back to the full
 /// path). Used for the model pool's per-slot labels.
 fn model_name_for(path: &Path) -> String {
@@ -3366,11 +4213,20 @@ fn model_name_for(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-fn should_queue_silent_output(buffered: usize, output_chunk: usize) -> bool {
-    // Keep at most one generated-silence chunk queued. Filling the output ring
-    // during quiet periods delays or drops the first converted speech when
-    // input resumes.
-    buffered <= output_chunk
+fn queued_output_len(
+    output_silent: bool,
+    buffered: usize,
+    output_chunk: usize,
+    prepared_len: usize,
+) -> usize {
+    if output_silent {
+        // Keep exactly one chunk's worth of generated silence buffered. Queue
+        // only the missing prefix so quiet processing cannot build latency or
+        // displace the first converted speech when input resumes.
+        output_chunk.saturating_sub(buffered).min(prepared_len)
+    } else {
+        prepared_len
+    }
 }
 
 /// Streams plus the worker-side ring-buffer ends created in the same attempt.
@@ -3399,7 +4255,7 @@ fn build_streams(
     let input_running = Arc::clone(running);
     let input_wake = Arc::clone(wake);
     let input_telemetry = Arc::clone(telemetry);
-    let input_stream = audio.build_input_stream(move |samples| {
+    let input_stream = audio.build_input_stream_with_running(running, move |samples| {
         if !input_running.load(Ordering::Relaxed) {
             return;
         }
@@ -3419,7 +4275,7 @@ fn build_streams(
     })?;
     let output_running = Arc::clone(running);
     let output_telemetry = Arc::clone(telemetry);
-    let output_stream = audio.build_output_stream(move |out| {
+    let output_stream = audio.build_output_stream_with_running(running, move |out| {
         if !output_running.load(Ordering::Relaxed) {
             out.fill(0.0);
             return;
@@ -3440,7 +4296,7 @@ fn build_streams(
             let (monitor_producer, mut monitor_consumer) = RingBuffer::<f32>::new(capacity);
             let monitor_running = Arc::clone(running);
             let monitor_telemetry = Arc::clone(telemetry);
-            let stream = audio.build_monitor_stream(move |out| {
+            let stream = audio.build_monitor_stream_with_running(running, move |out| {
                 if !monitor_running.load(Ordering::Relaxed) {
                     out.fill(0.0);
                     return;
@@ -3516,10 +4372,12 @@ mod tests {
         let params = LiveParams {
             pitch_shift: -3.5,
             speaker_id: 7,
+            f0_threshold: 0.04,
             input_gain: 0.5,
             output_gain: 2.0,
             monitor_gain: 1.5,
             noise_gate_enabled: true,
+            silence_gate_enabled: true,
             noise_gate_threshold: 0.025,
             index_rate: 0.7,
             protect: 0.33,
@@ -3531,8 +4389,10 @@ mod tests {
         let out = atomic.load();
         assert_eq!(out.pitch_shift, params.pitch_shift);
         assert_eq!(out.speaker_id, params.speaker_id);
+        assert_eq!(out.f0_threshold, params.f0_threshold);
         assert_eq!(out.input_gain, params.input_gain);
         assert_eq!(out.output_gain, params.output_gain);
+        assert_eq!(out.silence_gate_enabled, params.silence_gate_enabled);
         assert_eq!(out.monitor_gain, params.monitor_gain);
         assert_eq!(out.noise_gate_enabled, params.noise_gate_enabled);
         assert_eq!(out.noise_gate_threshold, params.noise_gate_threshold);
@@ -3541,6 +4401,177 @@ mod tests {
         assert_eq!(out.protect_transition_ms, params.protect_transition_ms);
         assert_eq!(out.denoiser_content_mix, params.denoiser_content_mix);
         assert_eq!(out.denoiser_rmvpe_mix, params.denoiser_rmvpe_mix);
+    }
+
+    #[test]
+    fn atomic_live_params_reject_non_finite_automation() {
+        let atomic = AtomicLiveParams::new(LiveParams {
+            pitch_shift: f32::NAN,
+            input_gain: f32::INFINITY,
+            output_gain: -1.0,
+            monitor_gain: f32::NEG_INFINITY,
+            noise_gate_threshold: 2.0,
+            ..LiveParams::default()
+        });
+        let out = atomic.load();
+        assert_eq!(out.pitch_shift, 0.0);
+        assert_eq!(out.input_gain, 1.0);
+        assert_eq!(out.output_gain, 0.0);
+        assert_eq!(out.monitor_gain, 1.0);
+        assert_eq!(
+            out.noise_gate_threshold,
+            vc_core::model_rvc::MAX_NOISE_GATE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn applied_denoiser_snapshot_round_trips_generation_and_mode_atomically() {
+        for mode in [
+            DenoiserMode::Off,
+            DenoiserMode::NoiseGate,
+            DenoiserMode::Rnnoise,
+            DenoiserMode::Gtcrn,
+            DenoiserMode::WebRtc,
+            DenoiserMode::DeepFilterNet3,
+        ] {
+            let snapshot = AppliedDenoiserSnapshot {
+                generation: 123_456,
+                mode,
+            };
+            assert_eq!(
+                unpack_applied_denoiser(pack_applied_denoiser(snapshot)),
+                snapshot
+            );
+            let state = AppliedDenoiserState::new(snapshot);
+            assert_eq!(state.load(), snapshot);
+        }
+    }
+
+    #[test]
+    fn dynamic_model_ids_never_collide_with_the_base_id() {
+        let mut next = FIRST_DYNAMIC_MODEL_REQUEST_ID;
+        assert_eq!(take_dynamic_model_request_id(&mut next), 1);
+        assert_eq!(take_dynamic_model_request_id(&mut next), 2);
+        assert_ne!(next.get(), BASE_MODEL_REQUEST_ID);
+    }
+
+    #[test]
+    fn model_status_removal_protects_base_and_supports_dynamic_slot_zero() {
+        let mut with_base = EngineStatusSnapshot {
+            model_loads: vec![
+                ModelLoadStatus {
+                    path: "base.onnx".to_string(),
+                    state: ModelLoadState::Loaded,
+                    pool_index: Some(0),
+                    request_id: BASE_MODEL_REQUEST_ID,
+                },
+                ModelLoadStatus {
+                    path: "dynamic.onnx".to_string(),
+                    state: ModelLoadState::Loaded,
+                    pool_index: Some(1),
+                    request_id: 1,
+                },
+            ],
+            ..EngineStatusSnapshot::default()
+        };
+        assert_eq!(
+            remove_dynamic_model_status(&mut with_base, BASE_MODEL_REQUEST_ID),
+            None
+        );
+        assert_eq!(with_base.model_loads.len(), 2);
+        assert_eq!(remove_dynamic_model_status(&mut with_base, 1), Some(1));
+        assert_eq!(with_base.model_loads.len(), 1);
+        assert_eq!(with_base.model_loads[0].request_id, BASE_MODEL_REQUEST_ID);
+
+        let mut without_base = EngineStatusSnapshot {
+            model_loads: vec![ModelLoadStatus {
+                path: "first-dynamic.onnx".to_string(),
+                state: ModelLoadState::Loaded,
+                pool_index: Some(0),
+                request_id: 1,
+            }],
+            ..EngineStatusSnapshot::default()
+        };
+        assert_eq!(remove_dynamic_model_status(&mut without_base, 1), Some(0));
+        assert!(without_base.model_loads.is_empty());
+    }
+
+    #[test]
+    fn dense_pool_removal_allows_the_only_dynamic_slot_zero() {
+        let mut models = vec![7_u8];
+        let mut names = vec!["dynamic".to_string()];
+        assert!(remove_aligned_model_slot(&mut models, &mut names, 0));
+        assert!(models.is_empty());
+        assert!(names.is_empty());
+        assert!(!remove_aligned_model_slot(&mut models, &mut names, 0));
+    }
+
+    #[test]
+    fn pool_slot_remap_preserves_a_concurrent_frontend_selection() {
+        assert_eq!(remap_slot_after_removal(0, 1, 2), 0);
+        assert_eq!(remap_slot_after_removal(1, 1, 2), 1);
+        assert_eq!(remap_slot_after_removal(2, 1, 2), 1);
+
+        let requested = AtomicUsize::new(2);
+        assert!(try_remap_requested_slot_after_removal(&requested, 2, 1, 2));
+        assert_eq!(requested.load(Ordering::Relaxed), 1);
+
+        requested.store(2, Ordering::Relaxed);
+        assert!(!try_remap_requested_slot_after_removal(&requested, 1, 1, 2));
+        assert_eq!(requested.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn adding_a_non_active_model_does_not_overwrite_requested_slot() {
+        let requested = AtomicUsize::new(2);
+        assert!(!try_publish_active_slot_after_add(&requested, 2, 0, false));
+        assert_eq!(requested.load(Ordering::Relaxed), 2);
+
+        assert!(try_publish_active_slot_after_add(&requested, 2, 3, true));
+        assert_eq!(requested.load(Ordering::Relaxed), 3);
+        requested.store(4, Ordering::Relaxed);
+        assert!(!try_publish_active_slot_after_add(&requested, 3, 1, true));
+        assert_eq!(requested.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn removing_the_final_pool_model_restores_passthrough_variant() {
+        let live = LiveParams::default();
+        let passthrough = PassthroughProcessor::new(
+            NoiseGateShaping::default(),
+            48_000,
+            48_000,
+            test_denoiser_settings(DenoiserMode::Off),
+            &live,
+        )
+        .unwrap();
+        let active_requested = Arc::new(AtomicUsize::new(0));
+        let model = RuntimeModel::Pool {
+            passthrough,
+            models: Vec::new(),
+            names: Vec::new(),
+            active: 0,
+            passthrough_active: false,
+            active_requested: Arc::clone(&active_requested),
+        };
+        let model = model.remove_model(0);
+        assert!(matches!(model, RuntimeModel::PassthroughOnly(_)));
+        assert_eq!(active_requested.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cancelled_model_load_is_not_live_for_worker_add() {
+        let mut status = EngineStatusSnapshot::default();
+        status.model_loads.push(ModelLoadStatus {
+            path: "pending.onnx".to_string(),
+            state: ModelLoadState::Loading("loading".to_string()),
+            pool_index: None,
+            request_id: 41,
+        });
+        assert!(model_load_request_is_live(&status, 41));
+
+        status.model_loads.clear();
+        assert!(!model_load_request_is_live(&status, 41));
     }
 
     #[test]
@@ -3569,6 +4600,29 @@ mod tests {
 
         control.cancel();
         assert_eq!(control.snapshot().state, VoiceCalibrationState::Idle);
+    }
+
+    #[test]
+    fn dynamic_tuning_control_resets_diagnostics_without_changing_mode() {
+        let control = DynamicTuningControl::default();
+        control.set_mode(DynamicTuningMode::Japanese);
+        assert_eq!(control.mode(), DynamicTuningMode::Japanese);
+        assert_eq!(control.snapshot().profile, DynamicLanguageProfile::Japanese);
+
+        control.publish(DynamicTuningSnapshot {
+            mode: DynamicTuningMode::Japanese,
+            profile: DynamicLanguageProfile::Japanese,
+            confidence: 1.0,
+            noise_floor_rms: 0.02,
+            estimated_snr_db: 8.0,
+        });
+        control.reset_snapshot();
+
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.mode, DynamicTuningMode::Japanese);
+        assert_eq!(snapshot.profile, DynamicLanguageProfile::Japanese);
+        assert_eq!(snapshot.confidence, 1.0);
+        assert_eq!(snapshot.noise_floor_rms, 0.0);
     }
 
     #[test]
@@ -3659,6 +4713,49 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_model_set_requires_fcpe_before_live_switching() {
+        let model = PathBuf::from("model.onnx");
+        let hybrid_without_fcpe = RealtimeConfig {
+            model: Some(model.clone()),
+            embedder: Some(model.clone()),
+            f0_model: Some(model.clone()),
+            f0_mode: F0Mode::Hybrid,
+            ..Default::default()
+        };
+        assert!(!hybrid_without_fcpe.has_complete_model_set());
+        assert!(hybrid_without_fcpe.validate().is_err());
+
+        let hybrid = RealtimeConfig {
+            fcpe_model: Some(model.clone()),
+            ..hybrid_without_fcpe
+        };
+        assert!(hybrid.has_complete_model_set());
+        assert!(hybrid.validate().is_ok());
+    }
+
+    #[test]
+    fn fcpe_model_set_does_not_require_rmvpe() {
+        let model = PathBuf::from("model.onnx");
+        let fcpe = RealtimeConfig {
+            model: Some(model.clone()),
+            embedder: Some(model.clone()),
+            f0_model: None,
+            f0_mode: F0Mode::Fcpe,
+            fcpe_model: Some(model.clone()),
+            ..Default::default()
+        };
+        assert!(fcpe.has_complete_model_set());
+        assert!(fcpe.validate().is_ok());
+
+        let missing_fcpe = RealtimeConfig {
+            fcpe_model: None,
+            ..fcpe
+        };
+        assert!(!missing_fcpe.has_complete_model_set());
+        assert!(missing_fcpe.validate().is_err());
+    }
+
+    #[test]
     fn passthrough_processor_applies_input_and_output_gain() {
         let live = LiveParams {
             input_gain: 2.0,
@@ -3735,10 +4832,143 @@ mod tests {
     }
 
     #[test]
-    fn silent_output_does_not_fill_the_output_ring() {
-        assert!(should_queue_silent_output(0, 1_000));
-        assert!(should_queue_silent_output(1_000, 1_000));
-        assert!(!should_queue_silent_output(1_001, 1_000));
+    fn silent_output_tops_up_but_never_exceeds_one_chunk() {
+        assert_eq!(queued_output_len(true, 0, 1_000, 1_000), 1_000);
+        assert_eq!(queued_output_len(true, 400, 1_000, 1_000), 600);
+        assert_eq!(queued_output_len(true, 1_000, 1_000, 1_000), 0);
+        assert_eq!(queued_output_len(true, 1_001, 1_000, 1_000), 0);
+        assert_eq!(queued_output_len(false, 1_000, 1_000, 1_000), 1_000);
+    }
+
+    #[test]
+    fn denoiser_swap_requires_an_exact_model_count() {
+        assert!(denoiser_set_matches_model_count(0, 0));
+        assert!(denoiser_set_matches_model_count(3, 3));
+        assert!(!denoiser_set_matches_model_count(2, 3));
+        assert!(!denoiser_set_matches_model_count(4, 3));
+    }
+
+    #[test]
+    fn device_status_patch_preserves_worker_owned_model_state() {
+        let mut current = EngineStatusSnapshot {
+            state: EngineState::Running,
+            message: "old devices".to_string(),
+            input_device: "old input".to_string(),
+            output_device: "old output".to_string(),
+            input_sample_rate: 48_000,
+            output_sample_rate: 48_000,
+            speaker_count: Some(308),
+            active_model: Some("dynamic.onnx".to_string()),
+            model_loads: vec![ModelLoadStatus {
+                path: "dynamic.onnx".to_string(),
+                state: ModelLoadState::Loaded,
+                pool_index: Some(1),
+                request_id: 7,
+            }],
+            ..EngineStatusSnapshot::default()
+        };
+        let device = EngineStatusSnapshot {
+            state: EngineState::Error,
+            message: "new devices".to_string(),
+            input_device: "new input".to_string(),
+            output_device: "new output".to_string(),
+            input_sample_rate: 48_000,
+            output_sample_rate: 48_000,
+            ..EngineStatusSnapshot::default()
+        };
+
+        patch_device_status(&mut current, &device);
+
+        assert_eq!(current.state, EngineState::Running);
+        assert_eq!(current.input_device, "new input");
+        assert_eq!(current.output_device, "new output");
+        assert_eq!(current.speaker_count, Some(308));
+        assert_eq!(current.active_model.as_deref(), Some("dynamic.onnx"));
+        assert_eq!(current.model_loads.len(), 1);
+        assert_eq!(current.model_loads[0].request_id, 7);
+    }
+
+    #[test]
+    fn failed_device_candidate_keeps_running_session_status() {
+        let status = Mutex::new(EngineStatusSnapshot {
+            state: EngineState::Running,
+            input_device: "working input".to_string(),
+            output_device: "working output".to_string(),
+            model_loads: vec![ModelLoadStatus {
+                path: "base.onnx".to_string(),
+                state: ModelLoadState::Loaded,
+                pool_index: Some(0),
+                request_id: BASE_MODEL_REQUEST_ID,
+            }],
+            ..EngineStatusSnapshot::default()
+        });
+        set_recoverable_error(&status, "candidate failed", &anyhow!("test playback error"));
+        let status = status.into_inner().unwrap();
+        assert_eq!(status.state, EngineState::Running);
+        assert_eq!(status.input_device, "working input");
+        assert_eq!(status.output_device, "working output");
+        assert_eq!(status.model_loads.len(), 1);
+        assert_eq!(status.message, "candidate failed");
+        assert!(status.detail.unwrap().contains("test playback error"));
+    }
+
+    #[test]
+    fn spontaneous_endpoint_stop_invalidates_async_denoiser_loads() {
+        let worker_running = AtomicBool::new(true);
+        let endpoint_running = AtomicBool::new(false);
+        let generation = AtomicU64::new(9);
+        assert_eq!(
+            stopped_session_message_and_invalidate(&worker_running, &endpoint_running, &generation,),
+            Some("Realtime audio endpoint stopped")
+        );
+        assert_eq!(generation.load(Ordering::Acquire), 10);
+    }
+
+    #[test]
+    fn candidate_endpoints_publish_rings_only_after_all_streams_start() {
+        let running = AtomicBool::new(true);
+        let order = std::cell::RefCell::new(Vec::new());
+        activate_candidate_endpoints(
+            &running,
+            || {
+                order.borrow_mut().push("output");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("monitor");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("input");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("rebind");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(order.into_inner(), ["output", "monitor", "input", "rebind"]);
+        assert!(running.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_candidate_start_does_not_publish_rings() {
+        let running = AtomicBool::new(true);
+        let rebind_called = AtomicBool::new(false);
+        let result = activate_candidate_endpoints(
+            &running,
+            || Ok(()),
+            || Err(anyhow!("monitor failed")),
+            || Ok(()),
+            || {
+                rebind_called.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!running.load(Ordering::Acquire));
+        assert!(!rebind_called.load(Ordering::Relaxed));
     }
 
     #[test]

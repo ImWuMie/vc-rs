@@ -181,6 +181,7 @@ impl TensorRtSessionProfile {
 pub(super) enum ModelRole {
     ContentVec,
     Rmvpe,
+    Fcpe,
     Rvc,
     #[cfg(feature = "gtcrn")]
     Gtcrn,
@@ -192,6 +193,7 @@ impl ModelRole {
         match self {
             ModelRole::ContentVec => "contentvec",
             ModelRole::Rmvpe => "rmvpe",
+            ModelRole::Fcpe => "fcpe",
             ModelRole::Rvc => "rvc",
             #[cfg(feature = "gtcrn")]
             ModelRole::Gtcrn => "gtcrn",
@@ -480,7 +482,7 @@ pub(super) struct RvcTensorRtPinnedBinding {
     pub(super) p_len: Tensor<i64>,
     pub(super) sid: Tensor<i64>,
     /// Latent-noise input buffer, when the export takes `rnd`. Re-bound per run
-    /// like `feats`, since fresh noise is copied in each chunk.
+    /// like `feats`, since timeline-addressed noise is copied in each chunk.
     pub(super) rnd: Option<Tensor<f32>>,
     pub(super) output: Tensor<f32>,
     pub(super) _input_allocator: Allocator,
@@ -542,7 +544,7 @@ impl RvcTensorRtPinnedBinding {
         write_scalar_i64_tensor(&mut p_len, frame_len, "p_len")?;
         write_scalar_i64_tensor(&mut sid, speaker_id, "sid")?;
         // Latent-noise input buffer (allocated only when the export takes it);
-        // bound per run alongside feats, since fresh noise is copied each chunk.
+        // bound per run alongside feats as timeline-addressed noise is copied.
         let rnd = match rvc_rnd_shape(names, frame_len)? {
             Some(shape) => Some(
                 Tensor::<f32>::new(&input_allocator, shape)
@@ -920,8 +922,8 @@ pub(super) struct RvcTensorRtGraphBinding {
     pub(super) host_sid: Tensor<i64>,
     pub(super) device_sid: Tensor<i64>,
     /// Latent-noise input (host staging + device buffer), when the export takes
-    /// `rnd`. The device tensor keeps a stable bound address; fresh noise is
-    /// staged into `host_rnd` and copied into `device_rnd` each chunk.
+    /// `rnd`. The device tensor keeps a stable bound address; timeline-addressed
+    /// noise is staged into `host_rnd` and copied into `device_rnd` each chunk.
     pub(super) host_rnd: Option<Tensor<f32>>,
     pub(super) device_rnd: Option<Tensor<f32>>,
     pub(super) device_output: Tensor<f32>,
@@ -1142,6 +1144,13 @@ pub(super) fn tensor_rt_benchmark_profile(role: ModelRole) -> Result<TensorRtSes
                 dims: RMVPE_WAVEFORM_DIMS.to_vec(),
             }],
         )),
+        ModelRole::Fcpe => Ok(TensorRtSessionProfile::new(
+            role,
+            vec![TensorRtInputShape {
+                name: "audio".to_string(),
+                dims: vec![1, 24_000, 1],
+            }],
+        )),
         ModelRole::Rvc => Ok(TensorRtSessionProfile::new(
             role,
             vec![
@@ -1209,6 +1218,24 @@ pub(super) fn derive_rvc_feature_len(
         bail!("derived zero RVC frames");
     }
     Ok(feature_len)
+}
+
+/// A static RVC ONNX is dedicated to one generator frame count. Reject it before
+/// engine construction when the current chunk/context configuration derives a
+/// different profile; TensorRT cannot repair legacy attention reshapes that were
+/// traced at another Python `T`.
+pub(super) fn validate_rvc_static_profile_frames(
+    onnx_frames: Option<usize>,
+    required_frames: usize,
+) -> Result<()> {
+    if let Some(onnx_frames) = onnx_frames {
+        if onnx_frames != required_frames {
+            bail!(
+                "RVC ONNX has {onnx_frames} static frames, but the current TensorRT runtime profile requires {required_frames} frames; re-export this checkpoint with `vc-rs export-pth ... --frames {required_frames}`"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "ort")]
@@ -1562,11 +1589,15 @@ pub(super) fn validate_tensorrt_input_shape(
     input_name: &str,
     actual: &[usize],
 ) -> Result<()> {
-    if !provider_uses_fixed_shape(provider) {
-        return Ok(());
-    }
-    let tensor_rt_profile = tensor_rt_profile
-        .ok_or_else(|| anyhow!("fixed-shape input validation requires a session profile"))?;
+    let tensor_rt_profile = match tensor_rt_profile {
+        Some(profile) => profile,
+        None if !provider_uses_fixed_shape(provider) => return Ok(()),
+        None => bail!("fixed-shape input validation requires a session profile"),
+    };
+    // A supplied profile is authoritative even for Windows ML TensorRT-RTX,
+    // whose provider enum is not part of the CUDA/IoBinding predicate above.
+    // This keeps worker input validation aligned with the fixed EP options
+    // without accidentally enabling CUDA allocators for a Windows ML session.
     let expected = tensor_rt_profile.fixed_input_dims(input_name)?;
     if actual != expected {
         bail!(
@@ -1632,5 +1663,18 @@ mod tests {
     #[test]
     fn derive_rvc_feature_len_rejects_zero_frames() {
         assert!(derive_rvc_feature_len(0, 0, 48_000).is_err());
+    }
+
+    #[test]
+    fn static_rvc_frames_must_match_the_tensorrt_profile() {
+        assert!(validate_rvc_static_profile_frames(Some(99), 99).is_ok());
+        assert!(validate_rvc_static_profile_frames(None, 99).is_ok());
+
+        let error = validate_rvc_static_profile_frames(Some(200), 99)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("200 static frames"), "{error}");
+        assert!(error.contains("requires 99 frames"), "{error}");
+        assert!(error.contains("export-pth ... --frames 99"), "{error}");
     }
 }

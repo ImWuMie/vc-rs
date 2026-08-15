@@ -125,10 +125,14 @@ pwsh .\download-models.ps1
 6. 按下 **Apply / Start** 应用并开始。通过 **Stop** 停止。
 7. **Live parameters**(Pitch shift / Speaker ID / Input gain / Output gain /
    Monitor gain)实时生效。
-8. **Input denoiser** — 在 `off` / `noise-gate` / `rnnoise` / `webrtc` / `gtcrn` /
+8. **Dynamic tuning** — 选择 `off` / `auto` / `chinese` / `english` / `japanese`。
+   `auto` 根据音高起伏、浊音比例和零交叉率作保守的声学判断，并非 ASR 语种识别；只有连续多块高置信度时才切换。它在运行中逐步微调 F0 threshold、Index rate、Protect 及其过渡、两路降噪混合、输入增益和静音抑制，手动参数仍是基线。
+9. **Input denoiser** — 在 `off` / `noise-gate` / `rnnoise` / `webrtc` / `gtcrn` /
    `deep-filter-net3` 之间
    **运行中实时切换**(详见下文);noise-gate 的阈值等参数也实时生效。
-9. **Telemetry** 显示推理时间、输入输出 RMS、overrun/underrun,可确认断音和负载
+   当停止说话时仍有 RVC 生成的底噪，可在非 `noise-gate` 模式下启用
+   **Silence suppressor**；它会在 RMVPE 分支融合 Silero 神经 VAD 与自适应声学检测（稳定环境底噪、能量、零交叉率和原始 F0），连续两个非活动块后对转换输出平滑淡出，不会停止 RVC 推理。低置信度神经结果只会否决弱 F0 误触发，能量和瞬态路径仍会保护起音、辅音和短暂停顿。
+10. **Telemetry** 显示推理时间、输入输出 RMS、overrun/underrun,可确认断音和负载
    状况(推理时间超过 chunk 预算时会以颜色警告)。
 
 设置会自动保存(`%APPDATA%\vc-rs\gui.toml`),下次启动时恢复。模型 3 件已加载时,

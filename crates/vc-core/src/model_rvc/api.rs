@@ -21,6 +21,8 @@ pub struct ModelOutput {
     pub applied_output_gain: f32,
     pub feature_frames: usize,
     pub pitch_frames: usize,
+    /// True only when this chunk is fully zero and frontends may skip queuing
+    /// it. A nonzero fade tail must report `false` so the output remains smooth.
     pub silent: bool,
     pub convert_size: usize,
     pub out_size: usize,
